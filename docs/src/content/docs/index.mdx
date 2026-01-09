@@ -4,7 +4,24 @@ description: Privacy-first semantic code search CLI
 template: splash
 hero:
   title: grep on steroids
-  tagline: Semantic code search powered by AI embeddings. Search your codebase by meaning, not just keywords.
+  tagline: Give your AI coding agents semantic code search. Find relevant code instantly, save tokens, ship faster.
+  image:
+    html: |
+      <svg xmlns="http://www.w3.org/2000/svg" width="280" height="280" viewBox="0 0 24 24" fill="none" stroke="url(#gradient)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <defs>
+          <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" style="stop-color:#818cf8"/>
+            <stop offset="100%" style="stop-color:#c084fc"/>
+          </linearGradient>
+        </defs>
+        <circle cx="11" cy="11" r="8"/>
+        <path d="m21 21-4.3-4.3"/>
+        <path d="M11 8a3 3 0 0 0-3 3"/>
+        <path d="M8 6h.01"/>
+        <path d="M14 6h.01"/>
+        <path d="M6 14h.01"/>
+        <path d="M14 14h.01"/>
+      </svg>
   actions:
     - text: Get Started
       link: /grepai/getting-started/
@@ -13,50 +30,138 @@ hero:
     - text: View on GitHub
       link: https://github.com/yoanbernabeu/grepai
       icon: external
+      variant: secondary
 ---
 
-import { Card, CardGrid } from '@astrojs/starlight/components';
+import { Card, CardGrid, LinkCard, Steps, Tabs, TabItem, Badge } from '@astrojs/starlight/components';
 
 ## Why grepai?
 
-Traditional search requires knowing exact names. grepai understands what you mean.
+`grep` was built in 1973 for exact text matching. Modern AI agents need semantic understanding.
 
 <CardGrid stagger>
-  <Card title="Semantic Search" icon="magnifier">
-    Search by meaning, not keywords. Find "auth logic" even when the code says `AuthMiddleware`.
+  <Card title="Semantic vs Exact" icon="magnifier">
+    `grep`: `"func.*Login"` → exact matches only.
+    `grepai`: `"user authentication flow"` → conceptually related code.
+  </Card>
+  <Card title="Fewer searches, better context" icon="rocket">
+    AI agents get relevant code in one query instead of multiple grep attempts. Save tokens, ship faster.
   </Card>
   <Card title="100% Local" icon="laptop">
     Runs entirely on your machine with Ollama. Your code never leaves your laptop.
   </Card>
-  <Card title="Real-Time Sync" icon="rocket">
-    File watcher keeps your index fresh automatically. No manual re-indexing.
-  </Card>
   <Card title="AI Agent Ready" icon="puzzle">
-    First-class integration with Cursor, Windsurf, Claude Code, and more.
+    First-class integration with Cursor, Windsurf, Claude Code, Gemini CLI, and more.
   </Card>
 </CardGrid>
 
+---
+
 ## Get started in seconds
 
-```bash
-# Install
-curl -sSL https://raw.githubusercontent.com/yoanbernabeu/grepai/main/install.sh | sh
+<Steps>
 
-# Initialize
-grepai init
+1. **Install grepai**
 
-# Index & Watch
-grepai watch
+   ```bash
+   curl -sSL https://raw.githubusercontent.com/yoanbernabeu/grepai/main/install.sh | sh
+   ```
 
-# Search
-grepai search "your query"
-```
+2. **Initialize your project**
 
-## grep vs grepai
+   ```bash
+   grepai init
+   ```
 
-| Traditional grep | grepai |
-|-----------------|--------|
-| Searches exact text | Searches by meaning |
-| Returns 847+ noisy results | Returns top relevant matches |
-| Requires knowing variable names | Works with natural language |
-| `grep -r "auth" .` | `grepai search "user login flow"` |
+3. **Start indexing & watching**
+
+   ```bash
+   grepai watch
+   ```
+
+4. **Search with natural language**
+
+   ```bash
+   grepai search "user authentication flow"
+   ```
+
+</Steps>
+
+---
+
+## Choose your embedder
+
+<Tabs>
+  <TabItem label="Ollama (Local)" icon="laptop">
+    ```yaml
+    # .grepai/config.yaml
+    embedder:
+      provider: ollama
+      model: nomic-embed-text
+    ```
+    <Badge text="Recommended" variant="success" /> Privacy-first, runs 100% offline.
+  </TabItem>
+  <TabItem label="OpenAI (Cloud)" icon="external">
+    ```yaml
+    # .grepai/config.yaml
+    embedder:
+      provider: openai
+      model: text-embedding-3-small
+    ```
+    Faster indexing, requires API key.
+  </TabItem>
+</Tabs>
+
+---
+
+## Choose your storage
+
+<CardGrid>
+  <Card title="GOB — Local File" icon="seti:favicon">
+    <Badge text="Default" variant="success" size="small" />
+
+    Zero setup, single portable file. Perfect for small & medium codebases.
+
+    ```yaml
+    store:
+      backend: gob
+    ```
+  </Card>
+  <Card title="PostgreSQL — pgvector" icon="seti:db">
+    <Badge text="Large projects" variant="caution" size="small" />
+
+    Shared index, native vector similarity. Scales to large codebases.
+
+    ```yaml
+    store:
+      backend: postgres
+    ```
+  </Card>
+</CardGrid>
+
+---
+
+## Ready to dive deeper?
+
+<CardGrid>
+  <LinkCard
+    title="Installation Guide"
+    description="Detailed setup instructions for all platforms."
+    href="/grepai/installation/"
+  />
+  <LinkCard
+    title="Configuration"
+    description="Customize chunking, backends, and more."
+    href="/grepai/configuration/"
+  />
+  <LinkCard
+    title="AI Agent Setup"
+    description="Integrate with Cursor, Claude Code, Windsurf."
+    href="/grepai/commands/agent-setup/"
+  />
+  <LinkCard
+    title="Contributing"
+    description="Help improve grepai."
+    href="/grepai/contributing/"
+  />
+</CardGrid>
