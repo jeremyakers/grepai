@@ -95,6 +95,9 @@ func handleAPIError(w http.ResponseWriter, err error) {
 
 ## Next Steps
 
+- [Semantic Search Guide](/grepai/search-guide/) - Master natural language queries
+- [File Watching Guide](/grepai/watch-guide/) - Understand the indexing daemon
+- [Call Graph Analysis](/grepai/trace/) - Explore function relationships
 - [Configuration](/grepai/configuration/) - Customize chunking, embedders, and storage
 - [Commands Reference](/grepai/commands/grepai/) - Full CLI documentation
 - [AI Agent Setup](/grepai/commands/grepai_agent-setup/) - Integrate with Cursor or Claude Code

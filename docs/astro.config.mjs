@@ -21,6 +21,14 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Features',
+          items: [
+            { label: 'Semantic Search', link: '/search-guide/' },
+            { label: 'File Watching', link: '/watch-guide/' },
+            { label: 'Call Graph Analysis', link: '/trace/' },
+          ],
+        },
+        {
           label: 'Configuration',
           items: [
             { label: 'Config File', link: '/configuration/' },
