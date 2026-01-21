@@ -11,7 +11,7 @@ Vector stores persist the embeddings and enable similarity search.
 |---------|------|------|------|
 | GOB | File-based | Simple, no setup | Single machine only |
 | PostgreSQL | Database | Scalable, team-friendly | Requires PostgreSQL + pgvector |
-| Qdrant | Database | Scalable, Vector-database |  |
+| Qdrant | Vector DB | Scalable, purpose-built for vectors | Requires Docker or Qdrant Cloud |
 
 ## GOB (File-based)
 
@@ -173,6 +173,25 @@ store:
 
 Note: Collection names are automatically sanitized from the project path (replaces `/` with `_`). If no collection is specified, the sanitized project path is used.
 
+### Characteristics
+
+- **Pros**:
+  - Purpose-built for vector search
+  - High performance with HNSW indexing
+  - Easy Docker setup
+  - Built-in dashboard (http://localhost:6333/dashboard)
+  - Supports filtering and metadata
+
+- **Cons**:
+  - Requires Docker or Qdrant Cloud
+  - Additional service to manage
+
+### Best For
+
+- Projects needing high-performance vector search
+- Docker-based development environments
+- Teams already using Qdrant
+- When you want a dedicated vector database
 
 ## Adding a New Store
 

@@ -187,6 +187,7 @@ func DefaultConfig() *Config {
 			"target",
 			".zig-cache",
 			"zig-out",
+			"qdrant_storage",
 		},
 	}
 }

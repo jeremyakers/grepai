@@ -37,7 +37,7 @@ This command will:
 
 func init() {
 	initCmd.Flags().StringVarP(&initProvider, "provider", "p", "", "Embedding provider (ollama, lmstudio, or openai)")
-	initCmd.Flags().StringVarP(&initBackend, "backend", "b", "", "Storage backend (gob or postgres)")
+	initCmd.Flags().StringVarP(&initBackend, "backend", "b", "", "Storage backend (gob, postgres, or qdrant)")
 	initCmd.Flags().BoolVar(&initNonInteractive, "yes", false, "Use defaults without prompting")
 }
 
@@ -126,7 +126,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 				}
 				cfg.Store.Qdrant.Endpoint = endpoint
 
-				fmt.Print("Qdrant port [6333]: ")
+				fmt.Print("Qdrant port [6334]: ")
 				port, _ := reader.ReadString('\n')
 				port = strings.TrimSpace(port)
 				if port == "" {

@@ -18,7 +18,7 @@ services:
     profiles:
       - postgres
 
-  # Optionnal: Qdrant for vector storage
+  # Optional: Qdrant for vector storage
   qdrant:
     image: qdrant/qdrant:latest
     container_name: qdrant_local

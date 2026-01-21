@@ -5,10 +5,20 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/qdrant/go-client/qdrant"
 )
+
+// sanitizeUTF8 ensures the string contains only valid UTF-8 characters.
+// Invalid sequences are replaced with the Unicode replacement character.
+func sanitizeUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, "\uFFFD")
+}
 
 type QdrantStore struct {
 	client         *qdrant.Client
@@ -151,7 +161,7 @@ func (s *QdrantStore) buildChunkPayload(chunk Chunk) (map[string]*qdrant.Value, 
 		return nil, fmt.Errorf("failed to create end_line value: %w", err)
 	}
 
-	contentVal, err := qdrant.NewValue(chunk.Content)
+	contentVal, err := qdrant.NewValue(sanitizeUTF8(chunk.Content))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create content value: %w", err)
 	}
