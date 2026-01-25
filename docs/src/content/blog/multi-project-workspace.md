@@ -38,15 +38,13 @@ When you're debugging an authentication issue, you need to search across all of 
 
 A workspace groups multiple projects under a shared index. One search, all results, ranked by relevance.
 
-```
-┌─────────────────────────────────────────────────┐
-│                 my-fullstack                     │
-│              (PostgreSQL Store)                  │
-├─────────────────────────────────────────────────┤
-│  frontend/     │  backend/     │  shared-lib/   │
-│  (React/TS)    │  (Go API)     │  (Go pkg)      │
-└─────────────────────────────────────────────────┘
-```
+**Workspace: `my-fullstack`** *(PostgreSQL Store)*
+
+| Project | Tech |
+|---------|------|
+| `frontend/` | React/TS |
+| `backend/` | Go API |
+| `shared-lib/` | Go pkg |
 
 ---
 
