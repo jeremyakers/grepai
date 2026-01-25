@@ -7,7 +7,23 @@ description: How to install grepai
 
 - **Ollama** (for local embeddings) or an **OpenAI API key** (for cloud embeddings)
 
-## Quick Install (Recommended)
+## Homebrew (Recommended)
+
+The easiest way to install grepai on macOS or Linux:
+
+```bash
+brew install yoanbernabeu/tap/grepai
+```
+
+To upgrade later:
+
+```bash
+brew upgrade grepai
+```
+
+## Shell Script
+
+Alternative installation via shell script:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/yoanbernabeu/grepai/main/install.sh | sh
@@ -70,7 +86,13 @@ curl http://localhost:11434/api/tags
 
 ## Updating
 
-Keep grepai up to date with the built-in update command:
+**If installed via Homebrew:**
+
+```bash
+brew upgrade grepai
+```
+
+**If installed via shell script or binary:**
 
 ```bash
 # Check for available updates
