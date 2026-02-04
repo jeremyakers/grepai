@@ -7,21 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-02-04
+
 ### Added
 
-- **Non-Interactive Workspace Create**: `workspace create` now supports `--name`, `--backend`, `--embedder-provider`, `--embedder-model`, `--dsn` flags for scripted/CI usage
+- **Non-Interactive Workspace Create**: `workspace create` now supports `--name`, `--backend`, `--embedder-provider`, `--embedder-model`, `--dsn` flags for scripted/CI usage (#100) - @jugrajsingh
   - Enables fully non-interactive workspace creation without TUI prompts
   - All required parameters can be passed as CLI flags
-- **MCP Serve Workspace Flag**: `mcp-serve --workspace <name>` to scope MCP tools to a specific workspace
+- **MCP Serve Workspace Flag**: `mcp-serve --workspace <name>` to scope MCP tools to a specific workspace (#100) - @jugrajsingh
   - MCP search and trace tools automatically use the workspace context
-- **Workspace Config Helpers**: `FindWorkspaceConfig()` and `WorkspaceStoreConfig()` in config package for programmatic workspace resolution
+- **Workspace Config Helpers**: `FindWorkspaceConfig()` and `WorkspaceStoreConfig()` in config package for programmatic workspace resolution (#100) - @jugrajsingh
 
 ### Documentation
 
+- **Community Tools Page**: New documentation page listing community-built tools and integrations (#101) - @miqcie
 - Updated workspace docs with workspace mode, parallelism tiers, and MCP workspace sections
 - Updated MCP docs with workspace-scoped configuration examples
 - Updated embedders docs with parallelism tier reference
 - Updated watch guide with workspace daemon examples
+
+### Dependencies
+
+- Bump `golang.org/x/sync` from 0.18.0 to 0.19.0 (#99) - @dependabot
 
 ## [0.26.0] - 2026-02-01
 
@@ -489,7 +496,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial public release
 
-[Unreleased]: https://github.com/yoanbernabeu/grepai/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/yoanbernabeu/grepai/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/yoanbernabeu/grepai/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/yoanbernabeu/grepai/compare/v0.25.2...v0.26.0
 [0.25.2]: https://github.com/yoanbernabeu/grepai/compare/v0.25.1...v0.25.2
 [0.25.1]: https://github.com/yoanbernabeu/grepai/compare/v0.25.0...v0.25.1
