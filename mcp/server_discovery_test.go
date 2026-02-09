@@ -1,7 +1,6 @@
 package mcp
 
 import (
-	"context"
 	"testing"
 )
 
@@ -41,8 +40,8 @@ func TestEncodeOutput(t *testing.T) {
 	}
 
 	tests := []struct {
-		name   string
-		format string
+		name      string
+		format    string
 		expectErr bool
 	}{
 		{
