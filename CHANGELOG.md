@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Client-side filtering for GOB and Qdrant stores
   - Works with all existing search options (--json, --toon, --compact, --limit, --workspace, --project)
   - Efficiently filters results at the database layer for optimal performance
+  - Available in MCP `grepai_search` tool via `path` parameter
 
 ## [0.30.0] - 2026-02-08
 
