@@ -1589,8 +1589,8 @@ func (p *projectPrefixStore) DeleteByFile(ctx context.Context, filePath string) 
 	return p.store.DeleteByFile(ctx, prefixedPath)
 }
 
-func (p *projectPrefixStore) Search(ctx context.Context, queryVector []float32, limit int) ([]store.SearchResult, error) {
-	return p.store.Search(ctx, queryVector, limit)
+func (p *projectPrefixStore) Search(ctx context.Context, queryVector []float32, limit int, pathPrefix string) ([]store.SearchResult, error) {
+	return p.store.Search(ctx, queryVector, limit, pathPrefix)
 }
 
 func (p *projectPrefixStore) GetDocument(ctx context.Context, filePath string) (*store.Document, error) {

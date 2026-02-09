@@ -229,7 +229,7 @@ func TestProjectPrefixStore_PassThroughAndGetChunks(t *testing.T) {
 		projectPath:   projectRoot,
 	}
 
-	results, err := wrapped.Search(ctx, []float32{1, 2}, 5)
+	results, err := wrapped.Search(ctx, []float32{1, 2}, 5, "")
 	if err != nil {
 		t.Fatalf("Search failed: %v", err)
 	}

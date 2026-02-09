@@ -119,18 +119,29 @@ func (s *PostgresStore) DeleteByFile(ctx context.Context, filePath string) error
 	return nil
 }
 
-func (s *PostgresStore) Search(ctx context.Context, queryVector []float32, limit int) ([]SearchResult, error) {
+func (s *PostgresStore) Search(ctx context.Context, queryVector []float32, limit int, pathPrefix string) ([]SearchResult, error) {
 	vec := pgvector.NewVector(queryVector)
 
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, file_path, start_line, end_line, content, vector, hash, updated_at,
-			1 - (vector <=> $1) as score
-		FROM chunks
-		WHERE project_id = $2
-		ORDER BY vector <=> $1
-		LIMIT $3`,
-		vec, s.projectID, limit,
-	)
+	query := `SELECT id, file_path, start_line, end_line, content, vector, hash, updated_at,
+		1 - (vector <=> $1) as score
+	FROM chunks
+	WHERE project_id = $2`
+
+	args := []interface{}{vec, s.projectID}
+	nextParam := 3
+
+	// Add path prefix filter if provided
+	if pathPrefix != "" {
+		query += ` AND file_path LIKE $` + fmt.Sprintf("%d", nextParam)
+		args = append(args, pathPrefix+"%")
+		nextParam++
+	}
+
+	query += ` ORDER BY vector <=> $1
+	LIMIT $` + fmt.Sprintf("%d", nextParam)
+	args = append(args, limit)
+
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to search: %w", err)
 	}

@@ -22,6 +22,7 @@ var (
 	searchCompact   bool
 	searchWorkspace string
 	searchProjects  []string
+	searchPath      string
 )
 
 // SearchResultJSON is a lightweight struct for JSON output (excludes vector, hash, updated_at)
@@ -61,6 +62,7 @@ func init() {
 	searchCmd.Flags().BoolVarP(&searchCompact, "compact", "c", false, "Output minimal format without content (requires --json or --toon)")
 	searchCmd.Flags().StringVar(&searchWorkspace, "workspace", "", "Workspace name for cross-project search")
 	searchCmd.Flags().StringArrayVar(&searchProjects, "project", nil, "Project name(s) to search (requires --workspace, can be repeated)")
+	searchCmd.Flags().StringVar(&searchPath, "path", "", "Path prefix to filter search results")
 	searchCmd.MarkFlagsMutuallyExclusive("json", "toon")
 }
 
@@ -170,7 +172,7 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	searcher := search.NewSearcher(st, emb, cfg.Search)
 
 	// Search with boosting
-	results, err := searcher.Search(ctx, query, searchLimit)
+	results, err := searcher.Search(ctx, query, searchLimit, searchPath)
 	if err != nil {
 		if searchJSON {
 			return outputSearchErrorJSON(err)
@@ -380,7 +382,7 @@ func SearchJSON(projectRoot string, query string, limit int) ([]store.SearchResu
 	// Create searcher with boost config
 	searcher := search.NewSearcher(st, emb, cfg.Search)
 
-	return searcher.Search(ctx, query, limit)
+	return searcher.Search(ctx, query, limit, "")
 }
 
 func init() {
@@ -480,7 +482,7 @@ func runWorkspaceSearch(ctx context.Context, query string) error {
 	searcher := search.NewSearcher(st, emb, searchCfg)
 
 	// Search
-	results, err := searcher.Search(ctx, query, searchLimit)
+	results, err := searcher.Search(ctx, query, searchLimit, searchPath)
 	if err != nil {
 		if searchJSON {
 			return outputSearchErrorJSON(err)

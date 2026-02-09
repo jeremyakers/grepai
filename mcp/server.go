@@ -271,7 +271,7 @@ func (s *Server) handleSearch(ctx context.Context, request mcp.CallToolRequest) 
 
 	// Create searcher and search
 	searcher := search.NewSearcher(st, emb, cfg.Search)
-	results, err := searcher.Search(ctx, query, limit)
+	results, err := searcher.Search(ctx, query, limit, "")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
 	}
@@ -353,7 +353,7 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 	searcher := search.NewSearcher(st, emb, searchCfg)
 
 	// Search
-	results, err := searcher.Search(ctx, query, limit)
+	results, err := searcher.Search(ctx, query, limit, "")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
 	}

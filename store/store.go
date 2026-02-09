@@ -56,7 +56,8 @@ type VectorStore interface {
 	DeleteByFile(ctx context.Context, filePath string) error
 
 	// Search finds the most similar chunks to a query vector
-	Search(ctx context.Context, queryVector []float32, limit int) ([]SearchResult, error)
+	// pathPrefix filters results to files that start with this prefix (empty string means no filter)
+	Search(ctx context.Context, queryVector []float32, limit int, pathPrefix string) ([]SearchResult, error)
 
 	// GetDocument retrieves document metadata by path
 	GetDocument(ctx context.Context, filePath string) (*Document, error)
