@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+
+- **Path Prefix Search Filter**: Add `--path` flag to `grepai search` command to filter results by file path prefix
+  - Database-level filtering for PostgreSQL using SQL `LIKE` operator
+  - Client-side filtering for GOB and Qdrant stores
+  - Works with all existing search options (--json, --toon, --compact, --limit, --workspace, --project)
+  - Efficiently filters results at the database layer for optimal performance
 
 ## [0.30.0] - 2026-02-08
 
