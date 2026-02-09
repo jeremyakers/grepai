@@ -224,14 +224,14 @@ func (s *QdrantStore) Search(ctx context.Context, queryVector []float32, limit i
 	if limit <= 0 {
 		return nil, fmt.Errorf("limit must be positive, got: %d", limit)
 	}
-	
+
 	// Fetch more results to account for filtering by path prefix
 	fetchLimit := limit
 	if pathPrefix != "" {
 		// Fetch 2x the limit to allow for filtering
 		fetchLimit = limit * 2
 	}
-	
+
 	searchResult, err := s.client.Query(ctx, &qdrant.QueryPoints{
 		CollectionName: s.collectionName,
 		Query:          qdrant.NewQuery(queryVector...),
@@ -245,17 +245,17 @@ func (s *QdrantStore) Search(ctx context.Context, queryVector []float32, limit i
 	results := make([]SearchResult, 0, len(searchResult))
 	for _, point := range searchResult {
 		chunk := s.parseChunkPayload(point.Payload)
-		
+
 		// Filter by path prefix if provided
 		if pathPrefix != "" && !strings.HasPrefix(chunk.FilePath, pathPrefix) {
 			continue
 		}
-		
+
 		results = append(results, SearchResult{
 			Chunk: *chunk,
 			Score: point.Score,
 		})
-		
+
 		// Stop once we have enough results
 		if len(results) >= limit {
 			break

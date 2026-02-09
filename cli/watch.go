@@ -408,56 +408,6 @@ func initializeStore(ctx context.Context, cfg *config.Config, projectRoot string
 
 const configWriteThrottle = 30 * time.Second
 
-//nolint:unused // Retained for upcoming watch-loop refactor across fg/bg modes.
-func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore *trace.GOBSymbolStore, w *watcher.Watcher, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, tracedLanguages []string, projectRoot string, cfg *config.Config, isBackgroundChild bool) error {
-	// Handle signals
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	if !isBackgroundChild {
-		fmt.Println("\nWatching for changes... (Press Ctrl+C to stop)")
-	} else {
-		log.Println("Watching for changes...")
-	}
-
-	// Periodic persist ticker
-	persistTicker := time.NewTicker(30 * time.Second)
-	defer persistTicker.Stop()
-
-	// Config write throttling - only write every 30 seconds at most
-	var lastConfigWrite time.Time
-
-	// Event loop
-	for {
-		select {
-		case <-sigChan:
-			if !isBackgroundChild {
-				fmt.Println("\nShutting down...")
-			} else {
-				log.Println("Shutting down...")
-			}
-			if err := st.Persist(ctx); err != nil {
-				log.Printf("Warning: failed to persist index on shutdown: %v", err)
-			}
-			if err := symbolStore.Persist(ctx); err != nil {
-				log.Printf("Warning: failed to persist symbol index on shutdown: %v", err)
-			}
-			return nil
-
-		case <-persistTicker.C:
-			if err := st.Persist(ctx); err != nil {
-				log.Printf("Warning: failed to persist index: %v", err)
-			}
-			if err := symbolStore.Persist(ctx); err != nil {
-				log.Printf("Warning: failed to persist symbol index: %v", err)
-			}
-
-		case event := <-w.Events():
-			handleFileEvent(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, projectRoot, cfg, &lastConfigWrite, event)
-		}
-	}
-}
-
 func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore *trace.GOBSymbolStore, tracedLanguages []string, isBackgroundChild bool) (*indexer.IndexStats, error) {
 	// Initial scan with progress
 	if !isBackgroundChild {
@@ -581,7 +531,7 @@ func discoverWorktreesForWatch(projectRoot string) []string {
 // watchProject runs the full watch lifecycle for a single project.
 // The embedder is shared across all projects to avoid duplicate connections.
 // If onReady is non-nil, it is called once after initial indexing and watcher start.
-func watchProject(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func()) error {
+func watchProject(ctx context.Context, projectRoot string, emb embedder.Embedder, onReady func()) error {
 	// Load configuration
 	cfg, err := config.Load(projectRoot)
 	if err != nil {
@@ -852,7 +802,7 @@ func runWatchForeground() error {
 			}()
 		}
 
-		return watchProject(watchCtx, projectRoot, emb, isBackgroundChild, onReady)
+		return watchProject(watchCtx, projectRoot, emb, onReady)
 	}
 
 	// Multi-worktree mode: run all projects in parallel using errgroup
@@ -873,7 +823,7 @@ func runWatchForeground() error {
 	g.Go(func() error {
 		onReady := makeOnReady()
 		defer onReady() // ensure Done() even if watchProject fails before calling onReady
-		return watchProject(gCtx, projectRoot, emb, true, onReady)
+		return watchProject(gCtx, projectRoot, emb, onReady)
 	})
 
 	// Linked worktrees
@@ -882,7 +832,7 @@ func runWatchForeground() error {
 		g.Go(func() error {
 			onReady := makeOnReady()
 			defer onReady()
-			return watchProject(gCtx, wt, emb, true, onReady)
+			return watchProject(gCtx, wt, emb, onReady)
 		})
 	}
 

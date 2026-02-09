@@ -378,26 +378,49 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 	}
 	searcher := search.NewSearcher(st, emb, searchCfg)
 
-	// Construct full path prefix for database query
-	// Database stores paths as: workspaceName/projectName/relativePath
-	// When a single project is specified, include it in the path prefix to push filtering to database level
+	// Construct full path prefix for database query. Database stores paths as:
+	// workspaceName/projectName/relativePath. When a single project is specified,
+	// include it in the path prefix to push filtering to database level. If no
+	// project is specified but a user path is provided, we must search using the
+	// workspace prefix and perform post-filtering to match the relative path
+	// across any project (since project name sits between workspace and user path).
 	fullPathPrefix := ws.Name + "/"
+	singleProject := ""
 	if projectsStr != "" {
 		projectNames := strings.Split(projectsStr, ",")
 		if len(projectNames) == 1 {
-			// If exactly one project specified, include it in the path prefix for database-level filtering
-			// This ensures file_path LIKE 'workspace/project/%' filter is applied even if no path parameter provided
-			fullPathPrefix += strings.TrimSpace(projectNames[0]) + "/"
+			singleProject = strings.TrimSpace(projectNames[0])
+			fullPathPrefix += singleProject + "/"
 		}
 	}
+
+	// Add path prefix if provided
 	if pathPrefix != "" {
 		fullPathPrefix += pathPrefix
 	}
 
 	// Search
-	results, err := searcher.Search(ctx, query, limit, fullPathPrefix)
+	var results []store.SearchResult
+	results, err = searcher.Search(ctx, query, limit, fullPathPrefix)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+	}
+
+	// If no single project was specified but a user path was provided, we
+	// post-filter results to match the relative path inside each project.
+	if singleProject == "" && pathPrefix != "" {
+		filtered := make([]store.SearchResult, 0)
+		for _, r := range results {
+			parts := strings.SplitN(r.Chunk.FilePath, "/", 3)
+			if len(parts) < 3 {
+				continue
+			}
+			relative := parts[2]
+			if strings.HasPrefix(relative, pathPrefix) {
+				filtered = append(filtered, r)
+			}
+		}
+		results = filtered
 	}
 
 	// Filter by projects if specified
@@ -879,20 +902,18 @@ func (s *Server) handleListWorkspaces(ctx context.Context, request mcp.CallToolR
 		return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace configuration: %v", err)), nil
 	}
 
-	// Build workspace list with root paths
+	// Build workspace list with project entries
 	type WorkspaceInfo struct {
-		Name     string `json:"name"`
-		RootPath string `json:"root_path"`
-		Active   bool   `json:"active"`
+		Name     string                `json:"name"`
+		Projects []config.ProjectEntry `json:"projects"`
 	}
 
 	var workspaces []WorkspaceInfo
 	for name, ws := range wsConfig.Workspaces {
-		isActive := (name == wsConfig.Active)
+		// ws.Projects is a slice of ProjectEntry
 		workspaces = append(workspaces, WorkspaceInfo{
 			Name:     name,
-			RootPath: ws.RootPath,
-			Active:   isActive,
+			Projects: ws.Projects,
 		})
 	}
 
@@ -925,22 +946,22 @@ func (s *Server) handleListProjects(ctx context.Context, request mcp.CallToolReq
 	}
 
 	// Get specific workspace
-	ws, exists := wsConfig.Workspaces[workspace]
+	wsEntry, exists := wsConfig.Workspaces[workspace]
 	if !exists {
 		return mcp.NewToolResultError(fmt.Sprintf("workspace '%s' not found", workspace)), nil
 	}
 
-	// Build projects list
+	// Build projects list from wsEntry.Projects (slice of ProjectEntry)
 	type ProjectInfo struct {
 		Name string `json:"name"`
 		Path string `json:"path"`
 	}
 
 	var projects []ProjectInfo
-	for name, projPath := range ws.Projects {
+	for _, proj := range wsEntry.Projects {
 		projects = append(projects, ProjectInfo{
-			Name: name,
-			Path: projPath,
+			Name: proj.Name,
+			Path: proj.Path,
 		})
 	}
 

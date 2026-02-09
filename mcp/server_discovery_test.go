@@ -8,27 +8,24 @@ import (
 // and can be called without errors. This is a smoke test to ensure the handlers
 // are callable and the MCP server is properly configured.
 func TestDiscoveryToolsCompile(t *testing.T) {
-	// This test primarily checks that the code compiles and the Server type
-	// has the new handler methods.
+	// This test verifies that the code compiles and the handlers can be created.
+	// The methods are verified to exist by their successful registration in registerTools()
+	// and their use in tool callbacks.
 
-	server := &Server{
-		projectRoot:   "/tmp/test",
-		workspaceName: "test",
+	s, err := NewServer("/tmp/test")
+	if err != nil {
+		t.Fatalf("NewServer failed: %v", err)
 	}
 
-	// Verify the methods exist by checking they can be accessed
-	if server.handleListWorkspaces == nil {
-		t.Fatal("handleListWorkspaces method not found on Server")
+	if s == nil {
+		t.Fatal("server should not be nil")
 	}
 
-	if server.handleListProjects == nil {
-		t.Fatal("handleListProjects method not found on Server")
-	}
-
-	// The handlers are defined and callable, which verifies:
+	// The MCP server was created successfully with all tools registered,
+	// which verifies:
 	// 1. The code compiles without errors
-	// 2. The methods are properly attached to the Server type
-	// 3. The signatures match what MCP expects
+	// 2. The handler methods exist and are accessible
+	// 3. The handlers have the correct signatures
 }
 
 // TestEncodeOutput verifies the output formatting for both JSON and TOON formats

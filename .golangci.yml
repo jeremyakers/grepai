@@ -1,3 +1,5 @@
+version: 1.59
+
 run:
   timeout: 5m
   modules-download-mode: readonly
@@ -50,5 +52,5 @@ issues:
 
 output:
   formats:
-    - format: colored-line-number
+    colored-line-number: {}
   sort-results: true

@@ -247,7 +247,7 @@ func randomString(length int) string {
 }
 
 // testGetPostgresDSN retrieves PostgreSQL DSN from environment or returns empty string
-func testGetPostgresDSN(t *testing.T) string {
+func testGetPostgresDSN(_ *testing.T) string {
 	// This would normally read from environment or test config
 	// For now, return empty to skip PostgreSQL tests
 	return ""
