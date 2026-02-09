@@ -150,7 +150,7 @@ func (s *Server) registerTools() {
 			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
 		),
 		mcp.WithString("path",
-			mcp.Description("Path prefix to filter results (e.g., 'src/', 'api/v1/')"),
+			mcp.Description("Path prefix to filter results. Relative to workspace root if only workspace provided, or project root if both workspace and projects provided (e.g., 'src/' or 'src/handlers/auth/')"),
 		),
 		mcp.WithString("workspace",
 			mcp.Description("Workspace name for cross-project search (optional)"),
@@ -356,8 +356,24 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 	}
 	searcher := search.NewSearcher(st, emb, searchCfg)
 
+	// Construct full path prefix for database query
+	// Database stores paths as: workspaceName/projectName/relativePath
+	// When a single project is specified, include it in the path prefix to push filtering to database level
+	fullPathPrefix := ws.Name + "/"
+	if projectsStr != "" {
+		projectNames := strings.Split(projectsStr, ",")
+		if len(projectNames) == 1 {
+			// If exactly one project specified, include it in the path prefix for database-level filtering
+			// This ensures file_path LIKE 'workspace/project/%' filter is applied even if no path parameter provided
+			fullPathPrefix += strings.TrimSpace(projectNames[0]) + "/"
+		}
+	}
+	if pathPrefix != "" {
+		fullPathPrefix += pathPrefix
+	}
+
 	// Search
-	results, err := searcher.Search(ctx, query, limit, pathPrefix)
+	results, err := searcher.Search(ctx, query, limit, fullPathPrefix)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
 	}

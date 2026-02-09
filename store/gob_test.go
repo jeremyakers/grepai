@@ -98,7 +98,7 @@ func TestGOBStore_DeleteByFile(t *testing.T) {
 	}
 
 	// Search should return no results
-	results, err := store2.Search(ctx, []float32{1.0, 0.0}, 10, "")
+	results, err := store.Search(ctx, []float32{1.0, 0.0}, 10, "")
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}
@@ -144,7 +144,7 @@ func TestGOBStore_PersistAndLoad(t *testing.T) {
 	}
 
 	// Verify data is loaded
-	results, err := store.Search(ctx, []float32{1.0, 0.0}, 10, "")
+	results, err := store2.Search(ctx, []float32{1.0, 0.0}, 10, "")
 	if err != nil {
 		t.Fatalf("search failed: %v", err)
 	}

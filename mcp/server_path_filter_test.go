@@ -7,21 +7,21 @@ import (
 
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/search"
-	"github.com/yoanbernabeu/grepai/store"
+	storelib "github.com/yoanbernabeu/grepai/store"
 )
 
 // MockMCPStore is a mock VectorStore for MCP tests
 type MockMCPStore struct {
-	chunks map[string]store.Chunk
+	chunks map[string]storelib.Chunk
 }
 
 func NewMockMCPStore() *MockMCPStore {
 	return &MockMCPStore{
-		chunks: make(map[string]store.Chunk),
+		chunks: make(map[string]storelib.Chunk),
 	}
 }
 
-func (m *MockMCPStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error {
+func (m *MockMCPStore) SaveChunks(ctx context.Context, chunks []storelib.Chunk) error {
 	for _, chunk := range chunks {
 		m.chunks[chunk.ID] = chunk
 	}
@@ -37,8 +37,8 @@ func (m *MockMCPStore) DeleteByFile(ctx context.Context, filePath string) error 
 	return nil
 }
 
-func (m *MockMCPStore) Search(ctx context.Context, queryVector []float32, limit int, pathPrefix string) ([]store.SearchResult, error) {
-	results := make([]store.SearchResult, 0)
+func (m *MockMCPStore) Search(ctx context.Context, queryVector []float32, limit int, pathPrefix string) ([]storelib.SearchResult, error) {
+	results := make([]storelib.SearchResult, 0)
 	for _, chunk := range m.chunks {
 		// Filter by path prefix if provided
 		if pathPrefix != "" && len(chunk.FilePath) < len(pathPrefix) {
@@ -56,7 +56,7 @@ func (m *MockMCPStore) Search(ctx context.Context, queryVector []float32, limit 
 			}
 		}
 
-		results = append(results, store.SearchResult{
+		results = append(results, storelib.SearchResult{
 			Chunk: chunk,
 			Score: score,
 		})
@@ -68,11 +68,11 @@ func (m *MockMCPStore) Search(ctx context.Context, queryVector []float32, limit 
 	return results, nil
 }
 
-func (m *MockMCPStore) GetDocument(ctx context.Context, filePath string) (*store.Document, error) {
+func (m *MockMCPStore) GetDocument(ctx context.Context, filePath string) (*storelib.Document, error) {
 	return nil, nil
 }
 
-func (m *MockMCPStore) SaveDocument(ctx context.Context, doc store.Document) error {
+func (m *MockMCPStore) SaveDocument(ctx context.Context, doc storelib.Document) error {
 	return nil
 }
 
@@ -96,20 +96,20 @@ func (m *MockMCPStore) Close() error {
 	return nil
 }
 
-func (m *MockMCPStore) GetStats(ctx context.Context) (*store.IndexStats, error) {
+func (m *MockMCPStore) GetStats(ctx context.Context) (*storelib.IndexStats, error) {
 	return nil, nil
 }
 
-func (m *MockMCPStore) ListFilesWithStats(ctx context.Context) ([]store.FileStats, error) {
+func (m *MockMCPStore) ListFilesWithStats(ctx context.Context) ([]storelib.FileStats, error) {
 	return nil, nil
 }
 
-func (m *MockMCPStore) GetChunksForFile(ctx context.Context, filePath string) ([]store.Chunk, error) {
+func (m *MockMCPStore) GetChunksForFile(ctx context.Context, filePath string) ([]storelib.Chunk, error) {
 	return nil, nil
 }
 
-func (m *MockMCPStore) GetAllChunks(ctx context.Context) ([]store.Chunk, error) {
-	chunks := make([]store.Chunk, 0, len(m.chunks))
+func (m *MockMCPStore) GetAllChunks(ctx context.Context) ([]storelib.Chunk, error) {
+	chunks := make([]storelib.Chunk, 0, len(m.chunks))
 	for _, chunk := range m.chunks {
 		chunks = append(chunks, chunk)
 	}
@@ -123,6 +123,18 @@ func (m *MockMCPEmbedder) Embed(ctx context.Context, text string) ([]float32, er
 	return []float32{0.9, 0.1, 0.0}, nil
 }
 
+func (m *MockMCPEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	result := make([][]float32, len(texts))
+	for i := range texts {
+		result[i] = []float32{0.9, 0.1, 0.0}
+	}
+	return result, nil
+}
+
+func (m *MockMCPEmbedder) Dimensions() int {
+	return 3
+}
+
 func (m *MockMCPEmbedder) Close() error {
 	return nil
 }
@@ -130,11 +142,11 @@ func (m *MockMCPEmbedder) Close() error {
 // TestMCPSearchWithPathParameter tests the path parameter in MCP search
 func TestMCPSearchWithPathParameter(t *testing.T) {
 	ctx := context.Background()
-	store := NewMockMCPStore()
+	mockStore := NewMockMCPStore()
 	embedder := &MockMCPEmbedder{}
 
 	// Setup test chunks
-	chunks := []store.Chunk{
+	chunks := []storelib.Chunk{
 		{
 			ID:        "1",
 			FilePath:  "src/handlers/auth.go",
@@ -177,7 +189,7 @@ func TestMCPSearchWithPathParameter(t *testing.T) {
 		},
 	}
 
-	if err := store.SaveChunks(ctx, chunks); err != nil {
+	if err := mockStore.SaveChunks(ctx, chunks); err != nil {
 		t.Fatalf("failed to save chunks: %v", err)
 	}
 
@@ -186,7 +198,7 @@ func TestMCPSearchWithPathParameter(t *testing.T) {
 		Boost:  config.BoostConfig{},
 		Hybrid: config.HybridConfig{Enabled: false},
 	}
-	searcher := search.NewSearcher(store, embedder, cfg)
+	searcher := search.NewSearcher(mockStore, embedder, cfg)
 
 	tests := []struct {
 		name       string
@@ -203,25 +215,25 @@ func TestMCPSearchWithPathParameter(t *testing.T) {
 			name:       "filter by src/ directory",
 			pathPrefix: "src/",
 			wantCount:  2,
-			wantFiles: []string{"src/handlers/auth.go", "src/models/user.go"},
+			wantFiles:  []string{"src/handlers/auth.go", "src/models/user.go"},
 		},
 		{
 			name:       "filter by src/handlers/ subdirectory",
 			pathPrefix: "src/handlers/",
 			wantCount:  1,
-			wantFiles: []string{"src/handlers/auth.go"},
+			wantFiles:  []string{"src/handlers/auth.go"},
 		},
 		{
 			name:       "filter by api/ directory",
 			pathPrefix: "api/",
 			wantCount:  1,
-			wantFiles: []string{"api/v1/routes.go"},
+			wantFiles:  []string{"api/v1/routes.go"},
 		},
 		{
 			name:       "filter by test/ directory",
 			pathPrefix: "test/",
 			wantCount:  1,
-			wantFiles: []string{"test/unit/auth_test.go"},
+			wantFiles:  []string{"test/unit/auth_test.go"},
 		},
 		{
 			name:       "filter with non-existent path",
@@ -270,11 +282,11 @@ func TestMCPSearchWithPathParameter(t *testing.T) {
 // TestMCPSearchPathWithLimit tests path filtering combined with result limit
 func TestMCPSearchPathWithLimit(t *testing.T) {
 	ctx := context.Background()
-	store := NewMockMCPStore()
+	mockStore := NewMockMCPStore()
 	embedder := &MockMCPEmbedder{}
 
 	// Setup chunks in src/ directory
-	chunks := []store.Chunk{
+	chunks := []storelib.Chunk{
 		{
 			ID:        "1",
 			FilePath:  "src/a.go",
@@ -317,7 +329,7 @@ func TestMCPSearchPathWithLimit(t *testing.T) {
 		},
 	}
 
-	if err := store.SaveChunks(ctx, chunks); err != nil {
+	if err := mockStore.SaveChunks(ctx, chunks); err != nil {
 		t.Fatalf("failed to save chunks: %v", err)
 	}
 
@@ -325,7 +337,7 @@ func TestMCPSearchPathWithLimit(t *testing.T) {
 		Boost:  config.BoostConfig{},
 		Hybrid: config.HybridConfig{Enabled: false},
 	}
-	searcher := search.NewSearcher(store, embedder, cfg)
+	searcher := search.NewSearcher(mockStore, embedder, cfg)
 
 	// Test combining path filter with limit
 	results, err := searcher.Search(ctx, "test", 2, "src/")

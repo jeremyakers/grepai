@@ -37,7 +37,7 @@ func (m *mockVectorStore) DeleteByFile(_ context.Context, filePath string) error
 	return nil
 }
 
-func (m *mockVectorStore) Search(_ context.Context, queryVector []float32, limit int) ([]store.SearchResult, error) {
+func (m *mockVectorStore) Search(_ context.Context, queryVector []float32, limit int, pathPrefix string) ([]store.SearchResult, error) {
 	m.searchVector = queryVector
 	m.searchLimit = limit
 	return m.searchResults, nil

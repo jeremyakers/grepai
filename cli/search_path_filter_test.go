@@ -124,6 +124,19 @@ func (m *MockEmbedder) Embed(ctx context.Context, text string) ([]float32, error
 	return []float32{0.9, 0.1, 0.0}, nil
 }
 
+func (m *MockEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	// Return constant vectors for all texts
+	result := make([][]float32, len(texts))
+	for i := range texts {
+		result[i] = []float32{0.9, 0.1, 0.0}
+	}
+	return result, nil
+}
+
+func (m *MockEmbedder) Dimensions() int {
+	return 3
+}
+
 func (m *MockEmbedder) Close() error {
 	return nil
 }
@@ -225,7 +238,7 @@ func TestSearcherWithPathPrefix(t *testing.T) {
 			// Verify all results match the path prefix
 			for _, result := range results {
 				if tt.pathPrefix != "" {
-					if len(result.Chunk.FilePath) < len(tt.pathPrefix) || 
+					if len(result.Chunk.FilePath) < len(tt.pathPrefix) ||
 						result.Chunk.FilePath[:len(tt.pathPrefix)] != tt.pathPrefix {
 						t.Errorf("result %s doesn't start with prefix %s", result.Chunk.FilePath, tt.pathPrefix)
 					}
