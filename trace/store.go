@@ -297,6 +297,31 @@ func (s *GOBSymbolStore) GetCallGraph(ctx context.Context, symbolName string, de
 		depth int
 	}
 	queue := []queueItem{{symbolName, 0}}
+	edgeSeen := make(map[string]bool)
+
+	shouldTraverse := func(name string, isRoot bool) bool {
+		symbols := s.index.Symbols[name]
+		if len(symbols) == 0 {
+			return false
+		}
+		// Root is explicitly requested by user and may be ambiguous.
+		if isRoot {
+			return true
+		}
+		// Avoid exploding through name-collided symbols (e.g. Load, Init).
+		return len(symbols) == 1
+	}
+	isDeclarationSelfEdge := func(edge CallEdge) bool {
+		if edge.Caller != edge.Callee {
+			return false
+		}
+		for _, sym := range s.index.Symbols[edge.Caller] {
+			if sym.File == edge.File && sym.Line == edge.Line {
+				return true
+			}
+		}
+		return false
+	}
 
 	for len(queue) > 0 {
 		current := queue[0]
@@ -313,26 +338,28 @@ func (s *GOBSymbolStore) GetCallGraph(ctx context.Context, symbolName string, de
 		}
 
 		// Find edges (both callers and callees)
-		edgeSeen := make(map[string]bool)
 		for _, edge := range s.index.CallGraph {
 			if edge.Caller == current.name {
+				if isDeclarationSelfEdge(edge) {
+					continue
+				}
 				edgeKey := fmt.Sprintf("%s->%s", edge.Caller, edge.Callee)
 				if !edgeSeen[edgeKey] {
 					graph.Edges = append(graph.Edges, edge)
 					edgeSeen[edgeKey] = true
 				}
-				if !visited[edge.Callee] {
+				if !visited[edge.Callee] && shouldTraverse(edge.Callee, false) {
 					queue = append(queue, queueItem{edge.Callee, current.depth + 1})
 				}
 			}
-			if edge.Callee == current.name {
+			if current.depth == 0 && edge.Callee == current.name {
+				if isDeclarationSelfEdge(edge) {
+					continue
+				}
 				edgeKey := fmt.Sprintf("%s->%s", edge.Caller, edge.Callee)
 				if !edgeSeen[edgeKey] {
 					graph.Edges = append(graph.Edges, edge)
 					edgeSeen[edgeKey] = true
-				}
-				if !visited[edge.Caller] {
-					queue = append(queue, queueItem{edge.Caller, current.depth + 1})
 				}
 			}
 		}
