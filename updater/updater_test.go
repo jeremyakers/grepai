@@ -319,6 +319,60 @@ func TestProgressReader(t *testing.T) {
 	}
 }
 
+func TestSafeRename_HappyPath(t *testing.T) {
+	tempDir := t.TempDir()
+
+	src := filepath.Join(tempDir, "source.txt")
+	dst := filepath.Join(tempDir, "dest.txt")
+
+	if err := os.WriteFile(src, []byte("hello"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := safeRename(src, dst); err != nil {
+		t.Fatalf("safeRename failed: %v", err)
+	}
+
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Error("source file should no longer exist")
+	}
+
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("failed to read destination: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Errorf("expected content %q, got %q", "hello", string(data))
+	}
+}
+
+func TestSafeRename_PermissionsPreserved(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission bits not applicable on Windows")
+	}
+
+	tempDir := t.TempDir()
+
+	src := filepath.Join(tempDir, "source.txt")
+	dst := filepath.Join(tempDir, "dest.txt")
+
+	if err := os.WriteFile(src, []byte("hello"), 0744); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := safeRename(src, dst); err != nil {
+		t.Fatalf("safeRename failed: %v", err)
+	}
+
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("failed to stat destination: %v", err)
+	}
+	if info.Mode().Perm() != 0744 {
+		t.Errorf("expected permissions 0744, got %04o", info.Mode().Perm())
+	}
+}
+
 type mockReader struct {
 	data   []byte
 	offset int

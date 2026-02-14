@@ -21,16 +21,17 @@ const (
 
 // Symbol represents a symbol definition in the codebase.
 type Symbol struct {
-	Name      string     `json:"name"`
-	Kind      SymbolKind `json:"kind"`
-	File      string     `json:"file"`
-	Line      int        `json:"line"`
-	EndLine   int        `json:"end_line,omitempty"`
-	Signature string     `json:"signature,omitempty"`
-	Receiver  string     `json:"receiver,omitempty"`
-	Package   string     `json:"package,omitempty"`
-	Exported  bool       `json:"exported,omitempty"`
-	Language  string     `json:"language"`
+	Name        string     `json:"name"`
+	Kind        SymbolKind `json:"kind"`
+	File        string     `json:"file"`
+	Line        int        `json:"line"`
+	EndLine     int        `json:"end_line,omitempty"`
+	Signature   string     `json:"signature,omitempty"`
+	Receiver    string     `json:"receiver,omitempty"`
+	Package     string     `json:"package,omitempty"`
+	Exported    bool       `json:"exported,omitempty"`
+	Language    string     `json:"language"`
+	FeaturePath string     `json:"feature_path,omitempty"` // RPG semantic hierarchy path (populated when RPG enabled)
 }
 
 // Reference represents a usage/call of a symbol.
@@ -135,6 +136,9 @@ type SymbolStore interface {
 	// DeleteFile removes all symbols and references for a file.
 	DeleteFile(ctx context.Context, filePath string) error
 
+	// IsFileIndexed checks if a file has been indexed.
+	IsFileIndexed(filePath string) bool
+
 	// LookupSymbol finds symbol definitions by name.
 	LookupSymbol(ctx context.Context, name string) ([]Symbol, error)
 
@@ -152,6 +156,12 @@ type SymbolStore interface {
 
 	// Persist writes the index to storage.
 	Persist(ctx context.Context) error
+
+	// GetSymbolsForFile returns all symbols defined in a specific file.
+	GetSymbolsForFile(ctx context.Context, filePath string) ([]Symbol, error)
+
+	// GetCallEdges returns all call graph edges.
+	GetCallEdges(ctx context.Context) ([]CallEdge, error)
 
 	// Close shuts down the store.
 	Close() error

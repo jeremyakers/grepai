@@ -15,6 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Efficiently filters results at the database layer for optimal performance
   - Available in MCP `grepai_search` tool via `path` parameter
 
+## [0.31.0] - 2026-02-13
+
+### Added
+
+- **RPG Semantic Graph Layer**: Add RPG semantic graph layer fully integrated into existing APIs (#110) - @tinker495
+- **Workspace Mode**: Add trace, symbol indexing, and watcher fixes for workspace mode (#121) - @jugrajsingh
+  - `grepai trace callers/callees/graph` now supports `--workspace` and `--project` flags for cross-project call graph analysis
+  - `grepai watch --workspace` now extracts symbols and builds per-project call graphs (stored in `.grepai/symbols.gob` per project)
+  - MCP trace tools (`grepai_trace_callers`, `grepai_trace_callees`, `grepai_trace_graph`) and `grepai_index_status` support workspace and project parameters
+  - Extracted `trace.SymbolStore` interface from `GOBSymbolStore` for extensibility
+- **Watch Optimization**: Reduce branch-switch reparsing with metadata and symbol hash cache (#123) - @tinker495
+
+### Fixed
+
+- **MCP Windsurf Compatibility**: Add titleFixWriter for Windsurf stdio compatibility (#104) - @cmdaltctr
+- **Update Command**: Fix cross-device link and newline output in `grepai update` (#124) - @hansipie
+- **GOB Store Directory Creation**: GOB stores create missing parent directories on persist (#136) - @tinker495
+- **Call Graph Quality**: Improve callgraph quality and GOB store resilience (#137) - @tinker495
+- **Call Graph Nodes**: Fix caller nodes missing from call graph for incoming edges
+- **Daemon Windows**: Use file-based stop signal on Windows (#140) - @tintop2k
+- **Watcher Event Routing**: Fixed workspace file events being silently dropped due to relative vs absolute path comparison
+
 ## [0.30.0] - 2026-02-08
 
 ### Added
@@ -542,7 +564,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial public release
 
-[Unreleased]: https://github.com/yoanbernabeu/grepai/compare/v0.30.0...HEAD
+[Unreleased]: https://github.com/yoanbernabeu/grepai/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/yoanbernabeu/grepai/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/yoanbernabeu/grepai/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/yoanbernabeu/grepai/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/yoanbernabeu/grepai/compare/v0.27.0...v0.28.0

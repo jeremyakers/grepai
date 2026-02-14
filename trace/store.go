@@ -5,21 +5,24 @@ import (
 	"encoding/gob"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
 
 // GOBSymbolStore implements SymbolStore using GOB encoding.
 type GOBSymbolStore struct {
-	indexPath string
-	index     *SymbolIndex
-	fileIndex map[string]bool
-	mu        sync.RWMutex
+	indexPath         string
+	index             *SymbolIndex
+	fileIndex         map[string]bool
+	fileContentHashes map[string]string
+	mu                sync.RWMutex
 }
 
 type gobSymbolData struct {
-	Index     SymbolIndex
-	FileIndex map[string]bool
+	Index             SymbolIndex
+	FileIndex         map[string]bool
+	FileContentHashes map[string]string
 }
 
 // NewGOBSymbolStore creates a new GOB-based symbol store.
@@ -32,7 +35,8 @@ func NewGOBSymbolStore(indexPath string) *GOBSymbolStore {
 			CallGraph:  []CallEdge{},
 			Version:    1,
 		},
-		fileIndex: make(map[string]bool),
+		fileIndex:         make(map[string]bool),
+		fileContentHashes: make(map[string]string),
 	}
 }
 
@@ -57,6 +61,7 @@ func (s *GOBSymbolStore) Load(ctx context.Context) error {
 
 	s.index = &data.Index
 	s.fileIndex = data.FileIndex
+	s.fileContentHashes = data.FileContentHashes
 
 	if s.index.Symbols == nil {
 		s.index.Symbols = make(map[string][]Symbol)
@@ -70,6 +75,9 @@ func (s *GOBSymbolStore) Load(ctx context.Context) error {
 	if s.fileIndex == nil {
 		s.fileIndex = make(map[string]bool)
 	}
+	if s.fileContentHashes == nil {
+		s.fileContentHashes = make(map[string]string)
+	}
 
 	return nil
 }
@@ -79,6 +87,10 @@ func (s *GOBSymbolStore) Persist(ctx context.Context) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	if err := ensureParentDir(s.indexPath); err != nil {
+		return fmt.Errorf("failed to prepare symbol index directory: %w", err)
+	}
+
 	file, err := os.Create(s.indexPath)
 	if err != nil {
 		return fmt.Errorf("failed to create symbol index file: %w", err)
@@ -87,8 +99,9 @@ func (s *GOBSymbolStore) Persist(ctx context.Context) error {
 
 	s.index.UpdatedAt = time.Now()
 	data := gobSymbolData{
-		Index:     *s.index,
-		FileIndex: s.fileIndex,
+		Index:             *s.index,
+		FileIndex:         s.fileIndex,
+		FileContentHashes: s.fileContentHashes,
 	}
 
 	if err := gob.NewEncoder(file).Encode(data); err != nil {
@@ -98,8 +111,19 @@ func (s *GOBSymbolStore) Persist(ctx context.Context) error {
 	return nil
 }
 
+func ensureParentDir(filePath string) error {
+	dir := filepath.Dir(filePath)
+	return os.MkdirAll(dir, 0755)
+}
+
 // SaveFile persists symbols and references for a file.
 func (s *GOBSymbolStore) SaveFile(ctx context.Context, filePath string, symbols []Symbol, refs []Reference) error {
+	return s.SaveFileWithContentHash(ctx, filePath, "", symbols, refs)
+}
+
+// SaveFileWithContentHash persists symbols/references for a file and tracks
+// the current file content hash for future cache checks.
+func (s *GOBSymbolStore) SaveFileWithContentHash(ctx context.Context, filePath string, contentHash string, symbols []Symbol, refs []Reference) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -130,6 +154,11 @@ func (s *GOBSymbolStore) SaveFile(ctx context.Context, filePath string, symbols 
 	}
 
 	s.fileIndex[filePath] = true
+	if contentHash != "" {
+		s.fileContentHashes[filePath] = contentHash
+	} else {
+		delete(s.fileContentHashes, filePath)
+	}
 	return nil
 }
 
@@ -182,6 +211,7 @@ func (s *GOBSymbolStore) deleteFileUnlocked(filePath string) {
 	s.index.CallGraph = filtered
 
 	delete(s.fileIndex, filePath)
+	delete(s.fileContentHashes, filePath)
 }
 
 // LookupSymbol finds symbol definitions by name.
@@ -267,6 +297,31 @@ func (s *GOBSymbolStore) GetCallGraph(ctx context.Context, symbolName string, de
 		depth int
 	}
 	queue := []queueItem{{symbolName, 0}}
+	edgeSeen := make(map[string]bool)
+
+	shouldTraverse := func(name string, isRoot bool) bool {
+		symbols := s.index.Symbols[name]
+		if len(symbols) == 0 {
+			return false
+		}
+		// Root is explicitly requested by user and may be ambiguous.
+		if isRoot {
+			return true
+		}
+		// Avoid exploding through name-collided symbols (e.g. Load, Init).
+		return len(symbols) == 1
+	}
+	isDeclarationSelfEdge := func(edge CallEdge) bool {
+		if edge.Caller != edge.Callee {
+			return false
+		}
+		for _, sym := range s.index.Symbols[edge.Caller] {
+			if sym.File == edge.File && sym.Line == edge.Line {
+				return true
+			}
+		}
+		return false
+	}
 
 	for len(queue) > 0 {
 		current := queue[0]
@@ -283,32 +338,66 @@ func (s *GOBSymbolStore) GetCallGraph(ctx context.Context, symbolName string, de
 		}
 
 		// Find edges (both callers and callees)
-		edgeSeen := make(map[string]bool)
 		for _, edge := range s.index.CallGraph {
 			if edge.Caller == current.name {
+				if isDeclarationSelfEdge(edge) {
+					continue
+				}
 				edgeKey := fmt.Sprintf("%s->%s", edge.Caller, edge.Callee)
 				if !edgeSeen[edgeKey] {
 					graph.Edges = append(graph.Edges, edge)
 					edgeSeen[edgeKey] = true
 				}
-				if !visited[edge.Callee] {
+				if !visited[edge.Callee] && shouldTraverse(edge.Callee, false) {
 					queue = append(queue, queueItem{edge.Callee, current.depth + 1})
 				}
 			}
-			if edge.Callee == current.name {
+			if current.depth == 0 && edge.Callee == current.name {
+				if isDeclarationSelfEdge(edge) {
+					continue
+				}
 				edgeKey := fmt.Sprintf("%s->%s", edge.Caller, edge.Callee)
 				if !edgeSeen[edgeKey] {
 					graph.Edges = append(graph.Edges, edge)
 					edgeSeen[edgeKey] = true
 				}
-				if !visited[edge.Caller] {
-					queue = append(queue, queueItem{edge.Caller, current.depth + 1})
+				// Ensure caller node is present in the graph.
+				if _, exists := graph.Nodes[edge.Caller]; !exists {
+					if syms, ok := s.index.Symbols[edge.Caller]; ok && len(syms) > 0 {
+						graph.Nodes[edge.Caller] = syms[0]
+					}
 				}
 			}
 		}
 	}
 
 	return graph, nil
+}
+
+// GetSymbolsForFile returns all symbols defined in a specific file.
+func (s *GOBSymbolStore) GetSymbolsForFile(ctx context.Context, filePath string) ([]Symbol, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var result []Symbol
+	for _, symbols := range s.index.Symbols {
+		for _, sym := range symbols {
+			if sym.File == filePath {
+				result = append(result, sym)
+			}
+		}
+	}
+	return result, nil
+}
+
+// GetCallEdges returns all call graph edges.
+func (s *GOBSymbolStore) GetCallEdges(ctx context.Context) ([]CallEdge, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	edges := make([]CallEdge, len(s.index.CallGraph))
+	copy(edges, s.index.CallGraph)
+	return edges, nil
 }
 
 // Close shuts down the store.
@@ -350,4 +439,12 @@ func (s *GOBSymbolStore) IsFileIndexed(filePath string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.fileIndex[filePath]
+}
+
+// GetFileContentHash returns the stored content hash for a file when available.
+func (s *GOBSymbolStore) GetFileContentHash(filePath string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	hash, ok := s.fileContentHashes[filePath]
+	return hash, ok
 }
