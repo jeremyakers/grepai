@@ -248,6 +248,28 @@ func (s *Server) registerTools() {
 	)
 	s.mcpServer.AddTool(indexStatusTool, s.handleIndexStatus)
 
+	// grepai_list_workspaces tool
+	listWorkspacesTool := mcp.NewTool("grepai_list_workspaces",
+		mcp.WithDescription("List all available workspaces with their root paths and configuration. Use this to discover workspace names for use with other tools that accept --workspace parameter."),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+	)
+	s.mcpServer.AddTool(listWorkspacesTool, s.handleListWorkspaces)
+
+	// grepai_list_projects tool
+	listProjectsTool := mcp.NewTool("grepai_list_projects",
+		mcp.WithDescription("List all projects within a workspace. Use this to discover project names and file paths relative to their project roots, which informs how to use the --path parameter in grepai_search."),
+		mcp.WithString("workspace",
+			mcp.Required(),
+			mcp.Description("Name of the workspace to list projects for"),
+		),
+		mcp.WithString("format",
+			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
+		),
+	)
+	s.mcpServer.AddTool(listProjectsTool, s.handleListProjects)
+
 	// grepai_rpg_search tool
 	rpgSearchTool := mcp.NewTool("grepai_rpg_search",
 		mcp.WithDescription("Search RPG nodes using Jaccard-based semantic matching with scope and kind filtering."),
@@ -1259,6 +1281,92 @@ func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequ
 	output, err := encodeOutput(status, format)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to encode status: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// handleListWorkspaces handles the grepai_list_workspaces tool call.
+func (s *Server) handleListWorkspaces(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	format := request.GetString("format", "json")
+
+	// Validate format
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	// Load workspace configuration
+	wsConfig, err := config.LoadWorkspaceConfig()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace configuration: %v", err)), nil
+	}
+
+	// Build workspace list with project entries
+	type WorkspaceInfo struct {
+		Name     string                `json:"name"`
+		Projects []config.ProjectEntry `json:"projects"`
+	}
+
+	var workspaces []WorkspaceInfo
+	for name, ws := range wsConfig.Workspaces {
+		// ws.Projects is a slice of ProjectEntry
+		workspaces = append(workspaces, WorkspaceInfo{
+			Name:     name,
+			Projects: ws.Projects,
+		})
+	}
+
+	output, err := encodeOutput(workspaces, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode workspaces: %v", err)), nil
+	}
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// handleListProjects handles the grepai_list_projects tool call.
+func (s *Server) handleListProjects(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	workspace, err := request.RequireString("workspace")
+	if err != nil {
+		return mcp.NewToolResultError("workspace parameter is required"), nil
+	}
+
+	format := request.GetString("format", "json")
+
+	// Validate format
+	if format != "json" && format != "toon" {
+		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	// Load workspace configuration
+	wsConfig, err := config.LoadWorkspaceConfig()
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace configuration: %v", err)), nil
+	}
+
+	// Get specific workspace
+	wsEntry, exists := wsConfig.Workspaces[workspace]
+	if !exists {
+		return mcp.NewToolResultError(fmt.Sprintf("workspace '%s' not found", workspace)), nil
+	}
+
+	// Build projects list from wsEntry.Projects (slice of ProjectEntry)
+	type ProjectInfo struct {
+		Name string `json:"name"`
+		Path string `json:"path"`
+	}
+
+	var projects []ProjectInfo
+	for _, proj := range wsEntry.Projects {
+		projects = append(projects, ProjectInfo{
+			Name: proj.Name,
+			Path: proj.Path,
+		})
+	}
+
+	output, err := encodeOutput(projects, format)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("failed to encode projects: %v", err)), nil
 	}
 
 	return mcp.NewToolResultText(output), nil
