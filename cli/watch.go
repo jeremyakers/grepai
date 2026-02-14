@@ -1044,7 +1044,6 @@ type watchProjectRunner func(ctx context.Context, projectRoot string, emb embedd
 func startProjectWatch(g *errgroup.Group, gCtx context.Context, projectRoot string, emb embedder.Embedder, makeOnReady func() func(), startFn watchProjectRunner) {
 	g.Go(func() error {
 		onReady := makeOnReady()
-		defer onReady() // Ensure readiness accounting even if startup fails before signaling.
 		return startFn(gCtx, projectRoot, emb, true, onReady)
 	})
 }
@@ -2055,8 +2054,8 @@ func (p *projectPrefixStore) DeleteByFile(ctx context.Context, filePath string) 
 	return p.store.DeleteByFile(ctx, prefixedPath)
 }
 
-func (p *projectPrefixStore) Search(ctx context.Context, queryVector []float32, limit int, pathPrefix string) ([]store.SearchResult, error) {
-	return p.store.Search(ctx, queryVector, limit, pathPrefix)
+func (p *projectPrefixStore) Search(ctx context.Context, queryVector []float32, limit int, opts store.SearchOptions) ([]store.SearchResult, error) {
+	return p.store.Search(ctx, queryVector, limit, opts)
 }
 
 func (p *projectPrefixStore) GetDocument(ctx context.Context, filePath string) (*store.Document, error) {

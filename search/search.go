@@ -41,7 +41,7 @@ func (s *Searcher) Search(ctx context.Context, query string, limit int, pathPref
 		results, err = s.hybridSearch(ctx, query, queryVector, fetchLimit, pathPrefix)
 	} else {
 		// Vector-only search
-		results, err = s.store.Search(ctx, queryVector, fetchLimit, pathPrefix)
+		results, err = s.store.Search(ctx, queryVector, fetchLimit, store.SearchOptions{PathPrefix: pathPrefix})
 	}
 
 	if err != nil {
@@ -62,7 +62,7 @@ func (s *Searcher) Search(ctx context.Context, query string, limit int, pathPref
 // hybridSearch combines vector search and text search using RRF.
 func (s *Searcher) hybridSearch(ctx context.Context, query string, queryVector []float32, limit int, pathPrefix string) ([]store.SearchResult, error) {
 	// Vector search
-	vectorResults, err := s.store.Search(ctx, queryVector, limit, pathPrefix)
+	vectorResults, err := s.store.Search(ctx, queryVector, limit, store.SearchOptions{PathPrefix: pathPrefix})
 	if err != nil {
 		return nil, err
 	}

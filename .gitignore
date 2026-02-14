@@ -46,7 +46,3 @@ __debug*
 # Local tooling
 .pre-commit-config.yaml
 docs/plans/
-TEST_PATH_FLAG.sh
-PATH_PREFIX_FEATURE.md
-IMPLEMENTATION_SUMMARY.md
-CODE_CHANGES_REFERENCE.md

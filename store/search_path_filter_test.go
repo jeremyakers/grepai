@@ -101,7 +101,7 @@ func TestGOBStoreSearchWithPathPrefix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			results, err := store.Search(ctx, queryVector, 10, tt.pathPrefix)
+			results, err := store.Search(ctx, queryVector, 10, SearchOptions{PathPrefix: tt.pathPrefix})
 			if err != nil {
 				t.Fatalf("search failed: %v", err)
 			}
@@ -207,7 +207,7 @@ func TestPostgresStoreSearchWithPathPrefix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			results, err := store.Search(ctx, queryVector, 10, tt.pathPrefix)
+			results, err := store.Search(ctx, queryVector, 10, SearchOptions{PathPrefix: tt.pathPrefix})
 			if err != nil {
 				t.Fatalf("search failed: %v", err)
 			}

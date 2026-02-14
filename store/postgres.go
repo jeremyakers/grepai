@@ -119,7 +119,7 @@ func (s *PostgresStore) DeleteByFile(ctx context.Context, filePath string) error
 	return nil
 }
 
-func (s *PostgresStore) Search(ctx context.Context, queryVector []float32, limit int, pathPrefix string) ([]SearchResult, error) {
+func (s *PostgresStore) Search(ctx context.Context, queryVector []float32, limit int, opts SearchOptions) ([]SearchResult, error) {
 	vec := pgvector.NewVector(queryVector)
 
 	query := `SELECT id, file_path, start_line, end_line, content, vector, hash, updated_at,
@@ -131,9 +131,9 @@ func (s *PostgresStore) Search(ctx context.Context, queryVector []float32, limit
 	nextParam := 3
 
 	// Add path prefix filter if provided
-	if pathPrefix != "" {
+	if opts.PathPrefix != "" {
 		query += ` AND file_path LIKE $` + fmt.Sprintf("%d", nextParam)
-		args = append(args, pathPrefix+"%")
+		args = append(args, opts.PathPrefix+"%")
 		nextParam++
 	}
 

@@ -220,14 +220,14 @@ func (s *QdrantStore) DeleteByFile(ctx context.Context, filePath string) error {
 	return nil
 }
 
-func (s *QdrantStore) Search(ctx context.Context, queryVector []float32, limit int, pathPrefix string) ([]SearchResult, error) {
+func (s *QdrantStore) Search(ctx context.Context, queryVector []float32, limit int, opts SearchOptions) ([]SearchResult, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("limit must be positive, got: %d", limit)
 	}
 
 	// Fetch more results to account for filtering by path prefix
 	fetchLimit := limit
-	if pathPrefix != "" {
+	if opts.PathPrefix != "" {
 		// Fetch 2x the limit to allow for filtering
 		fetchLimit = limit * 2
 	}
@@ -247,7 +247,7 @@ func (s *QdrantStore) Search(ctx context.Context, queryVector []float32, limit i
 		chunk := s.parseChunkPayload(point.Payload)
 
 		// Filter by path prefix if provided
-		if pathPrefix != "" && !strings.HasPrefix(chunk.FilePath, pathPrefix) {
+		if opts.PathPrefix != "" && !strings.HasPrefix(chunk.FilePath, opts.PathPrefix) {
 			continue
 		}
 

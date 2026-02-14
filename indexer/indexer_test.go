@@ -54,14 +54,14 @@ func (m *mockStore) DeleteByFile(ctx context.Context, filePath string) error {
 	return nil
 }
 
-func (m *mockStore) Search(ctx context.Context, queryVector []float32, limit int, pathPrefix string) ([]store.SearchResult, error) {
+func (m *mockStore) Search(ctx context.Context, queryVector []float32, limit int, opts store.SearchOptions) ([]store.SearchResult, error) {
 	results := make([]store.SearchResult, 0, len(m.chunks))
 	for _, chunk := range m.chunks {
 		// Filter by path prefix if provided
-		if pathPrefix != "" && len(chunk.FilePath) < len(pathPrefix) {
+		if opts.PathPrefix != "" && len(chunk.FilePath) < len(opts.PathPrefix) {
 			continue
 		}
-		if pathPrefix != "" && chunk.FilePath[:len(pathPrefix)] != pathPrefix {
+		if opts.PathPrefix != "" && chunk.FilePath[:len(opts.PathPrefix)] != opts.PathPrefix {
 			continue
 		}
 

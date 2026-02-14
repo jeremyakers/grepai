@@ -62,7 +62,7 @@ func (s *GOBStore) DeleteByFile(ctx context.Context, filePath string) error {
 	return nil
 }
 
-func (s *GOBStore) Search(ctx context.Context, queryVector []float32, limit int, pathPrefix string) ([]SearchResult, error) {
+func (s *GOBStore) Search(ctx context.Context, queryVector []float32, limit int, opts SearchOptions) ([]SearchResult, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -70,7 +70,7 @@ func (s *GOBStore) Search(ctx context.Context, queryVector []float32, limit int,
 
 	for _, chunk := range s.chunks {
 		// Filter by path prefix if provided
-		if pathPrefix != "" && !strings.HasPrefix(chunk.FilePath, pathPrefix) {
+		if opts.PathPrefix != "" && !strings.HasPrefix(chunk.FilePath, opts.PathPrefix) {
 			continue
 		}
 		score := cosineSimilarity(queryVector, chunk.Vector)
