@@ -16,14 +16,9 @@ func TestDiscoveryToolsCompile(t *testing.T) {
 		workspaceName: "test",
 	}
 
-	// Verify the methods exist by checking they can be accessed
-	if server.handleListWorkspaces == nil {
-		t.Fatal("handleListWorkspaces method not found on Server")
-	}
-
-	if server.handleListProjects == nil {
-		t.Fatal("handleListProjects method not found on Server")
-	}
+	// Verify the methods are accessible on Server.
+	_ = server.handleListWorkspaces
+	_ = server.handleListProjects
 
 	// The handlers are defined and callable, which verifies:
 	// 1. The code compiles without errors
