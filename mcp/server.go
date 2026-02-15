@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/alpkeskin/gotoon"
@@ -250,7 +251,7 @@ func (s *Server) registerTools() {
 
 	// grepai_list_workspaces tool
 	listWorkspacesTool := mcp.NewTool("grepai_list_workspaces",
-		mcp.WithDescription("List all available workspaces with their root paths and configuration. Use this to discover workspace names for use with other tools that accept --workspace parameter."),
+		mcp.WithDescription("List all available workspace names. Use this to discover valid values for tools that accept the workspace parameter."),
 		mcp.WithString("format",
 			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
 		),
@@ -1300,20 +1301,21 @@ func (s *Server) handleListWorkspaces(ctx context.Context, request mcp.CallToolR
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to load workspace configuration: %v", err)), nil
 	}
-
-	// Build workspace list with project entries
-	type WorkspaceInfo struct {
-		Name     string                `json:"name"`
-		Projects []config.ProjectEntry `json:"projects"`
+	if wsConfig == nil {
+		return mcp.NewToolResultText("[]"), nil
 	}
 
-	var workspaces []WorkspaceInfo
-	for name, ws := range wsConfig.Workspaces {
-		// ws.Projects is a slice of ProjectEntry
-		workspaces = append(workspaces, WorkspaceInfo{
-			Name:     name,
-			Projects: ws.Projects,
-		})
+	// Build workspace list (workspace-level information only).
+	type WorkspaceInfo struct {
+		Name string `json:"name"`
+	}
+
+	names := wsConfig.ListWorkspaces()
+	sort.Strings(names)
+
+	workspaces := make([]WorkspaceInfo, 0, len(names))
+	for _, name := range names {
+		workspaces = append(workspaces, WorkspaceInfo{Name: name})
 	}
 
 	output, err := encodeOutput(workspaces, format)

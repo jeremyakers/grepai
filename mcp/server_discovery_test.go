@@ -1,7 +1,12 @@
 package mcp
 
 import (
+	"context"
+	"encoding/json"
 	"testing"
+
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/yoanbernabeu/grepai/config"
 )
 
 // TestDiscoveryToolsCompile verifies that the discovery tools are properly integrated
@@ -67,5 +72,69 @@ func TestEncodeOutput(t *testing.T) {
 				t.Error("encodeOutput() returned empty string")
 			}
 		})
+	}
+}
+
+func TestHandleListWorkspaces_OnlyReturnsWorkspaceInfo(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	cfg := &config.WorkspaceConfig{
+		Version: 1,
+		Workspaces: map[string]config.Workspace{
+			"alpha": {
+				Name: "alpha",
+				Projects: []config.ProjectEntry{
+					{Name: "api", Path: "/tmp/alpha-api"},
+				},
+			},
+			"beta": {
+				Name: "beta",
+				Projects: []config.ProjectEntry{
+					{Name: "web", Path: "/tmp/beta-web"},
+				},
+			},
+		},
+	}
+	if err := config.SaveWorkspaceConfig(cfg); err != nil {
+		t.Fatalf("failed to save workspace config: %v", err)
+	}
+
+	s := &Server{}
+	req := mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Arguments: map[string]any{"format": "json"},
+		},
+	}
+
+	result, err := s.handleListWorkspaces(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleListWorkspaces returned error: %v", err)
+	}
+	if len(result.Content) == 0 {
+		t.Fatal("handleListWorkspaces returned no content")
+	}
+
+	textContent, ok := result.Content[0].(mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected text content, got %T", result.Content[0])
+	}
+
+	var workspaces []map[string]any
+	if err := json.Unmarshal([]byte(textContent.Text), &workspaces); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+	if len(workspaces) != 2 {
+		t.Fatalf("expected 2 workspaces, got %d", len(workspaces))
+	}
+
+	for _, ws := range workspaces {
+		if _, ok := ws["name"]; !ok {
+			t.Fatalf("workspace entry missing name: %#v", ws)
+		}
+		if _, hasProjects := ws["projects"]; hasProjects {
+			t.Fatalf("workspace entry should not include projects: %#v", ws)
+		}
 	}
 }
