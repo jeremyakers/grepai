@@ -1358,7 +1358,7 @@ func (s *Server) handleListProjects(ctx context.Context, request mcp.CallToolReq
 		Path string `json:"path"`
 	}
 
-	var projects []ProjectInfo
+	projects := make([]ProjectInfo, 0, len(wsEntry.Projects))
 	for _, proj := range wsEntry.Projects {
 		projects = append(projects, ProjectInfo{
 			Name: proj.Name,
