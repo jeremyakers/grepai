@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -136,5 +137,147 @@ func TestHandleListWorkspaces_OnlyReturnsWorkspaceInfo(t *testing.T) {
 		if _, hasProjects := ws["projects"]; hasProjects {
 			t.Fatalf("workspace entry should not include projects: %#v", ws)
 		}
+	}
+}
+
+func TestHandleListProjects_DefaultsToServerWorkspace(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	cfg := &config.WorkspaceConfig{
+		Version: 1,
+		Workspaces: map[string]config.Workspace{
+			"tymemud": {
+				Name: "tymemud",
+				Projects: []config.ProjectEntry{
+					{Name: "api", Path: "/tmp/tymemud-api"},
+					{Name: "web", Path: "/tmp/tymemud-web"},
+				},
+			},
+		},
+	}
+	if err := config.SaveWorkspaceConfig(cfg); err != nil {
+		t.Fatalf("failed to save workspace config: %v", err)
+	}
+
+	s := &Server{workspaceName: "tymemud"}
+	req := mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Arguments: map[string]any{"format": "json"},
+		},
+	}
+
+	result, err := s.handleListProjects(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleListProjects returned error: %v", err)
+	}
+	if len(result.Content) == 0 {
+		t.Fatal("handleListProjects returned no content")
+	}
+
+	textContent, ok := result.Content[0].(mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected text content, got %T", result.Content[0])
+	}
+
+	var projects []map[string]any
+	if err := json.Unmarshal([]byte(textContent.Text), &projects); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+	if len(projects) != 2 {
+		t.Fatalf("expected 2 projects, got %d", len(projects))
+	}
+
+	projectNames := map[string]bool{}
+	for _, p := range projects {
+		name, hasName := p["name"].(string)
+		path, hasPath := p["path"].(string)
+		if !hasName || !hasPath || name == "" || path == "" {
+			t.Fatalf("invalid project entry: %#v", p)
+		}
+		projectNames[name] = true
+	}
+
+	if !projectNames["api"] || !projectNames["web"] {
+		t.Fatalf("expected projects api and web, got %#v", projectNames)
+	}
+}
+
+func TestHandleSearch_NoWorkspaceHint_WhenWorkspacesConfigured(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	cfg := &config.WorkspaceConfig{
+		Version: 1,
+		Workspaces: map[string]config.Workspace{
+			"tymemud": {
+				Name: "tymemud",
+			},
+		},
+	}
+	if err := config.SaveWorkspaceConfig(cfg); err != nil {
+		t.Fatalf("failed to save workspace config: %v", err)
+	}
+
+	s := &Server{}
+	req := mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Arguments: map[string]any{"query": "hello"},
+		},
+	}
+
+	result, err := s.handleSearch(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleSearch returned error: %v", err)
+	}
+	if len(result.Content) == 0 {
+		t.Fatal("handleSearch returned no content")
+	}
+
+	textContent, ok := result.Content[0].(mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected text content, got %T", result.Content[0])
+	}
+
+	if !strings.Contains(textContent.Text, "no workspace was provided") {
+		t.Fatalf("expected workspace guidance in error, got: %s", textContent.Text)
+	}
+	if !strings.Contains(textContent.Text, "provide the workspace parameter") {
+		t.Fatalf("expected workspace parameter guidance in error, got: %s", textContent.Text)
+	}
+}
+
+func TestHandleSearch_NoWorkspaceHint_WhenNoWorkspacesConfigured(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("USERPROFILE", homeDir)
+
+	s := &Server{}
+	req := mcp.CallToolRequest{
+		Params: mcp.CallToolParams{
+			Arguments: map[string]any{"query": "hello"},
+		},
+	}
+
+	result, err := s.handleSearch(context.Background(), req)
+	if err != nil {
+		t.Fatalf("handleSearch returned error: %v", err)
+	}
+	if len(result.Content) == 0 {
+		t.Fatal("handleSearch returned no content")
+	}
+
+	textContent, ok := result.Content[0].(mcp.TextContent)
+	if !ok {
+		t.Fatalf("expected text content, got %T", result.Content[0])
+	}
+
+	if !strings.Contains(textContent.Text, "failed to read config file") {
+		t.Fatalf("expected fallback config error, got: %s", textContent.Text)
+	}
+	if strings.Contains(textContent.Text, "no workspace was provided") {
+		t.Fatalf("workspace hint should not appear when no workspaces are configured: %s", textContent.Text)
 	}
 }

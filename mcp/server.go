@@ -262,8 +262,7 @@ func (s *Server) registerTools() {
 	listProjectsTool := mcp.NewTool("grepai_list_projects",
 		mcp.WithDescription("List all projects within a workspace. Use this to discover project names and file paths relative to their project roots, which informs how to use the --path parameter in grepai_search."),
 		mcp.WithString("workspace",
-			mcp.Required(),
-			mcp.Description("Name of the workspace to list projects for"),
+			mcp.Description("Name of the workspace to list projects for (optional when mcp-serve was started with --workspace)"),
 		),
 		mcp.WithString("format",
 			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
@@ -367,6 +366,14 @@ func (s *Server) handleSearch(ctx context.Context, request mcp.CallToolRequest) 
 	// Load configuration
 	cfg, err := config.Load(s.projectRoot)
 	if err != nil {
+		if s.projectRoot == "" {
+			wsCfg, wsErr := config.LoadWorkspaceConfig()
+			if wsErr == nil && wsCfg != nil && len(wsCfg.Workspaces) > 0 {
+				return mcp.NewToolResultError(
+					fmt.Sprintf("failed to load configuration: no workspace was provided so grepai_search fell back to local project config; provide the workspace parameter (or start mcp-serve with --workspace). Details: %v", err),
+				), nil
+			}
+		}
 		return mcp.NewToolResultError(fmt.Sprintf("failed to load configuration: %v", err)), nil
 	}
 
@@ -1328,9 +1335,9 @@ func (s *Server) handleListWorkspaces(ctx context.Context, request mcp.CallToolR
 
 // handleListProjects handles the grepai_list_projects tool call.
 func (s *Server) handleListProjects(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	workspace, err := request.RequireString("workspace")
-	if err != nil {
-		return mcp.NewToolResultError("workspace parameter is required"), nil
+	workspace := s.resolveWorkspace(request.GetString("workspace", ""))
+	if workspace == "" {
+		return mcp.NewToolResultError("workspace parameter is required unless mcp-serve was started with --workspace"), nil
 	}
 
 	format := request.GetString("format", "json")
