@@ -219,8 +219,13 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	// Create searcher with boost config
 	searcher := search.NewSearcher(st, emb, cfg.Search)
 
+	normalizedPath, err := search.NormalizeProjectPathPrefix(searchPath, projectRoot)
+	if err != nil {
+		return fmt.Errorf("invalid --path value: %w", err)
+	}
+
 	// Search with boosting
-	results, err := searcher.Search(ctx, query, searchLimit, searchPath)
+	results, err := searcher.Search(ctx, query, searchLimit, normalizedPath)
 	if err != nil {
 		if searchJSON {
 			return outputSearchErrorJSON(err)
@@ -465,6 +470,11 @@ func runWorkspaceSearch(ctx context.Context, query string, projects []string, pa
 		return err
 	}
 
+	normalizedPath, resolvedProjects, err := search.NormalizeWorkspacePathPrefix(pathOpt, ws, projects)
+	if err != nil {
+		return fmt.Errorf("invalid --path value: %w", err)
+	}
+
 	// Validate backend
 	if err := config.ValidateWorkspaceBackend(ws); err != nil {
 		return err
@@ -544,13 +554,13 @@ func runWorkspaceSearch(ctx context.Context, query string, projects []string, pa
 	// Database stores paths as: workspaceName/projectName/relativePath
 	// When a single project is specified, include it in the path prefix to push filtering to database level
 	fullPathPrefix := ws.Name + "/"
-	if len(projects) == 1 {
+	if len(resolvedProjects) == 1 {
 		// If exactly one project specified, include it in the path prefix for database-level filtering
 		// This ensures file_path LIKE 'workspace/project/%' filter is applied
-		fullPathPrefix += projects[0] + "/"
+		fullPathPrefix += resolvedProjects[0] + "/"
 	}
-	if pathOpt != "" {
-		fullPathPrefix += pathOpt
+	if normalizedPath != "" {
+		fullPathPrefix += normalizedPath
 	}
 
 	// Search
@@ -567,10 +577,10 @@ func runWorkspaceSearch(ctx context.Context, query string, projects []string, pa
 
 	// Filter by projects if specified (additional client-side filtering for multiple projects)
 	// File paths are stored as: workspaceName/projectName/relativePath
-	if len(projects) > 0 {
+	if len(resolvedProjects) > 0 {
 		filteredResults := make([]store.SearchResult, 0)
 		for _, r := range results {
-			for _, projectName := range projects {
+			for _, projectName := range resolvedProjects {
 				// Match workspace/project/ prefix
 				expectedPrefix := ws.Name + "/" + projectName + "/"
 				if strings.HasPrefix(r.Chunk.FilePath, expectedPrefix) {

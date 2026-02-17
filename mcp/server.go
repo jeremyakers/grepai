@@ -367,7 +367,11 @@ func (s *Server) handleSearch(ctx context.Context, request mcp.CallToolRequest) 
 
 	// Create searcher and search
 	searcher := search.NewSearcher(st, emb, cfg.Search)
-	results, err := searcher.Search(ctx, query, limit, path)
+	normalizedPath, err := search.NormalizeProjectPathPrefix(path, s.projectRoot)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("invalid path parameter: %v", err)), nil
+	}
+	results, err := searcher.Search(ctx, query, limit, normalizedPath)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
 	}
@@ -457,6 +461,12 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 		return mcp.NewToolResultError(fmt.Sprintf("workspace not found: %v", err)), nil
 	}
 
+	projectNames := parseProjectNames(projectsStr)
+	normalizedPath, resolvedProjects, err := search.NormalizeWorkspacePathPrefix(pathPrefix, ws, projectNames)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("invalid path parameter: %v", err)), nil
+	}
+
 	// Validate backend
 	if err := config.ValidateWorkspaceBackend(ws); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -491,17 +501,14 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 	// across any project (since project name sits between workspace and user path).
 	fullPathPrefix := ws.Name + "/"
 	singleProject := ""
-	if projectsStr != "" {
-		projectNames := strings.Split(projectsStr, ",")
-		if len(projectNames) == 1 {
-			singleProject = strings.TrimSpace(projectNames[0])
-			fullPathPrefix += singleProject + "/"
-		}
+	if len(resolvedProjects) == 1 {
+		singleProject = resolvedProjects[0]
+		fullPathPrefix += singleProject + "/"
 	}
 
 	// Add path prefix if provided
-	if pathPrefix != "" {
-		fullPathPrefix += pathPrefix
+	if normalizedPath != "" {
+		fullPathPrefix += normalizedPath
 	}
 
 	// Search
@@ -513,7 +520,7 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 
 	// If no single project was specified but a user path was provided, we
 	// post-filter results to match the relative path inside each project.
-	if singleProject == "" && pathPrefix != "" {
+	if singleProject == "" && normalizedPath != "" {
 		filtered := make([]store.SearchResult, 0)
 		for _, r := range results {
 			parts := strings.SplitN(r.Chunk.FilePath, "/", 3)
@@ -521,7 +528,7 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 				continue
 			}
 			relative := parts[2]
-			if strings.HasPrefix(relative, pathPrefix) {
+			if strings.HasPrefix(relative, normalizedPath) {
 				filtered = append(filtered, r)
 			}
 		}
@@ -530,12 +537,10 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 
 	// Filter by projects if specified
 	// File paths are stored as: workspaceName/projectName/relativePath
-	if projectsStr != "" {
-		projectNames := strings.Split(projectsStr, ",")
+	if len(resolvedProjects) > 0 {
 		filteredResults := make([]store.SearchResult, 0)
 		for _, r := range results {
-			for _, projectName := range projectNames {
-				projectName = strings.TrimSpace(projectName)
+			for _, projectName := range resolvedProjects {
 				// Match workspace/project/ prefix
 				expectedPrefix := ws.Name + "/" + projectName + "/"
 				if strings.HasPrefix(r.Chunk.FilePath, expectedPrefix) {
@@ -579,6 +584,21 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 	}
 
 	return mcp.NewToolResultText(output), nil
+}
+
+func parseProjectNames(projectsStr string) []string {
+	if projectsStr == "" {
+		return nil
+	}
+	raw := strings.Split(projectsStr, ",")
+	projects := make([]string, 0, len(raw))
+	for _, p := range raw {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			projects = append(projects, p)
+		}
+	}
+	return projects
 }
 
 // createWorkspaceEmbedder creates an embedder based on workspace configuration.
