@@ -146,42 +146,9 @@ func runSearch(cmd *cobra.Command, args []string) error {
 	}
 
 	// Initialize embedder
-	var emb embedder.Embedder
-	switch cfg.Embedder.Provider {
-	case "ollama":
-		opts := []embedder.OllamaOption{
-			embedder.WithOllamaEndpoint(cfg.Embedder.Endpoint),
-			embedder.WithOllamaModel(cfg.Embedder.Model),
-		}
-		if cfg.Embedder.Dimensions != nil {
-			opts = append(opts, embedder.WithOllamaDimensions(*cfg.Embedder.Dimensions))
-		}
-		emb = embedder.NewOllamaEmbedder(opts...)
-	case "openai":
-		opts := []embedder.OpenAIOption{
-			embedder.WithOpenAIModel(cfg.Embedder.Model),
-			embedder.WithOpenAIKey(cfg.Embedder.APIKey),
-			embedder.WithOpenAIEndpoint(cfg.Embedder.Endpoint),
-		}
-		if cfg.Embedder.Dimensions != nil {
-			opts = append(opts, embedder.WithOpenAIDimensions(*cfg.Embedder.Dimensions))
-		}
-		var err error
-		emb, err = embedder.NewOpenAIEmbedder(opts...)
-		if err != nil {
-			return fmt.Errorf("failed to initialize OpenAI embedder: %w", err)
-		}
-	case "lmstudio":
-		opts := []embedder.LMStudioOption{
-			embedder.WithLMStudioEndpoint(cfg.Embedder.Endpoint),
-			embedder.WithLMStudioModel(cfg.Embedder.Model),
-		}
-		if cfg.Embedder.Dimensions != nil {
-			opts = append(opts, embedder.WithLMStudioDimensions(*cfg.Embedder.Dimensions))
-		}
-		emb = embedder.NewLMStudioEmbedder(opts...)
-	default:
-		return fmt.Errorf("unknown embedding provider: %s", cfg.Embedder.Provider)
+	emb, err := embedder.NewFromConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to initialize embedder: %w", err)
 	}
 	defer emb.Close()
 
@@ -396,28 +363,9 @@ func SearchJSON(projectRoot string, query string, limit int) ([]store.SearchResu
 		return nil, err
 	}
 
-	var emb embedder.Embedder
-	switch cfg.Embedder.Provider {
-	case "ollama":
-		emb = embedder.NewOllamaEmbedder(
-			embedder.WithOllamaEndpoint(cfg.Embedder.Endpoint),
-			embedder.WithOllamaModel(cfg.Embedder.Model),
-		)
-	case "openai":
-		var err error
-		emb, err = embedder.NewOpenAIEmbedder(
-			embedder.WithOpenAIModel(cfg.Embedder.Model),
-		)
-		if err != nil {
-			return nil, err
-		}
-	case "lmstudio":
-		emb = embedder.NewLMStudioEmbedder(
-			embedder.WithLMStudioEndpoint(cfg.Embedder.Endpoint),
-			embedder.WithLMStudioModel(cfg.Embedder.Model),
-		)
-	default:
-		return nil, fmt.Errorf("unknown provider: %s", cfg.Embedder.Provider)
+	emb, err := embedder.NewFromConfig(cfg)
+	if err != nil {
+		return nil, err
 	}
 	defer emb.Close()
 
@@ -471,41 +419,9 @@ func runWorkspaceSearch(ctx context.Context, query string, projects []string, pa
 	}
 
 	// Initialize embedder
-	var emb embedder.Embedder
-	switch ws.Embedder.Provider {
-	case "ollama":
-		opts := []embedder.OllamaOption{
-			embedder.WithOllamaEndpoint(ws.Embedder.Endpoint),
-			embedder.WithOllamaModel(ws.Embedder.Model),
-		}
-		if ws.Embedder.Dimensions != nil {
-			opts = append(opts, embedder.WithOllamaDimensions(*ws.Embedder.Dimensions))
-		}
-		emb = embedder.NewOllamaEmbedder(opts...)
-	case "openai":
-		opts := []embedder.OpenAIOption{
-			embedder.WithOpenAIModel(ws.Embedder.Model),
-			embedder.WithOpenAIKey(ws.Embedder.APIKey),
-			embedder.WithOpenAIEndpoint(ws.Embedder.Endpoint),
-		}
-		if ws.Embedder.Dimensions != nil {
-			opts = append(opts, embedder.WithOpenAIDimensions(*ws.Embedder.Dimensions))
-		}
-		emb, err = embedder.NewOpenAIEmbedder(opts...)
-		if err != nil {
-			return fmt.Errorf("failed to initialize OpenAI embedder: %w", err)
-		}
-	case "lmstudio":
-		opts := []embedder.LMStudioOption{
-			embedder.WithLMStudioEndpoint(ws.Embedder.Endpoint),
-			embedder.WithLMStudioModel(ws.Embedder.Model),
-		}
-		if ws.Embedder.Dimensions != nil {
-			opts = append(opts, embedder.WithLMStudioDimensions(*ws.Embedder.Dimensions))
-		}
-		emb = embedder.NewLMStudioEmbedder(opts...)
-	default:
-		return fmt.Errorf("unknown embedding provider: %s", ws.Embedder.Provider)
+	emb, err := embedder.NewFromWorkspaceConfig(ws)
+	if err != nil {
+		return fmt.Errorf("failed to initialize embedder: %w", err)
 	}
 	defer emb.Close()
 
