@@ -590,6 +590,29 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 		results = filteredResults
 	}
 
+	if normalizedPath != "" && len(results) == 0 {
+		selected := resolvedProjects
+		if len(selected) == 0 {
+			selected = listWorkspaceProjectNames(ws.Projects)
+		}
+		projects := selectWorkspaceProjects(ws, selected)
+
+		hasIndexedMatch, matchErr := workspacePathHasIndexedFiles(ctx, st, ws.Name, selected, normalizedPath)
+		if matchErr != nil {
+			log.Printf("Warning: failed to inspect indexed workspace paths for validation: %v", matchErr)
+		} else if !hasIndexedMatch {
+			return mcp.NewToolResultError(
+				buildWorkspacePathValidationError(
+					pathPrefix,
+					selected,
+					workspaceProjectRoots(projects),
+					workspacePathExamples(projects),
+					"no indexed files matched this path prefix in selected projects",
+				),
+			), nil
+		}
+	}
+
 	var data any
 	if compact {
 		searchResultsCompact := make([]SearchResultCompact, len(results))
@@ -831,6 +854,48 @@ func buildWorkspacePathValidationError(path string, selectedProjects, selectedPr
 		return fmt.Sprintf("invalid path parameter: %s", details)
 	}
 	return string(encoded)
+}
+
+func workspacePathHasIndexedFiles(ctx context.Context, st store.VectorStore, workspaceName string, selectedProjects []string, normalizedPath string) (bool, error) {
+	if st == nil {
+		return false, fmt.Errorf("vector store is nil")
+	}
+
+	docPaths, err := st.ListDocuments(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	selectedSet := make(map[string]struct{}, len(selectedProjects))
+	for _, p := range selectedProjects {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			selectedSet[p] = struct{}{}
+		}
+	}
+
+	normalizedPath = strings.Trim(strings.TrimSpace(filepath.ToSlash(normalizedPath)), "/")
+	for _, docPath := range docPaths {
+		parts := strings.SplitN(filepath.ToSlash(docPath), "/", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		if parts[0] != workspaceName {
+			continue
+		}
+		if len(selectedSet) > 0 {
+			if _, ok := selectedSet[parts[1]]; !ok {
+				continue
+			}
+		}
+
+		rel := strings.Trim(parts[2], "/")
+		if normalizedPath == "" || strings.HasPrefix(rel, normalizedPath) {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // createWorkspaceEmbedder creates an embedder based on workspace configuration.

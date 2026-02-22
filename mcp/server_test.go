@@ -10,6 +10,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/store"
 	"github.com/yoanbernabeu/grepai/trace"
 )
 
@@ -511,6 +512,56 @@ func TestValidateWorkspacePathForProjects_should_accept_valid_project_relative_p
 	errMsg := validateWorkspacePathForProjects("MM32/src", ws, []string{"ubermap_agent"})
 	if errMsg != "" {
 		t.Fatalf("expected valid path without error, got: %s", errMsg)
+	}
+}
+
+func TestWorkspacePathHasIndexedFiles_should_detect_matching_paths(t *testing.T) {
+	ctx := context.Background()
+	mockStore := NewMockMCPStore()
+	if err := mockStore.SaveChunks(ctx, []store.Chunk{
+		{
+			ID:       "1",
+			FilePath: "tymemud/tymemud/MM32/src/a.go",
+		},
+		{
+			ID:       "2",
+			FilePath: "tymemud/tymemud/docs/readme.md",
+		},
+	}); err != nil {
+		t.Fatalf("failed to save chunks: %v", err)
+	}
+
+	found, err := workspacePathHasIndexedFiles(ctx, mockStore, "tymemud", []string{"tymemud"}, "MM32/src")
+	if err != nil {
+		t.Fatalf("workspacePathHasIndexedFiles returned error: %v", err)
+	}
+	if !found {
+		t.Fatal("expected matching indexed files for MM32/src")
+	}
+}
+
+func TestWorkspacePathHasIndexedFiles_should_report_no_match_for_invalid_path(t *testing.T) {
+	ctx := context.Background()
+	mockStore := NewMockMCPStore()
+	if err := mockStore.SaveChunks(ctx, []store.Chunk{
+		{
+			ID:       "1",
+			FilePath: "tymemud/tymemud/MM32/src/a.go",
+		},
+		{
+			ID:       "2",
+			FilePath: "tymemud/tymemud/docs/readme.md",
+		},
+	}); err != nil {
+		t.Fatalf("failed to save chunks: %v", err)
+	}
+
+	found, err := workspacePathHasIndexedFiles(ctx, mockStore, "tymemud", []string{"tymemud"}, "_agent_work/ubermap_agent/MM32/src")
+	if err != nil {
+		t.Fatalf("workspacePathHasIndexedFiles returned error: %v", err)
+	}
+	if found {
+		t.Fatal("expected no indexed files for invalid path prefix")
 	}
 }
 
