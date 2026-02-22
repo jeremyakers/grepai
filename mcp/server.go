@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -147,7 +148,7 @@ func NewServerWithWorkspace(projectRoot, workspaceName string) (*Server, error) 
 func (s *Server) registerTools() {
 	// grepai_search tool
 	searchTool := mcp.NewTool("grepai_search",
-		mcp.WithDescription("Semantic code search. Search your codebase using natural language queries. Returns the most relevant code chunks with file paths, line numbers, and similarity scores."),
+		mcp.WithDescription("Semantic code search. Search your codebase using natural language queries. Returns the most relevant code chunks with file paths, line numbers, and similarity scores.\n\nExamples:\n- workspace-only mode: workspace='acme', path='src/'\n- workspace + projects mode: workspace='acme', projects='backend,shared', path='api/'"),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("Natural language search query (e.g., 'user authentication flow', 'error handling middleware')"),
@@ -162,7 +163,7 @@ func (s *Server) registerTools() {
 			mcp.Description("Output format: 'json' (default) or 'toon' (token-efficient)"),
 		),
 		mcp.WithString("path",
-			mcp.Description("Path prefix to filter results. Relative to workspace root if only workspace provided, or project root if both workspace and projects provided (e.g., 'src/' or 'src/handlers/auth/')"),
+			mcp.Description("Path prefix to filter results. When projects is set, path is relative to each selected project root (not workspace root). Examples: workspace-only path='src/' and workspace+projects path='MM32/src' or 'api/'."),
 		),
 		mcp.WithString("workspace",
 			mcp.Description("Workspace name for cross-project search (optional)"),
@@ -494,7 +495,14 @@ func (s *Server) handleWorkspaceSearch(ctx context.Context, query string, limit 
 	projectNames := parseProjectNames(projectsStr)
 	normalizedPath, resolvedProjects, err := search.NormalizeWorkspacePathPrefix(pathPrefix, ws, projectNames)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("invalid path parameter: %v", err)), nil
+		selected := projectNames
+		if len(selected) == 0 {
+			selected = listWorkspaceProjectNames(ws.Projects)
+		}
+		return mcp.NewToolResultError(buildWorkspacePathValidationError(pathPrefix, selected, workspaceProjectRoots(selectWorkspaceProjects(ws, selected)), workspacePathExamples(selectWorkspaceProjects(ws, selected)), err.Error())), nil
+	}
+	if validationErr := validateWorkspacePathForProjects(normalizedPath, ws, resolvedProjects); validationErr != "" {
+		return mcp.NewToolResultError(validationErr), nil
 	}
 
 	// Validate backend
@@ -629,6 +637,200 @@ func parseProjectNames(projectsStr string) []string {
 		}
 	}
 	return projects
+}
+
+func validateWorkspacePathForProjects(normalizedPath string, ws *config.Workspace, selectedProjects []string) string {
+	if normalizedPath == "" || ws == nil {
+		return ""
+	}
+
+	selected := selectedProjects
+	if len(selected) == 0 {
+		selected = listWorkspaceProjectNames(ws.Projects)
+	}
+	projects := selectWorkspaceProjects(ws, selected)
+	roots := workspaceProjectRoots(projects)
+	if len(roots) == 0 {
+		return buildWorkspacePathValidationError(
+			normalizedPath,
+			selected,
+			nil,
+			workspacePathExamples(ws.Projects),
+			"no project roots available for selected projects",
+		)
+	}
+	if pathPrefixMatchesProjectRoots(normalizedPath, roots) {
+		return ""
+	}
+
+	return buildWorkspacePathValidationError(
+		normalizedPath,
+		selected,
+		roots,
+		workspacePathExamples(projects),
+		"path must be relative to a selected project root (not the workspace root)",
+	)
+}
+
+func pathPrefixMatchesProjectRoots(pathPrefix string, projectRoots []string) bool {
+	trimmed := strings.Trim(strings.TrimSpace(pathPrefix), "/")
+	if trimmed == "" || trimmed == "." {
+		return true
+	}
+
+	firstSegment := trimmed
+	if idx := strings.Index(trimmed, "/"); idx >= 0 {
+		firstSegment = trimmed[:idx]
+	}
+	firstSegment = filepath.FromSlash(firstSegment)
+	if firstSegment == "." || firstSegment == "" {
+		return true
+	}
+
+	for _, root := range projectRoots {
+		if root == "" {
+			continue
+		}
+		candidate := filepath.Join(root, firstSegment)
+		if _, err := os.Stat(candidate); err == nil {
+			return true
+		}
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), firstSegment) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func selectWorkspaceProjects(ws *config.Workspace, selectedProjects []string) []config.ProjectEntry {
+	if ws == nil {
+		return nil
+	}
+	if len(selectedProjects) == 0 {
+		return ws.Projects
+	}
+
+	selectedSet := make(map[string]struct{}, len(selectedProjects))
+	for _, p := range selectedProjects {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			selectedSet[p] = struct{}{}
+		}
+	}
+
+	selectedEntries := make([]config.ProjectEntry, 0, len(selectedSet))
+	for _, p := range ws.Projects {
+		if _, ok := selectedSet[p.Name]; ok {
+			selectedEntries = append(selectedEntries, p)
+		}
+	}
+	return selectedEntries
+}
+
+func workspaceProjectRoots(projects []config.ProjectEntry) []string {
+	roots := make([]string, 0, len(projects))
+	for _, p := range projects {
+		if p.Path != "" {
+			roots = append(roots, p.Path)
+		}
+	}
+	sort.Strings(roots)
+	return roots
+}
+
+func listWorkspaceProjectNames(projects []config.ProjectEntry) []string {
+	names := make([]string, 0, len(projects))
+	for _, p := range projects {
+		if p.Name != "" {
+			names = append(names, p.Name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+func workspacePathExamples(projects []config.ProjectEntry) []string {
+	examples := make([]string, 0, 6)
+	seen := make(map[string]struct{})
+
+	add := func(example string) {
+		example = strings.Trim(strings.TrimSpace(filepath.ToSlash(example)), "/")
+		if example == "" {
+			return
+		}
+		if _, ok := seen[example]; ok {
+			return
+		}
+		seen[example] = struct{}{}
+		examples = append(examples, example)
+	}
+
+	for _, p := range projects {
+		if len(examples) >= 6 || p.Path == "" {
+			break
+		}
+
+		srcCandidate := filepath.Join(p.Path, "src")
+		if st, err := os.Stat(srcCandidate); err == nil && st.IsDir() {
+			add("src")
+		}
+
+		entries, err := os.ReadDir(p.Path)
+		if err != nil {
+			continue
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+		for _, e := range entries {
+			name := e.Name()
+			if strings.HasPrefix(name, ".") {
+				continue
+			}
+			add(name)
+			if e.IsDir() {
+				nestedSrc := filepath.Join(p.Path, name, "src")
+				if st, err := os.Stat(nestedSrc); err == nil && st.IsDir() {
+					add(filepath.Join(name, "src"))
+				}
+			}
+			if len(examples) >= 6 {
+				break
+			}
+		}
+	}
+
+	if len(examples) == 0 {
+		examples = append(examples, "src")
+	}
+	return examples
+}
+
+func buildWorkspacePathValidationError(path string, selectedProjects, selectedProjectRoots, exampleValidPaths []string, details string) string {
+	sort.Strings(selectedProjects)
+	sort.Strings(selectedProjectRoots)
+	sort.Strings(exampleValidPaths)
+
+	hint := map[string]any{
+		"reason":                 "path_not_within_selected_project",
+		"path":                   path,
+		"selected_projects":      selectedProjects,
+		"selected_project_roots": selectedProjectRoots,
+		"example_valid_paths":    exampleValidPaths,
+	}
+	if details != "" {
+		hint["details"] = details
+	}
+
+	encoded, err := json.Marshal(hint)
+	if err != nil {
+		return fmt.Sprintf("invalid path parameter: %s", details)
+	}
+	return string(encoded)
 }
 
 // createWorkspaceEmbedder creates an embedder based on workspace configuration.
