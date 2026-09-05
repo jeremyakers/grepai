@@ -646,3 +646,32 @@ func TestGOBSymbolStore_ReferenceKindFilters(t *testing.T) {
 		t.Fatalf("expected only write refs, got %+v", writers)
 	}
 }
+
+func TestGOBSymbolStore_LookupSymbolsBatch(t *testing.T) {
+	ctx := context.Background()
+	store := NewGOBSymbolStore(filepath.Join(t.TempDir(), "symbols.gob"))
+	if err := store.SaveFile(ctx, "one.go", []Symbol{
+		{Name: "Shared", File: "one.go", Line: 1},
+		{Name: "OnlyOne", File: "one.go", Line: 2},
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveFile(ctx, "two.go", []Symbol{{Name: "Shared", File: "two.go", Line: 3}}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := store.LookupSymbolsBatch(ctx, []string{"Shared", "Missing", "OnlyOne", "Shared"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || len(got["Shared"]) != 2 || len(got["OnlyOne"]) != 1 {
+		t.Fatalf("unexpected grouped symbols: %#v", got)
+	}
+	if _, ok := got["Missing"]; ok {
+		t.Fatalf("missing name should not be present: %#v", got)
+	}
+	empty, err := store.LookupSymbolsBatch(ctx, nil)
+	if err != nil || len(empty) != 0 {
+		t.Fatalf("empty lookup = %#v, %v", empty, err)
+	}
+}

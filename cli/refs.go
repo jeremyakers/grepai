@@ -179,7 +179,14 @@ func runRefs(symbolName string, readers bool) (refsResult, error) {
 			return refsResult{}, fmt.Errorf("failed to find project root: %w", err)
 		}
 
-		symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
+		cfg, err := config.Load(projectRoot)
+		if err != nil {
+			return refsResult{}, fmt.Errorf("failed to load configuration: %w", err)
+		}
+		symbolStore, err := trace.NewSymbolStore(ctx, cfg, projectRoot)
+		if err != nil {
+			return refsResult{}, fmt.Errorf("failed to create symbol store: %w", err)
+		}
 		if err := symbolStore.Load(ctx); err != nil {
 			return refsResult{}, fmt.Errorf("failed to load symbol index: %w", err)
 		}

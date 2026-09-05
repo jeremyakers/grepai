@@ -312,6 +312,25 @@ func (s *GOBSymbolStore) LookupSymbol(ctx context.Context, name string) ([]Symbo
 	return symbols, nil
 }
 
+// LookupSymbolsBatch finds symbol definitions grouped by name.
+func (s *GOBSymbolStore) LookupSymbolsBatch(ctx context.Context, names []string) (map[string][]Symbol, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	result := make(map[string][]Symbol)
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		if symbols, ok := s.index.Symbols[name]; ok {
+			result[name] = symbols
+		}
+	}
+	return result, nil
+}
+
 // LookupCallers finds all references/callers of a symbol.
 func (s *GOBSymbolStore) LookupCallers(ctx context.Context, symbolName string) ([]Reference, error) {
 	s.mu.RLock()

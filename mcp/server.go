@@ -36,6 +36,26 @@ type Server struct {
 	recorder      *stats.Recorder
 }
 
+func (s *Server) loadProjectSymbolStore(ctx context.Context) (trace.SymbolStore, error) {
+	cfg := config.DefaultConfig()
+	if config.Exists(s.projectRoot) {
+		var err error
+		cfg, err = config.Load(s.projectRoot)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load configuration: %w", err)
+		}
+	}
+	store, err := trace.NewSymbolStore(ctx, cfg, s.projectRoot)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.Load(ctx); err != nil {
+		store.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
 // SearchResult is a lightweight struct for MCP output.
 type SearchResult struct {
 	FilePath    string  `json:"file_path"`
@@ -1094,8 +1114,8 @@ func (s *Server) handleTraceCallers(ctx context.Context, request mcp.CallToolReq
 		return mcp.NewToolResultError("trace requires a project context; use --workspace parameter or start mcp-serve from a project directory"), nil
 	}
 
-	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(s.projectRoot))
-	if err := symbolStore.Load(ctx); err != nil {
+	symbolStore, err := s.loadProjectSymbolStore(ctx)
+	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
 	}
 	defer symbolStore.Close()
@@ -1138,6 +1158,7 @@ func (s *Server) handleTraceCallersFromStores(ctx context.Context, symbolName st
 		}
 		return mcp.NewToolResultText(output), nil
 	}
+	callerSymbols := lookupSymbolsInStores(ctx, stores, uniqueRefNames(allRefs, true), "caller")
 
 	var data any
 	if compact {
@@ -1155,11 +1176,8 @@ func (s *Server) handleTraceCallersFromStores(ctx context.Context, symbolName st
 
 		for _, ref := range allRefs {
 			var callerSym trace.Symbol
-			for _, ss := range stores {
-				callerSyms, err := ss.LookupSymbol(ctx, ref.CallerName)
-				if err != nil {
-					log.Printf("Warning: failed to lookup caller symbol %q: %v", ref.CallerName, err)
-				}
+			for _, symbols := range callerSymbols {
+				callerSyms := symbols[ref.CallerName]
 				if len(callerSyms) > 0 {
 					callerSym = callerSyms[0]
 					break
@@ -1193,11 +1211,8 @@ func (s *Server) handleTraceCallersFromStores(ctx context.Context, symbolName st
 		}
 		for _, ref := range allRefs {
 			var callerSym trace.Symbol
-			for _, ss := range stores {
-				callerSyms, err := ss.LookupSymbol(ctx, ref.CallerName)
-				if err != nil {
-					log.Printf("Warning: failed to lookup caller symbol %q: %v", ref.CallerName, err)
-				}
+			for _, symbols := range callerSymbols {
+				callerSyms := symbols[ref.CallerName]
 				if len(callerSyms) > 0 {
 					callerSym = callerSyms[0]
 					break
@@ -1272,8 +1287,8 @@ func (s *Server) handleTraceCallees(ctx context.Context, request mcp.CallToolReq
 		return mcp.NewToolResultError("trace requires a project context; use --workspace parameter or start mcp-serve from a project directory"), nil
 	}
 
-	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(s.projectRoot))
-	if err := symbolStore.Load(ctx); err != nil {
+	symbolStore, err := s.loadProjectSymbolStore(ctx)
+	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
 	}
 	defer symbolStore.Close()
@@ -1317,6 +1332,7 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 		}
 		return mcp.NewToolResultText(output), nil
 	}
+	calleeSymbols := lookupSymbolsInStores(ctx, stores, uniqueRefNames(allRefs, false), "callee")
 
 	var data any
 	if compact {
@@ -1334,11 +1350,8 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 
 		for _, ref := range allRefs {
 			var calleeSym trace.Symbol
-			for _, ss := range stores {
-				calleeSyms, err := ss.LookupSymbol(ctx, ref.SymbolName)
-				if err != nil {
-					log.Printf("Warning: failed to lookup callee symbol %q: %v", ref.SymbolName, err)
-				}
+			for _, symbols := range calleeSymbols {
+				calleeSyms := symbols[ref.SymbolName]
 				if len(calleeSyms) > 0 {
 					calleeSym = calleeSyms[0]
 					break
@@ -1372,11 +1385,8 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 		}
 		for _, ref := range allRefs {
 			var calleeSym trace.Symbol
-			for _, ss := range stores {
-				calleeSyms, err := ss.LookupSymbol(ctx, ref.SymbolName)
-				if err != nil {
-					log.Printf("Warning: failed to lookup callee symbol %q: %v", ref.SymbolName, err)
-				}
+			for _, symbols := range calleeSymbols {
+				calleeSyms := symbols[ref.SymbolName]
 				if len(calleeSyms) > 0 {
 					calleeSym = calleeSyms[0]
 					break
@@ -1492,8 +1502,8 @@ func (s *Server) handleTraceGraph(ctx context.Context, request mcp.CallToolReque
 		return mcp.NewToolResultError("trace requires a project context; use --workspace parameter or start mcp-serve from a project directory"), nil
 	}
 
-	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(s.projectRoot))
-	if err := symbolStore.Load(ctx); err != nil {
+	symbolStore, err := s.loadProjectSymbolStore(ctx)
+	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
 	}
 	defer symbolStore.Close()
@@ -1580,8 +1590,8 @@ func (s *Server) handleRefsGraph(ctx context.Context, request mcp.CallToolReques
 		if s.projectRoot == "" {
 			return mcp.NewToolResultError("refs requires a project context; use --workspace parameter or start mcp-serve from a project directory"), nil
 		}
-		symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(s.projectRoot))
-		if err := symbolStore.Load(ctx); err != nil {
+		symbolStore, err := s.loadProjectSymbolStore(ctx)
+		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
 		}
 		defer symbolStore.Close()
@@ -1595,33 +1605,32 @@ func (s *Server) handleRefsGraph(ctx context.Context, request mcp.CallToolReques
 	readers := make([]RefUsage, 0)
 	writers := make([]RefUsage, 0)
 	for _, ss := range stores {
-		r, err := ss.LookupReaders(ctx, symbolName)
-		if err == nil {
-			for _, ref := range r {
-				readers = append(readers, RefUsage{
-					Symbol: resolveRefCallerSymbol(ss, ctx, ref),
-					Access: ref.Kind,
-					AccessAt: trace.CallSite{
-						File:    ref.File,
-						Line:    ref.Line,
-						Context: ref.Context,
-					},
-				})
-			}
+		r, readErr := ss.LookupReaders(ctx, symbolName)
+		if readErr != nil {
+			log.Printf("Warning: failed to lookup readers of %q: %v", symbolName, readErr)
 		}
-		w, err := ss.LookupWriters(ctx, symbolName)
-		if err == nil {
-			for _, ref := range w {
-				writers = append(writers, RefUsage{
-					Symbol: resolveRefCallerSymbol(ss, ctx, ref),
-					Access: ref.Kind,
-					AccessAt: trace.CallSite{
-						File:    ref.File,
-						Line:    ref.Line,
-						Context: ref.Context,
-					},
-				})
-			}
+		w, writeErr := ss.LookupWriters(ctx, symbolName)
+		if writeErr != nil {
+			log.Printf("Warning: failed to lookup writers of %q: %v", symbolName, writeErr)
+		}
+		refs := append(append([]trace.Reference{}, r...), w...)
+		callerSymbols, batchErr := ss.LookupSymbolsBatch(ctx, uniqueRefNames(refs, true))
+		if batchErr != nil {
+			log.Printf("Warning: failed to lookup ref caller symbols: %v", batchErr)
+		}
+		for _, ref := range r {
+			readers = append(readers, RefUsage{
+				Symbol:   resolveRefCallerSymbol(callerSymbols, ref),
+				Access:   ref.Kind,
+				AccessAt: trace.CallSite{File: ref.File, Line: ref.Line, Context: ref.Context},
+			})
+		}
+		for _, ref := range w {
+			writers = append(writers, RefUsage{
+				Symbol:   resolveRefCallerSymbol(callerSymbols, ref),
+				Access:   ref.Kind,
+				AccessAt: trace.CallSite{File: ref.File, Line: ref.Line, Context: ref.Context},
+			})
 		}
 	}
 
@@ -1704,8 +1713,8 @@ func (s *Server) handleRefsByKind(ctx context.Context, request mcp.CallToolReque
 		return mcp.NewToolResultError("refs requires a project context; use --workspace parameter or start mcp-serve from a project directory"), nil
 	}
 
-	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(s.projectRoot))
-	if err := symbolStore.Load(ctx); err != nil {
+	symbolStore, err := s.loadProjectSymbolStore(ctx)
+	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
 	}
 	defer symbolStore.Close()
@@ -1733,10 +1742,14 @@ func (s *Server) handleRefsFromStores(ctx context.Context, symbolName string, ki
 			log.Printf("Warning: failed to lookup refs of %q: %v", symbolName, err)
 			continue
 		}
+		callerSymbols, batchErr := ss.LookupSymbolsBatch(ctx, uniqueRefNames(refs, true))
+		if batchErr != nil {
+			log.Printf("Warning: failed to lookup ref caller symbols: %v", batchErr)
+		}
 
 		for _, ref := range refs {
 			usages = append(usages, RefUsage{
-				Symbol: resolveRefCallerSymbol(ss, ctx, ref),
+				Symbol: resolveRefCallerSymbol(callerSymbols, ref),
 				Access: ref.Kind,
 				AccessAt: trace.CallSite{
 					File:    ref.File,
@@ -1790,13 +1803,13 @@ func (s *Server) handleRefsFromStores(ctx context.Context, symbolName string, ki
 	return mcp.NewToolResultText(output), nil
 }
 
-func resolveRefCallerSymbol(ss trace.SymbolStore, ctx context.Context, ref trace.Reference) trace.Symbol {
+func resolveRefCallerSymbol(candidatesByName map[string][]trace.Symbol, ref trace.Reference) trace.Symbol {
 	if ref.CallerName == "" || ref.CallerName == "<top-level>" {
 		return trace.Symbol{Name: ref.CallerName, File: ref.CallerFile, Line: ref.CallerLine}
 	}
 
-	candidates, err := ss.LookupSymbol(ctx, ref.CallerName)
-	if err != nil || len(candidates) == 0 {
+	candidates := candidatesByName[ref.CallerName]
+	if len(candidates) == 0 {
 		return trace.Symbol{Name: ref.CallerName, File: ref.CallerFile, Line: ref.CallerLine}
 	}
 	for _, sym := range candidates {
@@ -1806,6 +1819,35 @@ func resolveRefCallerSymbol(ss trace.SymbolStore, ctx context.Context, ref trace
 	}
 
 	return candidates[0]
+}
+
+func uniqueRefNames(refs []trace.Reference, callers bool) []string {
+	names := make([]string, 0, len(refs))
+	seen := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		name := ref.SymbolName
+		if callers {
+			name = ref.CallerName
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
+}
+
+func lookupSymbolsInStores(ctx context.Context, stores []trace.SymbolStore, names []string, label string) []map[string][]trace.Symbol {
+	result := make([]map[string][]trace.Symbol, len(stores))
+	for i, store := range stores {
+		symbols, err := store.LookupSymbolsBatch(ctx, names)
+		if err != nil {
+			log.Printf("Warning: failed to lookup %s symbols: %v", label, err)
+		}
+		result[i] = symbols
+	}
+	return result
 }
 
 // WorkspaceIndexStatus represents the status of a workspace index.
@@ -1860,8 +1902,16 @@ func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequ
 				Name: p.Name,
 				Path: p.Path,
 			}
-			ss := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(p.Path))
-			if loadErr := ss.Load(ctx); loadErr == nil {
+			projectCfg, loadErr := config.Load(p.Path)
+			if loadErr != nil {
+				wsStatus.Projects = append(wsStatus.Projects, ps)
+				continue
+			}
+			ss, loadErr := trace.NewSymbolStoreWithWorkspace(ctx, projectCfg, p.Path, &ws.Store)
+			if loadErr == nil {
+				loadErr = ss.Load(ctx)
+			}
+			if loadErr == nil {
 				if symbolStats, statsErr := ss.GetStats(ctx); statsErr == nil && symbolStats.TotalSymbols > 0 {
 					ps.SymbolsReady = true
 					ps.TotalSymbols = symbolStats.TotalSymbols
@@ -1903,9 +1953,12 @@ func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequ
 	}
 
 	// Check symbol index
-	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(s.projectRoot))
+	symbolStore, symbolStoreErr := trace.NewSymbolStore(ctx, cfg, s.projectRoot)
 	symbolsReady := false
-	if err := symbolStore.Load(ctx); err == nil {
+	if symbolStoreErr == nil {
+		symbolStoreErr = symbolStore.Load(ctx)
+	}
+	if symbolStoreErr == nil {
 		if symbolStats, err := symbolStore.GetStats(ctx); err == nil && symbolStats.TotalSymbols > 0 {
 			symbolsReady = true
 		}

@@ -336,9 +336,11 @@ func (w WatchConfig) WorktreeDiscoveryEnabled() bool {
 }
 
 type TraceConfig struct {
-	Mode             string   `yaml:"mode"`              // fast or precise
-	EnabledLanguages []string `yaml:"enabled_languages"` // File extensions to index
-	ExcludePatterns  []string `yaml:"exclude_patterns"`  // Patterns to exclude
+	Mode             string         `yaml:"mode"`              // fast or precise
+	EnabledLanguages []string       `yaml:"enabled_languages"` // File extensions to index
+	ExcludePatterns  []string       `yaml:"exclude_patterns"`  // Patterns to exclude
+	StoreBackend     string         `yaml:"store_backend,omitempty"`
+	Postgres         PostgresConfig `yaml:"postgres,omitempty"`
 }
 
 type RPGConfig struct {
@@ -465,7 +467,8 @@ func DefaultConfig() *Config {
 			},
 		},
 		Trace: TraceConfig{
-			Mode: "fast",
+			Mode:         "fast",
+			StoreBackend: "gob",
 			EnabledLanguages: []string{
 				".go", ".js", ".ts", ".jsx", ".tsx", ".vue", ".py", ".php",
 				".lua",
@@ -650,6 +653,10 @@ func (c *Config) applyDefaults() {
 	// Qdrant defaults
 	if c.Store.Backend == "qdrant" && c.Store.Qdrant.Port <= 0 {
 		c.Store.Qdrant.Port = DefaultStoreForBackend("qdrant").Qdrant.Port
+	}
+
+	if c.Trace.StoreBackend == "" {
+		c.Trace.StoreBackend = "gob"
 	}
 
 	// RPG defaults
