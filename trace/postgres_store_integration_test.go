@@ -229,6 +229,31 @@ func TestPostgresLookupCalleesMatchesGOB(t *testing.T) {
 	}
 }
 
+func TestPostgresCallGraphCanonicalMatchesGOB(t *testing.T) {
+	ctx := context.Background()
+	pg := newIntegrationSymbolStore(t, "graph-canonical", t.TempDir())
+	truncateSymbolTables(t, pg)
+	gob := NewGOBSymbolStore(filepath.Join(t.TempDir(), "symbols.gob"))
+	saveDuplicateGraphEdges(t, gob, []string{"z.go", "a.go"})
+	saveDuplicateGraphEdges(t, pg, []string{"a.go", "z.go"})
+	saveDuplicateGraphEdges(t, gob, []string{"a.go", "z.go"})
+	saveDuplicateGraphEdges(t, pg, []string{"z.go", "a.go"})
+	want, err := gob.GetCallGraph(ctx, "A", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := pg.GetCallGraph(ctx, "A", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Postgres graph differs from canonical GOB graph:\n got=%#v\nwant=%#v", got, want)
+	}
+	if len(got.Edges) != 2 || got.Edges[0].File != "a.go" || got.Edges[0].Line != 5 || got.Edges[1].File != "a.go" || got.Edges[1].Line != 7 {
+		t.Fatalf("unexpected canonical Postgres edges: %#v", got.Edges)
+	}
+}
+
 func TestPostgresSymbolStoreTenantIsolation(t *testing.T) {
 	ctx := context.Background()
 	one := newIntegrationSymbolStore(t, "tenant-one", t.TempDir())

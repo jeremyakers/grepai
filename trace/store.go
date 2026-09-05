@@ -459,6 +459,11 @@ func (s *GOBSymbolStore) GetCallGraph(ctx context.Context, symbolName string, de
 	}
 	queue := []queueItem{{symbolName, 0}}
 	edgeSeen := make(map[string]bool)
+	edgeCandidates := make([]callEdgeCandidate, len(s.index.CallGraph))
+	for ordinal, edge := range s.index.CallGraph {
+		edgeCandidates[ordinal] = callEdgeCandidate{edge: edge, ordinal: ordinal}
+	}
+	edgeCandidates = canonicalCallEdgeCandidates(edgeCandidates)
 
 	shouldTraverse := func(name string, isRoot bool) bool {
 		symbols := s.index.Symbols[name]
@@ -499,7 +504,8 @@ func (s *GOBSymbolStore) GetCallGraph(ctx context.Context, symbolName string, de
 		}
 
 		// Find edges (both callers and callees)
-		for _, edge := range s.index.CallGraph {
+		for _, candidate := range edgeCandidates {
+			edge := candidate.edge
 			if edge.Caller == current.name {
 				if isDeclarationSelfEdge(edge) {
 					continue

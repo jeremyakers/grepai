@@ -194,6 +194,7 @@ Postgres stores project, path, filename, and symbol identity values as raw bytes
 1. **Symbol Indexing**: During `grepai watch`, symbols (functions, methods, classes) are extracted from source files
 2. **Reference Tracking**: Function calls are identified and linked to their callers
 3. **Call Graph**: A graph is built mapping caller → callee relationships
+   Duplicate caller → callee edges use a stable canonical source location across storage backends.
 4. **Persistent Storage**: Symbols are stored in `.grepai/symbols.gob` by default, or written incrementally to Postgres when configured
 
 ### Use Cases

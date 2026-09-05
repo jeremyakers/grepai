@@ -27,7 +27,8 @@ func (s *PostgresSymbolStore) GetCallGraph(ctx context.Context, symbolName strin
 			return nil, err
 		}
 		names := append([]string(nil), frontier...)
-		for _, edge := range edges {
+		for _, candidate := range edges {
+			edge := candidate.edge
 			names = append(names, edge.Caller, edge.Callee)
 		}
 		symbols, err := s.LookupSymbolsBatch(ctx, names)
@@ -41,7 +42,8 @@ func (s *PostgresSymbolStore) GetCallGraph(ctx context.Context, symbolName strin
 		}
 
 		next := []string{}
-		for _, edge := range edges {
+		for _, candidate := range edges {
+			edge := candidate.edge
 			if isPostgresDeclarationSelfEdge(edge, symbols[edge.Caller]) {
 				continue
 			}
@@ -62,23 +64,24 @@ func (s *PostgresSymbolStore) GetCallGraph(ctx context.Context, symbolName strin
 	return graph, nil
 }
 
-func (s *PostgresSymbolStore) graphEdgesForLevel(ctx context.Context, frontier [][]byte, level int, root string) ([]CallEdge, error) {
-	rows, err := s.pool.Query(ctx, `SELECT caller,callee,file,line,call_type FROM call_edges WHERE project_id=$1 AND (caller=ANY($2::bytea[]) OR ($3=0 AND callee=$4)) ORDER BY file,line,ordinal`, identityBytes(s.projectID), frontier, level, identityBytes(root))
+func (s *PostgresSymbolStore) graphEdgesForLevel(ctx context.Context, frontier [][]byte, level int, root string) ([]callEdgeCandidate, error) {
+	rows, err := s.pool.Query(ctx, `SELECT caller,callee,file,line,call_type,ordinal FROM call_edges WHERE project_id=$1 AND (caller=ANY($2::bytea[]) OR ($3=0 AND callee=$4)) ORDER BY caller,callee,file,line,call_type,ordinal`, identityBytes(s.projectID), frontier, level, identityBytes(root))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query call graph: %w", err)
 	}
 	defer rows.Close()
-	edges := []CallEdge{}
+	edges := []callEdgeCandidate{}
 	for rows.Next() {
 		var edge CallEdge
+		var ordinal int
 		var caller, callee, file []byte
-		if err := rows.Scan(&caller, &callee, &file, &edge.Line, &edge.CallType); err != nil {
+		if err := rows.Scan(&caller, &callee, &file, &edge.Line, &edge.CallType, &ordinal); err != nil {
 			return nil, err
 		}
 		edge.Caller, edge.Callee, edge.File = string(caller), string(callee), string(file)
-		edges = append(edges, edge)
+		edges = append(edges, callEdgeCandidate{edge: edge, ordinal: ordinal})
 	}
-	return edges, rows.Err()
+	return canonicalCallEdgeCandidates(edges), rows.Err()
 }
 
 func isPostgresDeclarationSelfEdge(edge CallEdge, symbols []Symbol) bool {
