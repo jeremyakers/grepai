@@ -14,9 +14,11 @@ func scanSymbols(rows pgx.Rows) ([]Symbol, error) {
 	result := []Symbol{}
 	for rows.Next() {
 		var sym Symbol
-		if err := rows.Scan(&sym.Name, &sym.Kind, &sym.File, &sym.Line, &sym.EndLine, &sym.Signature, &sym.Receiver, &sym.Package, &sym.Exported, &sym.Language, &sym.Docstring, &sym.FeaturePath); err != nil {
+		var name, file []byte
+		if err := rows.Scan(&name, &sym.Kind, &file, &sym.Line, &sym.EndLine, &sym.Signature, &sym.Receiver, &sym.Package, &sym.Exported, &sym.Language, &sym.Docstring, &sym.FeaturePath); err != nil {
 			return nil, err
 		}
+		sym.Name, sym.File = string(name), string(file)
 		result = append(result, sym)
 	}
 	return result, rows.Err()
@@ -26,16 +28,19 @@ func scanRefs(rows pgx.Rows) ([]Reference, error) {
 	result := []Reference{}
 	for rows.Next() {
 		var ref Reference
-		if err := rows.Scan(&ref.SymbolName, &ref.Kind, &ref.File, &ref.Line, &ref.Column, &ref.Context, &ref.CallerName, &ref.CallerFile, &ref.CallerLine); err != nil {
+		var name, file, caller, callerFile []byte
+		if err := rows.Scan(&name, &ref.Kind, &file, &ref.Line, &ref.Column, &ref.Context, &caller, &callerFile, &ref.CallerLine); err != nil {
 			return nil, err
 		}
+		ref.SymbolName, ref.File = string(name), string(file)
+		ref.CallerName, ref.CallerFile = string(caller), string(callerFile)
 		result = append(result, ref)
 	}
 	return result, rows.Err()
 }
 
 func (s *PostgresSymbolStore) LookupSymbol(ctx context.Context, name string) ([]Symbol, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+symbolColumns+` FROM symbols WHERE project_id=$1 AND name=$2 ORDER BY file,line`, s.projectID, name)
+	rows, err := s.pool.Query(ctx, `SELECT `+symbolColumns+` FROM symbols WHERE project_id=$1 AND name=$2 ORDER BY file,line`, identityBytes(s.projectID), identityBytes(name))
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup symbol: %w", err)
 	}
@@ -57,16 +62,22 @@ func (s *PostgresSymbolStore) LookupSymbolsBatch(ctx context.Context, names []st
 		seen[name] = struct{}{}
 		unique = append(unique, name)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT `+symbolColumns+` FROM symbols WHERE project_id=$1 AND name=ANY($2::text[]) ORDER BY name,file,line`, s.projectID, unique)
+	identities := make([][]byte, len(unique))
+	for i, name := range unique {
+		identities[i] = identityBytes(name)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+symbolColumns+` FROM symbols WHERE project_id=$1 AND name=ANY($2::bytea[]) ORDER BY name,file,line`, identityBytes(s.projectID), identities)
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup symbols batch: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var sym Symbol
-		if err := rows.Scan(&sym.Name, &sym.Kind, &sym.File, &sym.Line, &sym.EndLine, &sym.Signature, &sym.Receiver, &sym.Package, &sym.Exported, &sym.Language, &sym.Docstring, &sym.FeaturePath); err != nil {
+		var name, file []byte
+		if err := rows.Scan(&name, &sym.Kind, &file, &sym.Line, &sym.EndLine, &sym.Signature, &sym.Receiver, &sym.Package, &sym.Exported, &sym.Language, &sym.Docstring, &sym.FeaturePath); err != nil {
 			return nil, fmt.Errorf("failed to scan symbol batch: %w", err)
 		}
+		sym.Name, sym.File = string(name), string(file)
 		result[sym.Name] = append(result[sym.Name], sym)
 	}
 	if err := rows.Err(); err != nil {
@@ -77,7 +88,7 @@ func (s *PostgresSymbolStore) LookupSymbolsBatch(ctx context.Context, names []st
 
 func (s *PostgresSymbolStore) lookupRefs(ctx context.Context, symbolName, kind string) ([]Reference, error) {
 	query := `SELECT ` + refColumns + ` FROM refs WHERE project_id=$1 AND symbol_name=$2`
-	args := []any{s.projectID, symbolName}
+	args := []any{identityBytes(s.projectID), identityBytes(symbolName)}
 	if kind == RefKindCall {
 		query += ` AND (ref_type=$3 OR ref_type='')`
 		args = append(args, kind)
@@ -104,20 +115,8 @@ func (s *PostgresSymbolStore) LookupWriters(ctx context.Context, symbolName stri
 	return s.lookupRefs(ctx, symbolName, RefKindWrite)
 }
 
-func (s *PostgresSymbolStore) LookupCallees(ctx context.Context, symbolName, _ string) ([]Reference, error) {
-	query := `SELECT DISTINCT ` + refColumns + ` FROM refs WHERE project_id=$1 AND caller=$2 AND (ref_type=$3 OR ref_type='')`
-	args := []any{s.projectID, symbolName, RefKindCall}
-	query += ` ORDER BY file,line`
-	rows, err := s.pool.Query(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to lookup callees: %w", err)
-	}
-	defer rows.Close()
-	return scanRefs(rows)
-}
-
 func (s *PostgresSymbolStore) GetSymbolsForFile(ctx context.Context, filePath string) ([]Symbol, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+symbolColumns+` FROM symbols WHERE project_id=$1 AND file=$2 ORDER BY line,name`, s.projectID, filePath)
+	rows, err := s.pool.Query(ctx, `SELECT `+symbolColumns+` FROM symbols WHERE project_id=$1 AND file=$2 ORDER BY line,name`, identityBytes(s.projectID), identityBytes(filePath))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get symbols for file: %w", err)
 	}
@@ -126,7 +125,7 @@ func (s *PostgresSymbolStore) GetSymbolsForFile(ctx context.Context, filePath st
 }
 
 func (s *PostgresSymbolStore) GetCallEdges(ctx context.Context) ([]CallEdge, error) {
-	rows, err := s.pool.Query(ctx, `SELECT caller,callee,file,line,call_type FROM call_edges WHERE project_id=$1 ORDER BY file,line`, s.projectID)
+	rows, err := s.pool.Query(ctx, `SELECT caller,callee,file,line,call_type FROM call_edges WHERE project_id=$1 ORDER BY file,line`, identityBytes(s.projectID))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get call edges: %w", err)
 	}
@@ -134,9 +133,11 @@ func (s *PostgresSymbolStore) GetCallEdges(ctx context.Context) ([]CallEdge, err
 	edges := []CallEdge{}
 	for rows.Next() {
 		var edge CallEdge
-		if err := rows.Scan(&edge.Caller, &edge.Callee, &edge.File, &edge.Line, &edge.CallType); err != nil {
+		var caller, callee, file []byte
+		if err := rows.Scan(&caller, &callee, &file, &edge.Line, &edge.CallType); err != nil {
 			return nil, err
 		}
+		edge.Caller, edge.Callee, edge.File = string(caller), string(callee), string(file)
 		edges = append(edges, edge)
 	}
 	return edges, rows.Err()
@@ -144,13 +145,19 @@ func (s *PostgresSymbolStore) GetCallEdges(ctx context.Context) ([]CallEdge, err
 
 func (s *PostgresSymbolStore) GetStats(ctx context.Context) (*SymbolStats, error) {
 	var stats SymbolStats
-	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM symbols WHERE project_id=$1`, s.projectID).Scan(&stats.TotalSymbols); err != nil {
+	projectID := identityBytes(s.projectID)
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM symbols WHERE project_id=$1`, projectID).Scan(&stats.TotalSymbols); err != nil {
 		return nil, err
 	}
-	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM refs WHERE project_id=$1`, s.projectID).Scan(&stats.TotalReferences); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM refs WHERE project_id=$1`, projectID).Scan(&stats.TotalReferences); err != nil {
 		return nil, err
 	}
-	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*),COALESCE(MAX(mod_time),'1970-01-01'::timestamptz) FROM symbol_files WHERE project_id=$1`, s.projectID).Scan(&stats.TotalFiles, &stats.LastUpdated); err != nil {
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*),COALESCE(MAX(mod_time),'1970-01-01'::timestamptz) FROM symbol_files WHERE project_id=$1`, projectID).Scan(&stats.TotalFiles, &stats.LastUpdated); err != nil {
+		return nil, err
+	}
+	// Logical row bytes provide a project-scoped estimate without counting
+	// unrelated tenants or global table/index overhead.
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE((SELECT SUM(pg_column_size(t)) FROM symbols t WHERE project_id=$1),0)+COALESCE((SELECT SUM(pg_column_size(t)) FROM refs t WHERE project_id=$1),0)+COALESCE((SELECT SUM(pg_column_size(t)) FROM call_edges t WHERE project_id=$1),0)+COALESCE((SELECT SUM(pg_column_size(t)) FROM symbol_files t WHERE project_id=$1),0)`, projectID).Scan(&stats.IndexSize); err != nil {
 		return nil, err
 	}
 	return &stats, nil

@@ -1132,9 +1132,9 @@ func (s *Server) handleTraceCallers(ctx context.Context, request mcp.CallToolReq
 func (s *Server) handleTraceCallersFromStores(ctx context.Context, symbolName string, compact bool, format string, stores []trace.SymbolStore) (*mcp.CallToolResult, error) {
 	// Aggregate results across stores
 	var firstSymbol *trace.Symbol
-	var allRefs []trace.Reference
+	var allRefs []storeReference
 
-	for _, ss := range stores {
+	for storeIndex, ss := range stores {
 		symbols, err := ss.LookupSymbol(ctx, symbolName)
 		if err != nil {
 			log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
@@ -1147,7 +1147,9 @@ func (s *Server) handleTraceCallersFromStores(ctx context.Context, symbolName st
 		if err != nil {
 			log.Printf("Warning: failed to lookup callers of %q: %v", symbolName, err)
 		}
-		allRefs = append(allRefs, refs...)
+		for _, ref := range refs {
+			allRefs = append(allRefs, storeReference{ref: ref, storeIndex: storeIndex})
+		}
 	}
 
 	if firstSymbol == nil {
@@ -1158,7 +1160,7 @@ func (s *Server) handleTraceCallersFromStores(ctx context.Context, symbolName st
 		}
 		return mcp.NewToolResultText(output), nil
 	}
-	callerSymbols := lookupSymbolsInStores(ctx, stores, uniqueRefNames(allRefs, true), "caller")
+	callerSymbols := lookupSymbolsByOrigin(ctx, stores, allRefs, true, "caller")
 
 	var data any
 	if compact {
@@ -1174,18 +1176,9 @@ func (s *Server) handleTraceCallersFromStores(ctx context.Context, symbolName st
 			Callers: make([]CallerInfoCompact, 0, len(allRefs)),
 		}
 
-		for _, ref := range allRefs {
-			var callerSym trace.Symbol
-			for _, symbols := range callerSymbols {
-				callerSyms := symbols[ref.CallerName]
-				if len(callerSyms) > 0 {
-					callerSym = callerSyms[0]
-					break
-				}
-			}
-			if callerSym.Name == "" {
-				callerSym = trace.Symbol{Name: ref.CallerName, File: ref.CallerFile, Line: ref.CallerLine}
-			}
+		for _, item := range allRefs {
+			ref := item.ref
+			callerSym := resolveRefCallerSymbol(callerSymbols[item.storeIndex], ref)
 			resultCompact.Callers = append(resultCompact.Callers, CallerInfoCompact{
 				Symbol: callerSym,
 				CallSite: CallSiteCompact{
@@ -1209,18 +1202,9 @@ func (s *Server) handleTraceCallersFromStores(ctx context.Context, symbolName st
 			Mode:   "fast",
 			Symbol: firstSymbol,
 		}
-		for _, ref := range allRefs {
-			var callerSym trace.Symbol
-			for _, symbols := range callerSymbols {
-				callerSyms := symbols[ref.CallerName]
-				if len(callerSyms) > 0 {
-					callerSym = callerSyms[0]
-					break
-				}
-			}
-			if callerSym.Name == "" {
-				callerSym = trace.Symbol{Name: ref.CallerName, File: ref.CallerFile, Line: ref.CallerLine}
-			}
+		for _, item := range allRefs {
+			ref := item.ref
+			callerSym := resolveRefCallerSymbol(callerSymbols[item.storeIndex], ref)
 			result.Callers = append(result.Callers, trace.CallerInfo{
 				Symbol: callerSym,
 				CallSite: trace.CallSite{
@@ -1304,9 +1288,9 @@ func (s *Server) handleTraceCallees(ctx context.Context, request mcp.CallToolReq
 // handleTraceCalleesFromStores handles callees lookup across one or more symbol stores.
 func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName string, compact bool, format string, stores []trace.SymbolStore) (*mcp.CallToolResult, error) {
 	var firstSymbol *trace.Symbol
-	var allRefs []trace.Reference
+	var allRefs []storeReference
 
-	for _, ss := range stores {
+	for storeIndex, ss := range stores {
 		symbols, err := ss.LookupSymbol(ctx, symbolName)
 		if err != nil {
 			log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
@@ -1320,7 +1304,9 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 			if err != nil {
 				log.Printf("Warning: failed to lookup callees of %q: %v", symbolName, err)
 			}
-			allRefs = append(allRefs, refs...)
+			for _, ref := range refs {
+				allRefs = append(allRefs, storeReference{ref: ref, storeIndex: storeIndex})
+			}
 		}
 	}
 
@@ -1332,7 +1318,7 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 		}
 		return mcp.NewToolResultText(output), nil
 	}
-	calleeSymbols := lookupSymbolsInStores(ctx, stores, uniqueRefNames(allRefs, false), "callee")
+	calleeSymbols := lookupSymbolsByOrigin(ctx, stores, allRefs, false, "callee")
 
 	var data any
 	if compact {
@@ -1348,14 +1334,12 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 			Callees: make([]CalleeInfoCompact, 0, len(allRefs)),
 		}
 
-		for _, ref := range allRefs {
+		for _, item := range allRefs {
+			ref := item.ref
+			calleeSyms := calleeSymbols[item.storeIndex][ref.SymbolName]
 			var calleeSym trace.Symbol
-			for _, symbols := range calleeSymbols {
-				calleeSyms := symbols[ref.SymbolName]
-				if len(calleeSyms) > 0 {
-					calleeSym = calleeSyms[0]
-					break
-				}
+			if len(calleeSyms) > 0 {
+				calleeSym = calleeSyms[0]
 			}
 			if calleeSym.Name == "" {
 				calleeSym = trace.Symbol{Name: ref.SymbolName}
@@ -1383,14 +1367,12 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 			Mode:   "fast",
 			Symbol: firstSymbol,
 		}
-		for _, ref := range allRefs {
+		for _, item := range allRefs {
+			ref := item.ref
+			calleeSyms := calleeSymbols[item.storeIndex][ref.SymbolName]
 			var calleeSym trace.Symbol
-			for _, symbols := range calleeSymbols {
-				calleeSyms := symbols[ref.SymbolName]
-				if len(calleeSyms) > 0 {
-					calleeSym = calleeSyms[0]
-					break
-				}
+			if len(calleeSyms) > 0 {
+				calleeSym = calleeSyms[0]
 			}
 			if calleeSym.Name == "" {
 				calleeSym = trace.Symbol{Name: ref.SymbolName}
@@ -1838,14 +1820,39 @@ func uniqueRefNames(refs []trace.Reference, callers bool) []string {
 	return names
 }
 
-func lookupSymbolsInStores(ctx context.Context, stores []trace.SymbolStore, names []string, label string) []map[string][]trace.Symbol {
+type storeReference struct {
+	ref        trace.Reference
+	storeIndex int
+}
+
+func lookupSymbolsByOrigin(ctx context.Context, stores []trace.SymbolStore, refs []storeReference, callers bool, label string) []map[string][]trace.Symbol {
+	names := make([][]string, len(stores))
+	for _, item := range refs {
+		name := item.ref.SymbolName
+		if callers {
+			name = item.ref.CallerName
+		}
+		names[item.storeIndex] = append(names[item.storeIndex], name)
+	}
 	result := make([]map[string][]trace.Symbol, len(stores))
 	for i, store := range stores {
-		symbols, err := store.LookupSymbolsBatch(ctx, names)
+		symbols, err := store.LookupSymbolsBatch(ctx, uniqueNames(names[i]))
 		if err != nil {
 			log.Printf("Warning: failed to lookup %s symbols: %v", label, err)
 		}
 		result[i] = symbols
+	}
+	return result
+}
+
+func uniqueNames(names []string) []string {
+	result := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if _, ok := seen[name]; !ok {
+			seen[name] = struct{}{}
+			result = append(result, name)
+		}
 	}
 	return result
 }

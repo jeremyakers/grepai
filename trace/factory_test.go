@@ -3,6 +3,7 @@ package trace
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/yoanbernabeu/grepai/config"
@@ -96,11 +97,28 @@ func containsIFNotExists(query string) bool {
 	return false
 }
 
-func TestShouldMigrateGOB(t *testing.T) {
-	if !shouldMigrateGOB(0, true) {
-		t.Fatal("empty Postgres project with a GOB file should migrate")
+func TestMigrationAdvisoryKeyIsStableAndProjectScoped(t *testing.T) {
+	a1, a2 := migrationAdvisoryKey("project-a")
+	b1, b2 := migrationAdvisoryKey("project-b")
+	if a1 != 239074291 || a2 != 498263476 {
+		t.Fatalf("unexpected stable advisory key: %d,%d", a1, a2)
 	}
-	if shouldMigrateGOB(1, true) || shouldMigrateGOB(0, false) {
-		t.Fatal("migration guard allowed a non-empty project or missing GOB file")
+	if a1 == b1 && a2 == b2 {
+		t.Fatal("different projects must not share an advisory key")
+	}
+}
+
+func TestSymbolSchemaUsesLosslessIdentityColumnsAndMigrationState(t *testing.T) {
+	schema := strings.Join(symbolSchemaQueries(), "\n")
+	for _, required := range []string{
+		"symbol_files (project_id BYTEA", "path BYTEA",
+		"symbols (project_id BYTEA", "name BYTEA", "file BYTEA",
+		"refs (project_id BYTEA", "symbol_name BYTEA", "caller BYTEA", "caller_file BYTEA",
+		"call_edges (project_id BYTEA", "callee BYTEA",
+		"symbol_migrations (project_id BYTEA PRIMARY KEY", "completed_at TIMESTAMPTZ",
+	} {
+		if !strings.Contains(schema, required) {
+			t.Fatalf("symbol schema missing %q", required)
+		}
 	}
 }

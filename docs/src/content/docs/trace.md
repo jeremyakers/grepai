@@ -185,7 +185,9 @@ trace:
 
 The Postgres symbol backend is independent of `store.backend`, which controls vector storage. Its DSN is resolved from `trace.postgres.dsn`, then the workspace's `store.postgres.dsn` (in workspace mode), then the project's `store.postgres.dsn`, and finally `postgres://localhost:5432/grepai`.
 
-When Postgres is enabled for a project that already has `.grepai/symbols.gob`, grepai imports that index automatically if the project's Postgres symbol tables are empty. After a successful import, the original file is renamed to `.grepai/symbols.gob.migrated.bak`. A failed import leaves the GOB file in place so migration can be retried.
+When Postgres is enabled for a project that already has `.grepai/symbols.gob`, grepai imports that index automatically. Migration is serialized with project-scoped Postgres and exclusive GOB file locks, and the complete import commits atomically. An interruption before commit leaves no partial project data and retains the GOB file for retry. After a successful import, the original file is renamed to `.grepai/symbols.gob.migrated.bak`; if commit succeeds but archiving is interrupted, the next startup completes the archive.
+
+Postgres stores project, path, filename, and symbol identity values as raw bytes. This preserves unusual filesystem names exactly; invalid UTF-8 is replaced only in display-oriented text such as signatures, documentation, and reference context.
 
 ### How It Works
 
