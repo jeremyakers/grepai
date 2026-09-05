@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Postgres Symbol Store**: Add an opt-in `trace.store_backend: postgres` backend that writes symbol, reference, and call-edge updates incrementally instead of periodically rewriting the entire `.grepai/symbols.gob` file. Existing GOB indexes migrate automatically on first use and are retained as `symbols.gob.migrated.bak` (#298)
   - Resolve caller, callee, and reference symbols in batches, avoiding thousands of Postgres round trips for large trace result sets
   - Serialize activation with Postgres advisory and GOB file locks, importing atomically so interrupted migrations retry without partial data
+  - Verify the locked GOB snapshot fingerprint before archive recovery, and serialize same-file saves/deletes with durable reference ordering
   - Preserve arbitrary filename and symbol-name bytes exactly while sanitizing invalid UTF-8 only in display text
 
 ## [0.36.1] - 2026-09-01

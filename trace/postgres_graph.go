@@ -63,7 +63,7 @@ func (s *PostgresSymbolStore) GetCallGraph(ctx context.Context, symbolName strin
 }
 
 func (s *PostgresSymbolStore) graphEdgesForLevel(ctx context.Context, frontier [][]byte, level int, root string) ([]CallEdge, error) {
-	rows, err := s.pool.Query(ctx, `SELECT caller,callee,file,line,call_type FROM call_edges WHERE project_id=$1 AND (caller=ANY($2::bytea[]) OR ($3=0 AND callee=$4))`, identityBytes(s.projectID), frontier, level, identityBytes(root))
+	rows, err := s.pool.Query(ctx, `SELECT caller,callee,file,line,call_type FROM call_edges WHERE project_id=$1 AND (caller=ANY($2::bytea[]) OR ($3=0 AND callee=$4)) ORDER BY file,line,ordinal`, identityBytes(s.projectID), frontier, level, identityBytes(root))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query call graph: %w", err)
 	}

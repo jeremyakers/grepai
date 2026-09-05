@@ -11,6 +11,9 @@ type calleeSite struct {
 	line int
 }
 
+const calleeEdgesSQL = `SELECT caller,callee,file,line,call_type FROM call_edges WHERE project_id=$1 AND caller=$2 ORDER BY file,line,ordinal,callee`
+const calleeRefsSQL = `SELECT ` + refColumns + ` FROM refs WHERE project_id=$1 AND caller=$2 AND (ref_type=$3 OR ref_type='') ORDER BY file,line,ordinal,symbol_name`
+
 func (s *PostgresSymbolStore) LookupCallees(ctx context.Context, symbolName, _ string) ([]Reference, error) {
 	edges, err := s.calleeEdges(ctx, symbolName)
 	if err != nil {
@@ -48,7 +51,7 @@ func (s *PostgresSymbolStore) LookupCallees(ctx context.Context, symbolName, _ s
 }
 
 func (s *PostgresSymbolStore) calleeEdges(ctx context.Context, symbolName string) ([]CallEdge, error) {
-	rows, err := s.pool.Query(ctx, `SELECT caller,callee,file,line,call_type FROM call_edges WHERE project_id=$1 AND caller=$2 ORDER BY file,line,ctid`, identityBytes(s.projectID), identityBytes(symbolName))
+	rows, err := s.pool.Query(ctx, calleeEdgesSQL, identityBytes(s.projectID), identityBytes(symbolName))
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup callee edges: %w", err)
 	}
@@ -67,7 +70,7 @@ func (s *PostgresSymbolStore) calleeEdges(ctx context.Context, symbolName string
 }
 
 func (s *PostgresSymbolStore) callRefsByCaller(ctx context.Context, symbolName string) ([]Reference, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+refColumns+` FROM refs WHERE project_id=$1 AND caller=$2 AND (ref_type=$3 OR ref_type='') ORDER BY file,line,ctid`, identityBytes(s.projectID), identityBytes(symbolName), RefKindCall)
+	rows, err := s.pool.Query(ctx, calleeRefsSQL, identityBytes(s.projectID), identityBytes(symbolName), RefKindCall)
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup callee references: %w", err)
 	}

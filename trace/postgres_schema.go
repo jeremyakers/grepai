@@ -21,9 +21,13 @@ func symbolSchemaQueries() []string {
 		`CREATE TABLE IF NOT EXISTS refs (project_id BYTEA NOT NULL, symbol_name BYTEA NOT NULL, file BYTEA NOT NULL, line INTEGER NOT NULL, col INTEGER NOT NULL DEFAULT 0, ref_type TEXT NOT NULL DEFAULT '', context TEXT NOT NULL DEFAULT '', caller BYTEA NOT NULL DEFAULT ''::bytea, caller_file BYTEA NOT NULL DEFAULT ''::bytea, caller_line INTEGER NOT NULL DEFAULT 0)`,
 		`ALTER TABLE refs ADD COLUMN IF NOT EXISTS caller_file BYTEA NOT NULL DEFAULT ''::bytea`,
 		`ALTER TABLE refs ADD COLUMN IF NOT EXISTS caller_line INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE refs ADD COLUMN IF NOT EXISTS ordinal INTEGER NOT NULL DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS call_edges (project_id BYTEA NOT NULL, caller BYTEA NOT NULL, callee BYTEA NOT NULL, file BYTEA NOT NULL, line INTEGER NOT NULL, call_type TEXT NOT NULL DEFAULT '')`,
 		`ALTER TABLE call_edges ADD COLUMN IF NOT EXISTS call_type TEXT NOT NULL DEFAULT ''`,
-		`CREATE TABLE IF NOT EXISTS symbol_migrations (project_id BYTEA PRIMARY KEY, state TEXT NOT NULL, source_path BYTEA NOT NULL, started_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ)`,
+		`ALTER TABLE call_edges ADD COLUMN IF NOT EXISTS ordinal INTEGER NOT NULL DEFAULT 0`,
+		`CREATE TABLE IF NOT EXISTS symbol_migrations (project_id BYTEA PRIMARY KEY, state TEXT NOT NULL, source_path BYTEA NOT NULL, source_digest BYTEA, source_size BIGINT, started_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ)`,
+		`ALTER TABLE symbol_migrations ADD COLUMN IF NOT EXISTS source_digest BYTEA`,
+		`ALTER TABLE symbol_migrations ADD COLUMN IF NOT EXISTS source_size BIGINT`,
 	}
 }
 

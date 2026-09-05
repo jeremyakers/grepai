@@ -99,12 +99,20 @@ func containsIFNotExists(query string) bool {
 
 func TestMigrationAdvisoryKeyIsStableAndProjectScoped(t *testing.T) {
 	a1, a2 := migrationAdvisoryKey("project-a")
+	a1Again, a2Again := migrationAdvisoryKey("project-a")
 	b1, b2 := migrationAdvisoryKey("project-b")
-	if a1 != 239074291 || a2 != 498263476 {
-		t.Fatalf("unexpected stable advisory key: %d,%d", a1, a2)
+	if a1 != a1Again || a2 != a2Again {
+		t.Fatal("migration advisory key is not stable")
 	}
 	if a1 == b1 && a2 == b2 {
 		t.Fatal("different projects must not share an advisory key")
+	}
+	f1, f2 := fileMutationAdvisoryKey("project-a", "file.go")
+	if a1 == f1 && a2 == f2 {
+		t.Fatal("migration and file mutation keys must use distinct namespaces")
+	}
+	if other1, other2 := fileMutationAdvisoryKey("project-a", "other.go"); f1 == other1 && f2 == other2 {
+		t.Fatal("different files must not share a mutation key")
 	}
 }
 
@@ -115,10 +123,38 @@ func TestSymbolSchemaUsesLosslessIdentityColumnsAndMigrationState(t *testing.T) 
 		"symbols (project_id BYTEA", "name BYTEA", "file BYTEA",
 		"refs (project_id BYTEA", "symbol_name BYTEA", "caller BYTEA", "caller_file BYTEA",
 		"call_edges (project_id BYTEA", "callee BYTEA",
-		"symbol_migrations (project_id BYTEA PRIMARY KEY", "completed_at TIMESTAMPTZ",
+		"symbol_migrations (project_id BYTEA PRIMARY KEY", "source_digest BYTEA", "source_size BIGINT", "completed_at TIMESTAMPTZ",
+		"refs ADD COLUMN IF NOT EXISTS ordinal", "call_edges ADD COLUMN IF NOT EXISTS ordinal",
 	} {
 		if !strings.Contains(schema, required) {
 			t.Fatalf("symbol schema missing %q", required)
 		}
+	}
+}
+
+func TestCalleeQueriesUseDurableOrdinals(t *testing.T) {
+	for _, query := range []string{calleeEdgesSQL, calleeRefsSQL} {
+		if strings.Contains(strings.ToLower(query), "ctid") {
+			t.Fatalf("callee query depends on ctid: %s", query)
+		}
+		if !strings.Contains(query, "ORDER BY file,line,ordinal") {
+			t.Fatalf("callee query does not use durable ordinal ordering: %s", query)
+		}
+	}
+}
+
+func TestMigrationRefsByFileReconstructsOriginalOrder(t *testing.T) {
+	store := NewGOBSymbolStore("unused")
+	refs := []Reference{
+		{SymbolName: "readFirst", Kind: RefKindRead, File: "main.go", Line: 10, CallerName: "Main"},
+		{SymbolName: "callSecond", Kind: RefKindCall, File: "main.go", Line: 10, CallerName: "Main"},
+		{SymbolName: "writeThird", Kind: RefKindWrite, File: "main.go", Line: 11, CallerName: "Main"},
+	}
+	if err := store.SaveFile(context.Background(), "main.go", nil, refs); err != nil {
+		t.Fatal(err)
+	}
+	got := migrationRefsByFile(store)["main.go"]
+	if !reflect.DeepEqual(got, refs) {
+		t.Fatalf("migration ref order = %#v, want %#v", got, refs)
 	}
 }

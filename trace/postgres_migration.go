@@ -2,8 +2,6 @@ package trace
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -17,11 +15,6 @@ import (
 )
 
 const migrationBatchSize = 500
-
-func migrationAdvisoryKey(projectID string) (int32, int32) {
-	digest := sha256.Sum256([]byte(projectID))
-	return int32(binary.BigEndian.Uint32(digest[:4])), int32(binary.BigEndian.Uint32(digest[4:8]))
-}
 
 func (s *PostgresSymbolStore) migrateGOBIfNeeded(ctx context.Context) (retErr error) {
 	conn, err := s.pool.Acquire(ctx)
@@ -49,7 +42,7 @@ func (s *PostgresSymbolStore) migrateGOBIfNeeded(ctx context.Context) (retErr er
 	}
 	defer func() { retErr = errors.Join(retErr, fileutil.Funlock(lockFile)) }()
 
-	state, err := s.migrationState(ctx, conn)
+	status, err := s.migrationState(ctx, conn)
 	if err != nil {
 		return err
 	}
@@ -57,8 +50,15 @@ func (s *PostgresSymbolStore) migrateGOBIfNeeded(ctx context.Context) (retErr er
 	if err != nil {
 		return err
 	}
-	if state == "completed" {
+	if status.state == "completed" {
 		if gobExists {
+			fingerprint, err := fingerprintSource(path)
+			if err != nil {
+				return err
+			}
+			if err := verifyCompletedSource(status, fingerprint); err != nil {
+				return err
+			}
 			return archiveMigratedGOB(path)
 		}
 		return nil
@@ -71,13 +71,17 @@ func (s *PostgresSymbolStore) migrateGOBIfNeeded(ctx context.Context) (retErr er
 		return fmt.Errorf("inconsistent partial Postgres symbol migration for project: %d data rows exist without a completed migration marker", rows)
 	}
 	if !gobExists {
-		if state != "" {
+		if status.state != "" {
 			return fmt.Errorf("incomplete Postgres symbol migration has no source GOB file to retry")
 		}
-		if _, err := conn.Exec(ctx, `INSERT INTO symbol_migrations(project_id,state,source_path,started_at,completed_at) VALUES($1,'completed',$2,NOW(),NOW())`, identityBytes(s.projectID), identityBytes(path)); err != nil {
+		if _, err := conn.Exec(ctx, `INSERT INTO symbol_migrations(project_id,state,source_path,source_digest,source_size,started_at,completed_at) VALUES($1,'completed',$2,NULL,NULL,NOW(),NOW())`, identityBytes(s.projectID), identityBytes(path)); err != nil {
 			return fmt.Errorf("failed to activate empty Postgres symbol store: %w", err)
 		}
 		return nil
+	}
+	fingerprint, err := fingerprintSource(path)
+	if err != nil {
+		return err
 	}
 
 	gobStore := NewGOBSymbolStore(path)
@@ -88,10 +92,10 @@ func (s *PostgresSymbolStore) migrateGOBIfNeeded(ctx context.Context) (retErr er
 	if !loaded {
 		return nil
 	}
-	if _, err := conn.Exec(ctx, `INSERT INTO symbol_migrations(project_id,state,source_path,started_at,completed_at) VALUES($1,'migrating',$2,NOW(),NULL) ON CONFLICT(project_id) DO UPDATE SET state='migrating',source_path=EXCLUDED.source_path,started_at=EXCLUDED.started_at,completed_at=NULL`, identityBytes(s.projectID), identityBytes(path)); err != nil {
+	if _, err := conn.Exec(ctx, `INSERT INTO symbol_migrations(project_id,state,source_path,source_digest,source_size,started_at,completed_at) VALUES($1,'migrating',$2,$3,$4,NOW(),NULL) ON CONFLICT(project_id) DO UPDATE SET state='migrating',source_path=EXCLUDED.source_path,source_digest=EXCLUDED.source_digest,source_size=EXCLUDED.source_size,started_at=EXCLUDED.started_at,completed_at=NULL`, identityBytes(s.projectID), identityBytes(path), fingerprint.digest, fingerprint.size); err != nil {
 		return fmt.Errorf("failed to record symbol migration start: %w", err)
 	}
-	if err := s.importGOBSnapshot(ctx, conn, gobStore); err != nil {
+	if err := s.importGOBSnapshot(ctx, conn, gobStore, fingerprint); err != nil {
 		return err
 	}
 	if err := archiveMigratedGOB(path); err != nil {
@@ -101,17 +105,12 @@ func (s *PostgresSymbolStore) migrateGOBIfNeeded(ctx context.Context) (retErr er
 	return nil
 }
 
-func (s *PostgresSymbolStore) importGOBSnapshot(ctx context.Context, conn *pgxpool.Conn, gobStore *GOBSymbolStore) error {
+func (s *PostgresSymbolStore) importGOBSnapshot(ctx context.Context, conn *pgxpool.Conn, gobStore *GOBSymbolStore, fingerprint sourceFingerprint) error {
 	files := make([]string, 0, len(gobStore.fileIndex))
 	for file := range gobStore.fileIndex {
 		files = append(files, file)
 	}
-	refsByFile := make(map[string][]Reference, len(files))
-	for _, refs := range gobStore.index.References {
-		for _, ref := range refs {
-			refsByFile[ref.File] = append(refsByFile[ref.File], ref)
-		}
-	}
+	refsByFile := migrationRefsByFile(gobStore)
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin GOB symbol migration: %w", err)
@@ -134,7 +133,7 @@ func (s *PostgresSymbolStore) importGOBSnapshot(ctx context.Context, conn *pgxpo
 			}
 		}
 	}
-	if _, err := tx.Exec(ctx, `UPDATE symbol_migrations SET state='completed',completed_at=NOW() WHERE project_id=$1`, identityBytes(s.projectID)); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE symbol_migrations SET state='completed',source_digest=$2,source_size=$3,completed_at=NOW() WHERE project_id=$1`, identityBytes(s.projectID), fingerprint.digest, fingerprint.size); err != nil {
 		return rollbackMigration(tx, fmt.Errorf("failed to complete symbol migration marker: %w", err))
 	}
 	if err := tx.Commit(ctx); err != nil {

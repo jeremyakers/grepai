@@ -96,7 +96,7 @@ func (s *PostgresSymbolStore) lookupRefs(ctx context.Context, symbolName, kind s
 		query += ` AND ref_type=$3`
 		args = append(args, kind)
 	}
-	query += ` ORDER BY file,line`
+	query += ` ORDER BY file,line,ordinal`
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup references: %w", err)
@@ -125,7 +125,7 @@ func (s *PostgresSymbolStore) GetSymbolsForFile(ctx context.Context, filePath st
 }
 
 func (s *PostgresSymbolStore) GetCallEdges(ctx context.Context) ([]CallEdge, error) {
-	rows, err := s.pool.Query(ctx, `SELECT caller,callee,file,line,call_type FROM call_edges WHERE project_id=$1 ORDER BY file,line`, identityBytes(s.projectID))
+	rows, err := s.pool.Query(ctx, `SELECT caller,callee,file,line,call_type FROM call_edges WHERE project_id=$1 ORDER BY file,line,ordinal`, identityBytes(s.projectID))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get call edges: %w", err)
 	}

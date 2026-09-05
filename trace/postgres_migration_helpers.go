@@ -1,14 +1,30 @@
 package trace
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+type migrationStatus struct {
+	state        string
+	sourceDigest []byte
+	sourceSize   *int64
+}
+
+type sourceFingerprint struct {
+	digest []byte
+	size   int64
+}
 
 func releaseMigrationAdvisoryLock(conn *pgxpool.Conn, key1, key2 int32) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -23,16 +39,20 @@ func releaseMigrationAdvisoryLock(conn *pgxpool.Conn, key1, key2 int32) error {
 	return nil
 }
 
-func (s *PostgresSymbolStore) migrationState(ctx context.Context, conn *pgxpool.Conn) (string, error) {
-	var state string
-	err := conn.QueryRow(ctx, `SELECT state FROM symbol_migrations WHERE project_id=$1`, identityBytes(s.projectID)).Scan(&state)
+func (s *PostgresSymbolStore) migrationState(ctx context.Context, conn *pgxpool.Conn) (migrationStatus, error) {
+	var status migrationStatus
+	var size pgtype.Int8
+	err := conn.QueryRow(ctx, `SELECT state,source_digest,source_size FROM symbol_migrations WHERE project_id=$1`, identityBytes(s.projectID)).Scan(&status.state, &status.sourceDigest, &size)
 	if err == pgx.ErrNoRows {
-		return "", nil
+		return migrationStatus{}, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("failed to read symbol migration state: %w", err)
+		return migrationStatus{}, fmt.Errorf("failed to read symbol migration state: %w", err)
 	}
-	return state, nil
+	if size.Valid {
+		status.sourceSize = &size.Int64
+	}
+	return status, nil
 }
 
 func (s *PostgresSymbolStore) projectDataRows(ctx context.Context, conn *pgxpool.Conn) (int64, error) {
@@ -53,6 +73,30 @@ func fileExists(path string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("failed to inspect GOB symbol index: %w", err)
+}
+
+func fingerprintSource(path string) (fingerprint sourceFingerprint, retErr error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return sourceFingerprint{}, fmt.Errorf("failed to open GOB symbol source for fingerprinting: %w", err)
+	}
+	defer func() { retErr = errors.Join(retErr, file.Close()) }()
+	hash := sha256.New()
+	size, err := io.Copy(hash, file)
+	if err != nil {
+		return sourceFingerprint{}, fmt.Errorf("failed to fingerprint GOB symbol source: %w", err)
+	}
+	return sourceFingerprint{digest: hash.Sum(nil), size: size}, nil
+}
+
+func verifyCompletedSource(status migrationStatus, fingerprint sourceFingerprint) error {
+	if len(status.sourceDigest) != sha256.Size || status.sourceSize == nil {
+		return fmt.Errorf("completed Postgres symbol migration has no source fingerprint; refusing to archive residual GOB")
+	}
+	if !bytes.Equal(status.sourceDigest, fingerprint.digest) || *status.sourceSize != fingerprint.size {
+		return fmt.Errorf("residual GOB differs from the completed Postgres symbol migration source; refusing to archive unimported data")
+	}
+	return nil
 }
 
 func archiveMigratedGOB(path string) error {

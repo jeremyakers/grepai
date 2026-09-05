@@ -17,6 +17,7 @@ type PostgresSymbolStore struct {
 	projectID          string
 	projectRoot        string
 	migrationBatchHook func(int) error
+	mutationHook       func(string, string) error
 }
 
 func NewPostgresSymbolStore(ctx context.Context, dsn, projectID, projectRoot string) (*PostgresSymbolStore, error) {
@@ -50,6 +51,9 @@ func (s *PostgresSymbolStore) saveFile(ctx context.Context, filePath, contentHas
 		return fmt.Errorf("failed to begin symbol file transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := s.lockFileMutation(ctx, tx, "save", filePath); err != nil {
+		return err
+	}
 	if err := s.saveFileTx(ctx, tx, filePath, contentHash, extractorVersion, symbols, refs); err != nil {
 		return err
 	}
@@ -83,19 +87,19 @@ func (s *PostgresSymbolStore) saveFileTx(ctx context.Context, tx pgx.Tx, filePat
 	}
 	refRows := make([][]any, 0, len(refs))
 	edgeRows := make([][]any, 0, len(refs))
-	for _, ref := range refs {
-		refRows = append(refRows, []any{identityBytes(s.projectID), identityBytes(ref.SymbolName), identityBytes(ref.File), ref.Line, ref.Column, sanUTF8(ref.Kind), sanUTF8(ref.Context), identityBytes(ref.CallerName), identityBytes(ref.CallerFile), ref.CallerLine})
+	for ordinal, ref := range refs {
+		refRows = append(refRows, []any{identityBytes(s.projectID), identityBytes(ref.SymbolName), identityBytes(ref.File), ref.Line, ref.Column, sanUTF8(ref.Kind), sanUTF8(ref.Context), identityBytes(ref.CallerName), identityBytes(ref.CallerFile), ref.CallerLine, ordinal})
 		if ref.CallerName != "" && ref.CallerName != "<top-level>" {
-			edgeRows = append(edgeRows, []any{identityBytes(s.projectID), identityBytes(ref.CallerName), identityBytes(ref.SymbolName), identityBytes(ref.File), ref.Line, "direct"})
+			edgeRows = append(edgeRows, []any{identityBytes(s.projectID), identityBytes(ref.CallerName), identityBytes(ref.SymbolName), identityBytes(ref.File), ref.Line, "direct", ordinal})
 		}
 	}
 	if len(refRows) > 0 {
-		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"refs"}, []string{"project_id", "symbol_name", "file", "line", "col", "ref_type", "context", "caller", "caller_file", "caller_line"}, pgx.CopyFromRows(refRows)); err != nil {
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"refs"}, []string{"project_id", "symbol_name", "file", "line", "col", "ref_type", "context", "caller", "caller_file", "caller_line", "ordinal"}, pgx.CopyFromRows(refRows)); err != nil {
 			return fmt.Errorf("failed to insert references: %w", err)
 		}
 	}
 	if len(edgeRows) > 0 {
-		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"call_edges"}, []string{"project_id", "caller", "callee", "file", "line", "call_type"}, pgx.CopyFromRows(edgeRows)); err != nil {
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"call_edges"}, []string{"project_id", "caller", "callee", "file", "line", "call_type", "ordinal"}, pgx.CopyFromRows(edgeRows)); err != nil {
 			return fmt.Errorf("failed to insert call edges: %w", err)
 		}
 	}
@@ -121,6 +125,9 @@ func (s *PostgresSymbolStore) DeleteFile(ctx context.Context, filePath string) e
 		return fmt.Errorf("failed to begin delete transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := s.lockFileMutation(ctx, tx, "delete", filePath); err != nil {
+		return err
+	}
 	if err := s.deleteFileTx(ctx, tx, filePath); err != nil {
 		return err
 	}

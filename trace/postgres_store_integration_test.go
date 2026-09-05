@@ -1,6 +1,7 @@
 package trace
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -211,6 +212,21 @@ func TestPostgresLookupCalleesMatchesGOB(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("Postgres callees differ from GOB:\n got: %#v\nwant: %#v", got, want)
 	}
+	if err := pg.DeleteFile(ctx, "main.go"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pg.SaveFile(ctx, "main.go", []Symbol{{Name: "Main", File: "main.go", Line: 1}}, refs); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{`VACUUM FULL refs`, `VACUUM FULL call_edges`} {
+		if _, err := pg.pool.Exec(ctx, query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rewritten, err := pg.LookupCallees(ctx, "Main", "main.go")
+	if err != nil || !reflect.DeepEqual(rewritten, want) {
+		t.Fatalf("durable ordinal parity after rewrite = %#v, %v; want %#v", rewritten, err, want)
+	}
 }
 
 func TestPostgresSymbolStoreTenantIsolation(t *testing.T) {
@@ -266,6 +282,40 @@ func TestPostgresSymbolStoreMigratesGOB(t *testing.T) {
 	}
 	if _, err := os.Stat(gobPath); !os.IsNotExist(err) {
 		t.Fatalf("original GOB file still exists: %v", err)
+	}
+}
+
+func TestPostgresMigrationPreservesReferenceOrdinals(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, config.ConfigDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := config.GetSymbolIndexPath(root)
+	gob := NewGOBSymbolStore(path)
+	refs := []Reference{
+		{SymbolName: "readFirst", Kind: RefKindRead, File: "main.go", Line: 10, CallerName: "Main"},
+		{SymbolName: "calledSecond", Kind: RefKindCall, File: "main.go", Line: 10, CallerName: "Main"},
+		{SymbolName: "calledLater", Kind: RefKindCall, File: "main.go", Line: 11, CallerName: "Main"},
+	}
+	if err := gob.SaveFile(ctx, "main.go", []Symbol{{Name: "Main", File: "main.go", Line: 1}}, refs); err != nil {
+		t.Fatal(err)
+	}
+	want, err := gob.LookupCallees(ctx, "Main", "main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gob.Persist(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pg := newIntegrationSymbolStore(t, "migration-ordinals", root)
+	truncateSymbolTables(t, pg)
+	if err := pg.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got, err := pg.LookupCallees(ctx, "Main", "main.go")
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("migrated ordinal parity = %#v, %v; want %#v", got, err, want)
 	}
 }
 
@@ -393,6 +443,29 @@ func TestPostgresMigrationCompletedMarkerArchivesResidualGOB(t *testing.T) {
 	}
 }
 
+func TestPostgresMigrationFingerprintRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := writeMigrationGOB(t, root, 1)
+	want, err := fingerprintSource(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newIntegrationSymbolStore(t, "migration-fingerprint", root)
+	truncateSymbolTables(t, store)
+	if err := store.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var digest []byte
+	var size int64
+	if err := store.pool.QueryRow(ctx, `SELECT source_digest,source_size FROM symbol_migrations WHERE project_id=$1`, identityBytes(store.projectID)).Scan(&digest, &size); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(digest, want.digest) || size != want.size {
+		t.Fatalf("migration fingerprint = %x/%d, want %x/%d", digest, size, want.digest, want.size)
+	}
+}
+
 func TestPostgresMigrationArchiveFailureKeepsCommittedData(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -424,6 +497,67 @@ func TestPostgresMigrationArchiveFailureKeepsCommittedData(t *testing.T) {
 	}
 }
 
+func TestPostgresMigrationModifiedResidualFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := writeMigrationGOB(t, root, 1)
+	backup := path + ".migrated.bak"
+	if err := os.MkdirAll(backup, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(backup, "block"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := newIntegrationSymbolStore(t, "migration-modified-residual", root)
+	truncateSymbolTables(t, store)
+	if err := store.Load(ctx); err == nil {
+		t.Fatal("expected initial archive failure")
+	}
+	if err := os.WriteFile(path, append(mustReadFile(t, path), byte('x')), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(backup); err != nil {
+		t.Fatal(err)
+	}
+	err := store.Load(ctx)
+	if err == nil || !strings.Contains(err.Error(), "differs") {
+		t.Fatalf("expected source fingerprint mismatch, got %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("modified residual GOB was touched: %v", err)
+	}
+	if stats, err := store.GetStats(ctx); err != nil || stats.TotalSymbols != 1 {
+		t.Fatalf("fingerprint mismatch touched Postgres data: %#v, %v", stats, err)
+	}
+}
+
+func TestPostgresEmptyActivationRejectsLaterGOB(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store := newIntegrationSymbolStore(t, "migration-empty-then-gob", root)
+	truncateSymbolTables(t, store)
+	if err := store.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	path := writeMigrationGOB(t, root, 1)
+	err := store.Load(ctx)
+	if err == nil || !strings.Contains(err.Error(), "no source fingerprint") {
+		t.Fatalf("expected unimported-source rejection, got %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("new GOB was touched: %v", err)
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
 func TestPostgresMigrationRejectsPartialRowsWithoutMarker(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -439,5 +573,99 @@ func TestPostgresMigrationRejectsPartialRowsWithoutMarker(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("partial-state guard touched GOB: %v", err)
+	}
+}
+
+func TestPostgresFileMutationSaveSaveSerializes(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	one := newIntegrationSymbolStore(t, "mutation-save-save", root)
+	two := newIntegrationSymbolStore(t, "mutation-save-save", root)
+	truncateSymbolTables(t, one)
+	locked, release := make(chan struct{}), make(chan struct{})
+	secondAttempt, secondLocked := make(chan struct{}), make(chan struct{})
+	one.mutationHook = func(operation, file string) error {
+		close(locked)
+		<-release
+		return nil
+	}
+	two.mutationHook = func(operation, file string) error { close(secondLocked); return nil }
+	firstResult := make(chan error, 1)
+	go func() {
+		firstResult <- one.SaveFileWithSignature(ctx, "same.go", "hash-1", "version-1", []Symbol{{Name: "Generation1", File: "same.go", Line: 1}}, []Reference{{SymbolName: "Target1", Kind: RefKindCall, File: "same.go", Line: 2, CallerName: "Generation1"}})
+	}()
+	<-locked
+	secondResult := make(chan error, 1)
+	go func() {
+		secondAttempt <- struct{}{}
+		secondResult <- two.SaveFileWithSignature(ctx, "same.go", "hash-2", "version-2", []Symbol{{Name: "Generation2", File: "same.go", Line: 1}}, []Reference{{SymbolName: "Target2", Kind: RefKindCall, File: "same.go", Line: 2, CallerName: "Generation2"}})
+	}()
+	<-secondAttempt
+	select {
+	case <-secondLocked:
+		t.Fatal("second save acquired file lock before first released")
+	default:
+	}
+	close(release)
+	if err := <-firstResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondResult; err != nil {
+		t.Fatal(err)
+	}
+	assertSavedGeneration(t, two, "hash-2", "version-2", "Generation2", "Target2")
+	if stale, _ := two.LookupCallers(ctx, "Target1"); len(stale) != 0 {
+		t.Fatalf("first generation refs remain: %#v", stale)
+	}
+}
+
+func TestPostgresFileMutationSaveDeleteSerializes(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	one := newIntegrationSymbolStore(t, "mutation-save-delete", root)
+	two := newIntegrationSymbolStore(t, "mutation-save-delete", root)
+	truncateSymbolTables(t, one)
+	locked, release := make(chan struct{}), make(chan struct{})
+	deleteAttempt, deleteLocked := make(chan struct{}), make(chan struct{})
+	one.mutationHook = func(operation, file string) error { close(locked); <-release; return nil }
+	two.mutationHook = func(operation, file string) error { close(deleteLocked); return nil }
+	saveResult := make(chan error, 1)
+	go func() {
+		saveResult <- one.SaveFileWithSignature(ctx, "same.go", "hash", "version", []Symbol{{Name: "Saved", File: "same.go", Line: 1}}, []Reference{{SymbolName: "Target", Kind: RefKindCall, File: "same.go", Line: 2, CallerName: "Saved"}})
+	}()
+	<-locked
+	deleteResult := make(chan error, 1)
+	go func() { deleteAttempt <- struct{}{}; deleteResult <- two.DeleteFile(ctx, "same.go") }()
+	<-deleteAttempt
+	select {
+	case <-deleteLocked:
+		t.Fatal("delete acquired file lock before save released")
+	default:
+	}
+	close(release)
+	if err := <-saveResult; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-deleteResult; err != nil {
+		t.Fatal(err)
+	}
+	stats, err := two.GetStats(ctx)
+	if err != nil || stats.TotalFiles != 0 || stats.TotalSymbols != 0 || stats.TotalReferences != 0 {
+		t.Fatalf("save/delete left partial rows: %#v, %v", stats, err)
+	}
+}
+
+func assertSavedGeneration(t *testing.T, store *PostgresSymbolStore, hash, version, symbolName, target string) {
+	t.Helper()
+	if got, ok := store.GetFileContentHash("same.go"); !ok || got != hash {
+		t.Fatalf("content hash = %q, %v", got, ok)
+	}
+	if got, ok := store.GetFileExtractorVersion("same.go"); !ok || got != version {
+		t.Fatalf("extractor version = %q, %v", got, ok)
+	}
+	syms, _ := store.GetSymbolsForFile(context.Background(), "same.go")
+	refs, _ := store.LookupCallers(context.Background(), target)
+	if len(syms) != 1 || syms[0].Name != symbolName || len(refs) != 1 || refs[0].CallerName != symbolName {
+		t.Fatalf("mixed saved generation: symbols=%#v refs=%#v", syms, refs)
 	}
 }
