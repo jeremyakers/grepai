@@ -89,8 +89,9 @@ func TestMigrationFileAndFingerprintHelpers(t *testing.T) {
 	if _, err := fingerprintSource(path + ".missing"); err == nil {
 		t.Fatal("missing source fingerprint succeeded")
 	}
-	if _, err := fileExists(filepath.Join(path, "child")); err == nil {
-		t.Fatal("invalid source path inspection succeeded")
+	exists, err = fileExists(filepath.Join(path, "child"))
+	if err != nil || exists {
+		t.Fatalf("child of file = %v, %v; want false,nil", exists, err)
 	}
 }
 

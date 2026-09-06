@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -69,7 +70,10 @@ func fileExists(path string) (bool, error) {
 	if err == nil {
 		return true, nil
 	}
-	if os.IsNotExist(err) {
+	// Go reports both ENOENT and Windows ERROR_PATH_NOT_FOUND as ErrNotExist.
+	// ENOTDIR means a non-directory was used as a directory; for a source path
+	// inspection this is still "not present", and must not fail the check.
+	if os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) {
 		return false, nil
 	}
 	return false, fmt.Errorf("failed to inspect GOB symbol index: %w", err)
