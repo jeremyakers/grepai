@@ -85,8 +85,7 @@ func (s *PostgresSymbolStore) migrateGOBIfNeeded(ctx context.Context) (retErr er
 		return err
 	}
 
-	gobStore := NewGOBSymbolStore(path)
-	loaded, err := gobStore.loadUnlocked()
+	gobStore, loaded, err := loadLockedGOBSymbolSnapshot(path)
 	if err != nil {
 		return fmt.Errorf("failed to load locked GOB symbol snapshot: %w", err)
 	}
