@@ -167,6 +167,20 @@ The watcher periodically saves the index:
 - **Shutdown save**: Clean save on Ctrl+C or SIGTERM
 - **Location**: `.grepai/index.gob` (or PostgreSQL)
 
+Only one watcher may write a project at a time. Foreground, background, and
+workspace watchers all acquire the same nonblocking lifetime lock at
+`.grepai/writer.lock`; a second watcher exits immediately with an error naming
+the contended project. This prevents concurrent watchers from overwriting each
+other's index snapshots, even when they use different log directories. The lock
+is released automatically when the watcher exits or crashes.
+
+The lifetime writer lock is acquired before vector, symbol, or RPG stores are
+loaded. Their shorter per-load and per-persist locks are nested inside it, which
+keeps lock ordering consistent and avoids deadlocks.
+
+Searches, MCP servers, and trace commands are read-only and do not acquire this
+lifetime lock, so they can continue to run concurrently with the watcher.
+
 ### Background Daemon Mode
 
 Run the watcher as a background daemon with built-in lifecycle management:

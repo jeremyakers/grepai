@@ -23,6 +23,7 @@ import (
 	"github.com/yoanbernabeu/grepai/framework"
 	"github.com/yoanbernabeu/grepai/git"
 	"github.com/yoanbernabeu/grepai/indexer"
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
 	"github.com/yoanbernabeu/grepai/rpg"
 	"github.com/yoanbernabeu/grepai/store"
 	"github.com/yoanbernabeu/grepai/trace"
@@ -996,6 +997,25 @@ func watchProject(ctx context.Context, projectRoot string, emb embedder.Embedder
 }
 
 func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver) error {
+	return runProjectWatchWithWriterLock(projectRoot, func(canonicalRoot string) error {
+		return watchProjectWithEventObserverLocked(ctx, canonicalRoot, emb, isBackgroundChild, onReady, onEvent, onScan, onEmbed, onRPG, onActivity, onStats)
+	})
+}
+
+func runProjectWatchWithWriterLock(projectRoot string, run func(canonicalRoot string) error) (err error) {
+	writerLock, err := fileutil.AcquireProjectWriterLock(projectRoot)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := writerLock.Close(); err == nil && closeErr != nil {
+			err = fmt.Errorf("failed to release writer lock for project %s: %w", writerLock.ProjectRoot(), closeErr)
+		}
+	}()
+	return run(writerLock.ProjectRoot())
+}
+
+func watchProjectWithEventObserverLocked(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver) error {
 	// Load configuration
 	cfg, err := config.Load(projectRoot)
 	if err != nil {
@@ -2586,6 +2606,23 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		}
 	}
 
+	// Acquire every project lifetime lock before any workspace store is loaded.
+	// Store-specific Load/Persist locks are always nested inside these locks.
+	writerLocks, err := acquireWorkspaceProjectWriterLocks(ws.Projects)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		for _, writerLock := range writerLocks {
+			if err := writerLock.Close(); err != nil {
+				log.Printf("Warning: failed to release writer lock for %s: %v", writerLock.ProjectRoot(), err)
+			}
+		}
+	}()
+	for i, writerLock := range writerLocks {
+		ws.Projects[i].Path = writerLock.ProjectRoot()
+	}
+
 	// Initialize shared embedder
 	embCfg := &config.Config{Embedder: ws.Embedder}
 	emb, err := initializeEmbedder(ctx, embCfg)
@@ -2759,6 +2796,21 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 			)
 		}
 	}
+}
+
+func acquireWorkspaceProjectWriterLocks(projects []config.ProjectEntry) ([]*fileutil.ProjectWriterLock, error) {
+	locks := make([]*fileutil.ProjectWriterLock, 0, len(projects))
+	for _, project := range projects {
+		writerLock, err := fileutil.AcquireProjectWriterLock(project.Path)
+		if err != nil {
+			for i := len(locks) - 1; i >= 0; i-- {
+				_ = locks[i].Close()
+			}
+			return nil, fmt.Errorf("failed to start workspace writer for project %s: %w", project.Name, err)
+		}
+		locks = append(locks, writerLock)
+	}
+	return locks, nil
 }
 
 type workspaceWatchEvent struct {

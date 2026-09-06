@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Idle GOB Index Rewrites**: Symbol and vector GOB stores now persist only when modified, eliminating full-index rewrites every 30 seconds when idle (#298)
 - **Atomic GOB Replacement**: Failed cross-platform index replacement now preserves the previous index instead of falling back to a remove-then-rename window that could leave no index after interruption
+- **Concurrent Watcher Snapshot Loss**: Foreground, background, and workspace watchers now enforce one lifetime writer per canonical project root, while read-only search, MCP, and trace processes remain concurrent
 
 ## [0.36.1] - 2026-09-01
 
