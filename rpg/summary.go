@@ -48,6 +48,7 @@ func (s *Summarizer) SummarizeHierarchy(ctx context.Context, force bool) error {
 func (s *Summarizer) summarizeNodes(ctx context.Context, kind NodeKind, force bool) error {
 	nodes := s.graph.GetNodesByKind(kind)
 	consecutiveFailures := 0
+	changed := false
 	const maxConsecutiveFailures = 3
 
 	for _, node := range nodes {
@@ -68,8 +69,14 @@ func (s *Summarizer) summarizeNodes(ctx context.Context, kind NodeKind, force bo
 			}
 			continue
 		}
-		node.Summary = summary
+		if node.Summary != summary {
+			node.Summary = summary
+			changed = true
+		}
 		consecutiveFailures = 0
+	}
+	if changed {
+		s.graph.markMutated()
 	}
 	return nil
 }

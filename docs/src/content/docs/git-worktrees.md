@@ -18,6 +18,11 @@ When you run any grepai command (`search`, `trace`, `watch`) from a **linked wor
 
 This means `search` and `trace` work immediately in any worktree, without re-indexing.
 
+Auto-initialization holds the linked worktree's `.grepai/writer.lock` for the
+complete seed copy. `index.gob` and `symbols.gob` finish copying before
+`config.yaml` is installed as the completion marker. Concurrent initializers
+serialize on that lock, and a watcher cannot load a partially copied seed.
+
 ### Quick Start
 
 ```bash

@@ -1,11 +1,13 @@
 package fileutil
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 )
 
 const projectWriterLockName = "writer.lock"
@@ -17,8 +19,32 @@ type ProjectWriterActiveError struct {
 	Err         error
 }
 
+// AcquireProjectWriterLockContext retries nonblocking acquisition until the
+// context ends. It is intended for short initialization critical sections,
+// never lifetime watcher startup.
+func AcquireProjectWriterLockContext(ctx context.Context, projectRoot string) (*ProjectWriterLock, error) {
+	const retryInterval = 10 * time.Millisecond
+	for {
+		lock, err := AcquireProjectWriterLock(projectRoot)
+		if err == nil {
+			return lock, nil
+		}
+		var activeErr *ProjectWriterActiveError
+		if !errors.As(err, &activeErr) {
+			return nil, err
+		}
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("%w: %v", activeErr, ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
 func (e *ProjectWriterActiveError) Error() string {
-	return fmt.Sprintf("cannot watch project %s: another writer is active (lock: %s)", e.ProjectRoot, e.LockPath)
+	return fmt.Sprintf("cannot write project %s: another writer is active (lock: %s)", e.ProjectRoot, e.LockPath)
 }
 
 func (e *ProjectWriterActiveError) Unwrap() error { return e.Err }

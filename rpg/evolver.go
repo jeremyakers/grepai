@@ -107,6 +107,7 @@ func (ev *Evolver) HandleModify(ctx context.Context, filePath string, symbols []
 
 	ev.refreshFileSemantics(ctx, fileNode, filePath, now)
 	ev.ensureFileHierarchyPlacement(filePath, oldFileFeatures, getNodeAtomicFeatures(fileNode), now)
+	ev.graph.markMutated()
 }
 
 // HandleAdd adds nodes for a newly created file.

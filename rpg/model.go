@@ -84,6 +84,7 @@ type Graph struct {
 	byFeaturePath map[string]*Node   // feature path -> hierarchy node
 	adjForward    map[string][]*Edge // from -> outgoing edges
 	adjReverse    map[string][]*Edge // to -> incoming edges
+	onMutation    func()
 }
 
 // GraphStats holds graph statistics.
@@ -115,7 +116,6 @@ func NewGraph() *Graph {
 // TODO: consider map[string]int index for O(1) stale-entry removal during bulk operations
 func (g *Graph) AddNode(n *Node) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	// If node already exists, remove old index entries first
 	if old, exists := g.Nodes[n.ID]; exists {
 		if nodes, ok := g.byKind[old.Kind]; ok {
@@ -155,14 +155,16 @@ func (g *Graph) AddNode(n *Node) {
 	if n.Kind == KindArea || n.Kind == KindCategory || n.Kind == KindSubcategory {
 		g.byFeaturePath[n.Feature] = n
 	}
+	g.mu.Unlock()
+	g.markMutated()
 }
 
 // RemoveNode removes a node and all its edges, updating indexes.
 func (g *Graph) RemoveNode(id string) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	n, ok := g.Nodes[id]
 	if !ok {
+		g.mu.Unlock()
 		return
 	}
 
@@ -246,26 +248,31 @@ func (g *Graph) RemoveNode(id string) {
 
 	// Remove the node itself
 	delete(g.Nodes, id)
+	g.mu.Unlock()
+	g.markMutated()
 }
 
 // AddEdge adds an edge and updates adjacency indexes.
 func (g *Graph) AddEdge(e *Edge) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.Edges = append(g.Edges, e)
 	g.adjForward[e.From] = append(g.adjForward[e.From], e)
 	g.adjReverse[e.To] = append(g.adjReverse[e.To], e)
+	g.mu.Unlock()
+	g.markMutated()
 }
 
 // RemoveEdgesBetween removes all edges between two nodes.
 func (g *Graph) RemoveEdgesBetween(from, to string) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	removed := false
 	// Remove from main edge list
 	filtered := make([]*Edge, 0, len(g.Edges))
 	for _, e := range g.Edges {
 		if !(e.From == from && e.To == to) {
 			filtered = append(filtered, e)
+		} else {
+			removed = true
 		}
 	}
 	g.Edges = filtered
@@ -299,17 +306,23 @@ func (g *Graph) RemoveEdgesBetween(from, to string) {
 			g.adjReverse[to] = cleaned
 		}
 	}
+	g.mu.Unlock()
+	if removed {
+		g.markMutated()
+	}
 }
 
 // RemoveEdgesBetweenOfType removes edges of a specific type between two nodes.
 func (g *Graph) RemoveEdgesBetweenOfType(from, to string, edgeType EdgeType) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
+	removed := false
 	// Remove from main edge list
 	filtered := make([]*Edge, 0, len(g.Edges))
 	for _, e := range g.Edges {
 		if !(e.From == from && e.To == to && e.Type == edgeType) {
 			filtered = append(filtered, e)
+		} else {
+			removed = true
 		}
 	}
 	g.Edges = filtered
@@ -343,6 +356,10 @@ func (g *Graph) RemoveEdgesBetweenOfType(from, to string, edgeType EdgeType) {
 			g.adjReverse[to] = cleaned
 		}
 	}
+	g.mu.Unlock()
+	if removed {
+		g.markMutated()
+	}
 }
 
 // RemoveEdgesIf removes edges that match the predicate and rebuilds edge indexes.
@@ -374,6 +391,7 @@ func (g *Graph) RemoveEdgesIf(predicate func(*Edge) bool) {
 
 	// Apply the filter and rebuild indexes under write lock.
 	g.mu.Lock()
+	before := len(g.Edges)
 	filtered := make([]*Edge, 0, len(g.Edges))
 	for _, e := range g.Edges {
 		if !toRemove[e] {
@@ -383,6 +401,9 @@ func (g *Graph) RemoveEdgesIf(predicate func(*Edge) bool) {
 	g.Edges = filtered
 	g.rebuildIndexesLocked()
 	g.mu.Unlock()
+	if len(filtered) != before {
+		g.markMutated()
+	}
 }
 
 // NodePath returns the file path for a node ID when present.
@@ -463,10 +484,17 @@ func (g *Graph) GetNeighbors(nodeID string, direction string) []string {
 // Reset clears all graph data and rebuilds empty indexes atomically.
 func (g *Graph) Reset() {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.Nodes = make(map[string]*Node)
 	g.Edges = make([]*Edge, 0)
 	g.rebuildIndexesLocked()
+	g.mu.Unlock()
+	g.markMutated()
+}
+
+func (g *Graph) markMutated() {
+	if g.onMutation != nil {
+		g.onMutation()
+	}
 }
 
 // RebuildIndexes rebuilds all in-memory indexes from Nodes and Edges.

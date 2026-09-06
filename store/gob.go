@@ -21,8 +21,11 @@ type GOBStore struct {
 	lockPath  string
 	chunks    map[string]Chunk    // id -> chunk
 	documents map[string]Document // path -> document
-	dirty     bool
-	mu        sync.RWMutex
+	// Constructors retain the historical first-Persist behavior independently
+	// from mutations made before Load.
+	constructorPersistPending bool
+	mutationGeneration        uint64
+	mu                        sync.RWMutex
 }
 
 type gobData struct {
@@ -32,18 +35,18 @@ type gobData struct {
 
 func NewGOBStore(indexPath string) *GOBStore {
 	return &GOBStore{
-		indexPath: indexPath,
-		lockPath:  indexPath + ".lock",
-		chunks:    make(map[string]Chunk),
-		documents: make(map[string]Document),
-		dirty:     true,
+		indexPath:                 indexPath,
+		lockPath:                  indexPath + ".lock",
+		chunks:                    make(map[string]Chunk),
+		documents:                 make(map[string]Document),
+		constructorPersistPending: true,
 	}
 }
 
 func (s *GOBStore) SaveChunks(ctx context.Context, chunks []Chunk) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.dirty = true
+	s.mutationGeneration++
 
 	for _, chunk := range chunks {
 		s.chunks[chunk.ID] = chunk
@@ -69,7 +72,7 @@ func (s *GOBStore) DeleteByFile(ctx context.Context, filePath string) error {
 		}
 	}
 	if removed {
-		s.dirty = true
+		s.mutationGeneration++
 	}
 
 	return nil
@@ -122,7 +125,7 @@ func (s *GOBStore) SaveDocument(ctx context.Context, doc Document) error {
 	defer s.mu.Unlock()
 
 	s.documents[doc.Path] = doc
-	s.dirty = true
+	s.mutationGeneration++
 	return nil
 }
 
@@ -132,7 +135,7 @@ func (s *GOBStore) DeleteDocument(ctx context.Context, filePath string) error {
 
 	if _, ok := s.documents[filePath]; ok {
 		delete(s.documents, filePath)
-		s.dirty = true
+		s.mutationGeneration++
 	}
 	return nil
 }
@@ -154,8 +157,11 @@ func (s *GOBStore) Load(ctx context.Context) (err error) {
 	defer s.mu.Unlock()
 	loaded := false
 	defer func() {
-		if err == nil && loaded {
-			s.dirty = false
+		if err == nil {
+			s.constructorPersistPending = false
+			if loaded {
+				s.mutationGeneration = 0
+			}
 		}
 	}()
 
@@ -246,7 +252,7 @@ func (s *GOBStore) loadUnlocked() (bool, error) {
 func (s *GOBStore) Persist(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.dirty {
+	if !s.constructorPersistPending && s.mutationGeneration == 0 {
 		return nil
 	}
 
@@ -310,7 +316,8 @@ func (s *GOBStore) persistUnlocked() error {
 		return fmt.Errorf("failed to replace index file: %w", err)
 	}
 	cleanupTemp = false
-	s.dirty = false
+	s.constructorPersistPending = false
+	s.mutationGeneration = 0
 
 	return nil
 }

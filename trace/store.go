@@ -14,14 +14,15 @@ import (
 
 // GOBSymbolStore implements SymbolStore using GOB encoding.
 type GOBSymbolStore struct {
-	indexPath             string
-	lockPath              string
-	index                 *SymbolIndex
-	fileIndex             map[string]bool
-	fileContentHashes     map[string]string
-	fileExtractorVersions map[string]string
-	dirty                 bool
-	mu                    sync.RWMutex
+	indexPath                 string
+	lockPath                  string
+	index                     *SymbolIndex
+	fileIndex                 map[string]bool
+	fileContentHashes         map[string]string
+	fileExtractorVersions     map[string]string
+	constructorPersistPending bool
+	mutationGeneration        uint64
+	mu                        sync.RWMutex
 }
 
 type gobSymbolData struct {
@@ -50,10 +51,10 @@ func NewGOBSymbolStore(indexPath string) *GOBSymbolStore {
 			CallGraph:  []CallEdge{},
 			Version:    1,
 		},
-		fileIndex:             make(map[string]bool),
-		fileContentHashes:     make(map[string]string),
-		fileExtractorVersions: make(map[string]string),
-		dirty:                 true,
+		fileIndex:                 make(map[string]bool),
+		fileContentHashes:         make(map[string]string),
+		fileExtractorVersions:     make(map[string]string),
+		constructorPersistPending: true,
 	}
 }
 
@@ -63,8 +64,11 @@ func (s *GOBSymbolStore) Load(ctx context.Context) (err error) {
 	defer s.mu.Unlock()
 	loaded := false
 	defer func() {
-		if err == nil && loaded {
-			s.dirty = false
+		if err == nil {
+			s.constructorPersistPending = false
+			if loaded {
+				s.mutationGeneration = 0
+			}
 		}
 	}()
 
@@ -132,7 +136,7 @@ func (s *GOBSymbolStore) loadUnlocked() (bool, error) {
 func (s *GOBSymbolStore) Persist(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.dirty {
+	if !s.constructorPersistPending && s.mutationGeneration == 0 {
 		return nil
 	}
 
@@ -192,7 +196,8 @@ func (s *GOBSymbolStore) persistUnlocked() error {
 		return fmt.Errorf("failed to replace symbol index file: %w", err)
 	}
 	cleanupTemp = false
-	s.dirty = false
+	s.constructorPersistPending = false
+	s.mutationGeneration = 0
 
 	return nil
 }
@@ -209,7 +214,7 @@ func (s *GOBSymbolStore) SaveFile(ctx context.Context, filePath string, symbols 
 func (s *GOBSymbolStore) SaveFileWithContentHash(ctx context.Context, filePath string, contentHash string, symbols []Symbol, refs []Reference) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.dirty = true
+	s.mutationGeneration++
 	s.saveFileWithContentHashUnlocked(filePath, contentHash, symbols, refs)
 	return nil
 }
@@ -256,7 +261,7 @@ func (s *GOBSymbolStore) saveFileWithContentHashUnlocked(filePath string, conten
 func (s *GOBSymbolStore) SaveFileWithSignature(ctx context.Context, filePath string, contentHash, extractorVersion string, symbols []Symbol, refs []Reference) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.dirty = true
+	s.mutationGeneration++
 	s.saveFileWithContentHashUnlocked(filePath, contentHash, symbols, refs)
 	if extractorVersion != "" {
 		s.fileExtractorVersions[filePath] = extractorVersion
@@ -276,7 +281,7 @@ func (s *GOBSymbolStore) DeleteFile(ctx context.Context, filePath string) error 
 		removed = true
 	}
 	if removed {
-		s.dirty = true
+		s.mutationGeneration++
 	}
 	return nil
 }

@@ -1,10 +1,14 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
 )
 
 func TestCopyFileIfExists(t *testing.T) {
@@ -143,6 +147,86 @@ func TestAutoInitFromMainWorktree(t *testing.T) {
 			t.Error("expected error when config.yaml missing")
 		}
 	})
+}
+
+func TestAutoInitWorktreeSerializesCompleteSeedCopy(t *testing.T) {
+	mainDir := t.TempDir()
+	worktreeDir := t.TempDir()
+	mainGrepai := filepath.Join(mainDir, ".grepai")
+	if err := os.MkdirAll(mainGrepai, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	indexData := []byte("complete-vector-index")
+	symbolData := []byte("complete-symbol-index")
+	if err := os.WriteFile(filepath.Join(mainGrepai, "config.yaml"), []byte("version: 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mainGrepai, "index.gob"), indexData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mainGrepai, "symbols.gob"), symbolData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	partialWritten := make(chan struct{})
+	finishCopy := make(chan struct{})
+	var blocked atomic.Bool
+	barrierCopy := func(src, dst string) error {
+		if filepath.Base(dst) == "index.gob" && blocked.CompareAndSwap(false, true) {
+			if err := os.WriteFile(dst, indexData[:5], 0o600); err != nil {
+				return err
+			}
+			close(partialWritten)
+			<-finishCopy
+		}
+		return copyFileIfExists(src, dst)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- autoInitFromMainWorktreeWithCopy(worktreeDir, mainDir, barrierCopy)
+	}()
+	<-partialWritten
+
+	secondDone := make(chan error, 1)
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		secondDone <- autoInitFromMainWorktree(worktreeDir, mainDir)
+	}()
+	<-secondStarted
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second initializer did not serialize with active copy: %v", err)
+	default:
+	}
+
+	watcherLock, err := fileutil.AcquireProjectWriterLock(worktreeDir)
+	if watcherLock != nil {
+		watcherLock.Close()
+		t.Fatal("competing watcher acquired lock while seed index was partial")
+	}
+	var activeErr *fileutil.ProjectWriterActiveError
+	if !errors.As(err, &activeErr) {
+		t.Fatalf("competing watcher error = %T %v, want *ProjectWriterActiveError", err, err)
+	}
+	if Exists(worktreeDir) {
+		t.Fatal("auto-init exposed config completion marker while seed index was partial")
+	}
+
+	close(finishCopy)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first initializer failed: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second initializer failed: %v", err)
+	}
+	for name, want := range map[string][]byte{"index.gob": indexData, "symbols.gob": symbolData} {
+		got, err := os.ReadFile(filepath.Join(worktreeDir, ".grepai", name))
+		if err != nil || string(got) != string(want) {
+			t.Fatalf("%s seed is partial: got=%q err=%v", name, got, err)
+		}
+	}
 }
 
 func TestWatchConfig_WorktreeDiscoveryEnabled(t *testing.T) {

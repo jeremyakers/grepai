@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Idle GOB Index Rewrites**: Symbol and vector GOB stores now persist only when modified, eliminating full-index rewrites every 30 seconds when idle (#298)
+- **Idle GOB Index Rewrites**: Vector, symbol, and RPG GOB stores now persist only when modified, eliminating full-index rewrites every 30 seconds when idle (#298)
 - **Atomic GOB Replacement**: Failed cross-platform index replacement now preserves the previous index instead of falling back to a remove-then-rename window that could leave no index after interruption
 - **Concurrent Watcher Snapshot Loss**: Foreground, background, and workspace watchers now enforce one lifetime writer per canonical project root, while read-only search, MCP, and trace processes remain concurrent
+- **Missing-Index Reader Overwrites**: Read-only GOB stores that load before an index exists now close cleanly without replacing an index created later, while real pre-load mutations and direct first persists are preserved
+- **Worktree Seed Races**: Worktree auto-initialization now copies complete vector and symbol seed indexes under the project writer lock before exposing the copied configuration
 
 ## [0.36.1] - 2026-09-01
 

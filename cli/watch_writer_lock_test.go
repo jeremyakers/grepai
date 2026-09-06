@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/internal/fileutil"
@@ -14,42 +13,41 @@ func TestProjectWatchWriterLockContendsAcrossModesAndLogDirs(t *testing.T) {
 	projectRoot := t.TempDir()
 	foregroundLogDir := t.TempDir()
 	backgroundLogDir := t.TempDir()
-	firstStarted := make(chan struct{})
-	releaseFirst := make(chan struct{})
-	firstDone := make(chan error, 1)
-
-	startWatchCore := func(_ bool, _ string, run func(string) error) error {
-		return runProjectWatchWithWriterLock(projectRoot, run)
+	lock, err := fileutil.AcquireProjectWriterLock(projectRoot)
+	if err != nil {
+		t.Fatalf("AcquireProjectWriterLock() error = %v", err)
 	}
+	defer lock.Close()
 
-	go func() {
-		firstDone <- startWatchCore(false, foregroundLogDir, func(string) error {
-			close(firstStarted)
-			<-releaseFirst
-			return nil
+	originalLogDir := watchLogDir
+	defer func() { watchLogDir = originalLogDir }()
+	cases := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "foreground",
+			run: func() error {
+				watchLogDir = foregroundLogDir
+				return watchProject(context.Background(), projectRoot, nil, false, nil)
+			},
+		},
+		{
+			name: "background different log directory",
+			run: func() error {
+				watchLogDir = backgroundLogDir
+				return watchProjectWithEventObserver(context.Background(), projectRoot, nil, true, nil, nil, nil, nil, nil, nil, nil)
+			},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.run()
+			var activeErr *fileutil.ProjectWriterActiveError
+			if !errors.As(err, &activeErr) {
+				t.Fatalf("watch entrypoint error = %T %v, want *ProjectWriterActiveError", err, err)
+			}
 		})
-	}()
-	<-firstStarted
-
-	secondRan := false
-	started := time.Now()
-	err := startWatchCore(true, backgroundLogDir, func(string) error {
-		secondRan = true
-		return nil
-	})
-	if time.Since(started) > time.Second {
-		t.Fatalf("background watcher contention took %s; want immediate failure", time.Since(started))
-	}
-	if secondRan {
-		t.Fatal("contending background watcher entered the mutating watch core")
-	}
-	var activeErr *fileutil.ProjectWriterActiveError
-	if !errors.As(err, &activeErr) {
-		t.Fatalf("background watcher error = %T %v, want *ProjectWriterActiveError", err, err)
-	}
-	close(releaseFirst)
-	if err := <-firstDone; err != nil {
-		t.Fatalf("foreground watcher error = %v", err)
 	}
 }
 

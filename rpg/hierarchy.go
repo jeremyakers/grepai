@@ -423,6 +423,7 @@ func fileNameStem(name string) string {
 // Example: area "cli" with descendants [handle-search, handle-trace, run-watch]
 // becomes "cli [handle, run]" providing semantic context about what the area does.
 func (h *HierarchyBuilder) EnrichLabels() {
+	changed := false
 	areas := h.graph.GetNodesByKind(KindArea)
 	sort.Slice(areas, func(i, j int) bool {
 		return areas[i].ID < areas[j].ID
@@ -430,7 +431,11 @@ func (h *HierarchyBuilder) EnrichLabels() {
 	for _, area := range areas {
 		verbs := h.collectDescendantVerbs(area.ID)
 		if len(verbs) > 0 {
-			area.SemanticLabel = area.Feature + " [" + strings.Join(topN(verbs, 3), ", ") + "]"
+			label := area.Feature + " [" + strings.Join(topN(verbs, 3), ", ") + "]"
+			if area.SemanticLabel != label {
+				area.SemanticLabel = label
+				changed = true
+			}
 		}
 	}
 
@@ -441,8 +446,15 @@ func (h *HierarchyBuilder) EnrichLabels() {
 	for _, cat := range cats {
 		verbs := h.collectDescendantVerbs(cat.ID)
 		if len(verbs) > 0 {
-			cat.SemanticLabel = cat.Feature + " [" + strings.Join(topN(verbs, 3), ", ") + "]"
+			label := cat.Feature + " [" + strings.Join(topN(verbs, 3), ", ") + "]"
+			if cat.SemanticLabel != label {
+				cat.SemanticLabel = label
+				changed = true
+			}
 		}
+	}
+	if changed {
+		h.graph.markMutated()
 	}
 }
 

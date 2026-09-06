@@ -222,6 +222,49 @@ func TestGOBStore_LoadMissingIndexPreservesPendingChanges(t *testing.T) {
 	}
 }
 
+func TestGOBStore_UntouchedMissingReaderCloseWritesNothing(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "index.gob")
+	store := NewGOBStore(indexPath)
+	if err := store.Load(context.Background()); err != nil {
+		t.Fatalf("Load missing index failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if _, err := os.Stat(indexPath); !os.IsNotExist(err) {
+		t.Fatalf("untouched missing-index reader wrote %s: %v", indexPath, err)
+	}
+}
+
+func TestGOBStore_MissingReaderCannotOverwriteLaterWriter(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "index.gob")
+	ctx := context.Background()
+	reader := NewGOBStore(indexPath)
+	if err := reader.Load(ctx); err != nil {
+		t.Fatalf("reader Load failed: %v", err)
+	}
+
+	writer := NewGOBStore(indexPath)
+	if err := writer.SaveDocument(ctx, Document{Path: "writer.go", Hash: "writer"}); err != nil {
+		t.Fatalf("writer SaveDocument failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer Close failed: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("reader Close failed: %v", err)
+	}
+
+	check := NewGOBStore(indexPath)
+	if err := check.Load(ctx); err != nil {
+		t.Fatalf("check Load failed: %v", err)
+	}
+	doc, err := check.GetDocument(ctx, "writer.go")
+	if err != nil || doc == nil || doc.Hash != "writer" {
+		t.Fatalf("writer document was overwritten: doc=%#v err=%v", doc, err)
+	}
+}
+
 func TestGOBStore_DeleteByFileWithoutChunksDoesNotRewrite(t *testing.T) {
 	indexPath := filepath.Join(t.TempDir(), "index.gob")
 	ctx := context.Background()

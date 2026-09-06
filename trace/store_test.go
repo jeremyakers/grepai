@@ -345,6 +345,50 @@ func TestGOBSymbolStore_LoadMissingIndexPreservesPendingChanges(t *testing.T) {
 	}
 }
 
+func TestGOBSymbolStore_UntouchedMissingReaderCloseWritesNothing(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	store := NewGOBSymbolStore(indexPath)
+	if err := store.Load(context.Background()); err != nil {
+		t.Fatalf("Load missing index failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if _, err := os.Stat(indexPath); !os.IsNotExist(err) {
+		t.Fatalf("untouched missing-index reader wrote %s: %v", indexPath, err)
+	}
+}
+
+func TestGOBSymbolStore_MissingReaderCannotOverwriteLaterWriter(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	ctx := context.Background()
+	reader := NewGOBSymbolStore(indexPath)
+	if err := reader.Load(ctx); err != nil {
+		t.Fatalf("reader Load failed: %v", err)
+	}
+
+	writer := NewGOBSymbolStore(indexPath)
+	symbol := Symbol{Name: "Writer", File: "writer.go", Kind: KindFunction}
+	if err := writer.SaveFile(ctx, "writer.go", []Symbol{symbol}, nil); err != nil {
+		t.Fatalf("writer SaveFile failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer Close failed: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("reader Close failed: %v", err)
+	}
+
+	check := NewGOBSymbolStore(indexPath)
+	if err := check.Load(ctx); err != nil {
+		t.Fatalf("check Load failed: %v", err)
+	}
+	symbols, err := check.LookupSymbol(ctx, "Writer")
+	if err != nil || len(symbols) != 1 || symbols[0].File != "writer.go" {
+		t.Fatalf("writer symbols were overwritten: symbols=%#v err=%v", symbols, err)
+	}
+}
+
 func TestGOBSymbolStore_DeleteFileRemovesExtractorVersion(t *testing.T) {
 	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
 	ctx := context.Background()
