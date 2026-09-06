@@ -191,7 +191,9 @@ func (h *HierarchyBuilder) ClusterSymbols(symbols []*Node) map[string][]*Node {
 		}
 		if feature == "" {
 			feature = h.extractor.ExtractFeature(context.Background(), sn.SymbolName, sn.Signature, sn.Receiver, "")
-			setNodeFeatures(sn, []string{atomicFromPrimaryFeature(feature)}, feature)
+			features := []string{atomicFromPrimaryFeature(feature)}
+			setNodeFeatures(sn, features, feature)
+			h.graph.UpdateNode(sn.ID, func(node *Node) { setNodeFeatures(node, features, feature) })
 		}
 
 		clusterName := h.extractClusterKey(feature)
@@ -423,7 +425,6 @@ func fileNameStem(name string) string {
 // Example: area "cli" with descendants [handle-search, handle-trace, run-watch]
 // becomes "cli [handle, run]" providing semantic context about what the area does.
 func (h *HierarchyBuilder) EnrichLabels() {
-	changed := false
 	areas := h.graph.GetNodesByKind(KindArea)
 	sort.Slice(areas, func(i, j int) bool {
 		return areas[i].ID < areas[j].ID
@@ -433,8 +434,7 @@ func (h *HierarchyBuilder) EnrichLabels() {
 		if len(verbs) > 0 {
 			label := area.Feature + " [" + strings.Join(topN(verbs, 3), ", ") + "]"
 			if area.SemanticLabel != label {
-				area.SemanticLabel = label
-				changed = true
+				h.graph.UpdateNode(area.ID, func(node *Node) { node.SemanticLabel = label })
 			}
 		}
 	}
@@ -448,13 +448,9 @@ func (h *HierarchyBuilder) EnrichLabels() {
 		if len(verbs) > 0 {
 			label := cat.Feature + " [" + strings.Join(topN(verbs, 3), ", ") + "]"
 			if cat.SemanticLabel != label {
-				cat.SemanticLabel = label
-				changed = true
+				h.graph.UpdateNode(cat.ID, func(node *Node) { node.SemanticLabel = label })
 			}
 		}
-	}
-	if changed {
-		h.graph.markMutated()
 	}
 }
 

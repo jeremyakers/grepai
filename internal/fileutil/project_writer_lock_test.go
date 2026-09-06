@@ -1,6 +1,7 @@
 package fileutil
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +10,29 @@ import (
 	"testing"
 	"time"
 )
+
+func TestAcquireProjectWriterLockContextCancellation(t *testing.T) {
+	projectRoot := t.TempDir()
+	held, err := AcquireProjectWriterLock(projectRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	lock, err := AcquireProjectWriterLockContext(ctx, projectRoot)
+	if lock != nil {
+		lock.Close()
+		t.Fatal("canceled acquisition unexpectedly succeeded")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	var activeErr *ProjectWriterActiveError
+	if !errors.As(err, &activeErr) {
+		t.Fatalf("error = %T %v, want ProjectWriterActiveError", err, err)
+	}
+}
 
 func TestProjectWriterLockContentionIsImmediateAndActionable(t *testing.T) {
 	projectRoot := t.TempDir()

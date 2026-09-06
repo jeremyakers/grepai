@@ -73,15 +73,14 @@ func writeTestRPGProject(t *testing.T) string {
 	}
 
 	store := rpg.NewGOBRPGStore(config.GetRPGIndexPath(projectRoot))
-	graph := store.GetGraph()
 	now := time.Now()
-	graph.AddNode(&rpg.Node{ID: "area:cli", Kind: rpg.KindArea, Feature: "cli", UpdatedAt: now})
-	graph.AddNode(&rpg.Node{ID: "file:cli/search.go", Kind: rpg.KindFile, Feature: "search-command", Path: "cli/search.go", UpdatedAt: now})
-	graph.AddNode(&rpg.Node{ID: "sym:cli/search.go:runSearch", Kind: rpg.KindSymbol, Feature: "search codebase", SymbolName: "runSearch", Path: "cli/search.go", StartLine: 10, EndLine: 40, Language: "go", UpdatedAt: now})
-	graph.AddNode(&rpg.Node{ID: "sym:cli/search.go:printSearch", Kind: rpg.KindSymbol, Feature: "print search results", SymbolName: "printSearch", Path: "cli/search.go", StartLine: 42, EndLine: 60, Language: "go", UpdatedAt: now})
-	graph.AddEdge(&rpg.Edge{From: "area:cli", To: "file:cli/search.go", Type: rpg.EdgeFeatureParent, Weight: 1, UpdatedAt: now})
-	graph.AddEdge(&rpg.Edge{From: "file:cli/search.go", To: "sym:cli/search.go:runSearch", Type: rpg.EdgeContains, Weight: 1, UpdatedAt: now})
-	graph.AddEdge(&rpg.Edge{From: "sym:cli/search.go:runSearch", To: "sym:cli/search.go:printSearch", Type: rpg.EdgeInvokes, Weight: 1, UpdatedAt: now})
+	store.AddNode(&rpg.Node{ID: "area:cli", Kind: rpg.KindArea, Feature: "cli", UpdatedAt: now})
+	store.AddNode(&rpg.Node{ID: "file:cli/search.go", Kind: rpg.KindFile, Feature: "search-command", Path: "cli/search.go", UpdatedAt: now})
+	store.AddNode(&rpg.Node{ID: "sym:cli/search.go:runSearch", Kind: rpg.KindSymbol, Feature: "search codebase", SymbolName: "runSearch", Path: "cli/search.go", StartLine: 10, EndLine: 40, Language: "go", UpdatedAt: now})
+	store.AddNode(&rpg.Node{ID: "sym:cli/search.go:printSearch", Kind: rpg.KindSymbol, Feature: "print search results", SymbolName: "printSearch", Path: "cli/search.go", StartLine: 42, EndLine: 60, Language: "go", UpdatedAt: now})
+	store.AddEdge(&rpg.Edge{From: "area:cli", To: "file:cli/search.go", Type: rpg.EdgeFeatureParent, Weight: 1, UpdatedAt: now})
+	store.AddEdge(&rpg.Edge{From: "file:cli/search.go", To: "sym:cli/search.go:runSearch", Type: rpg.EdgeContains, Weight: 1, UpdatedAt: now})
+	store.AddEdge(&rpg.Edge{From: "sym:cli/search.go:runSearch", To: "sym:cli/search.go:printSearch", Type: rpg.EdgeInvokes, Weight: 1, UpdatedAt: now})
 	if err := store.Persist(context.Background()); err != nil {
 		t.Fatalf("failed to persist test RPG: %v", err)
 	}

@@ -182,6 +182,9 @@ Searches, MCP servers, and trace commands are read-only and do not acquire this
 lifetime lock, so they can continue to run concurrently with the watcher.
 Vector, symbol, and RPG GOB readers also keep explicit mutation state: closing a
 clean reader does not rewrite an existing index or create a missing one.
+GOB stores own mutable vectors, chunk ID lists, and RPG node data; values
+returned by search, trace, and RPG graph APIs are detached copies rather than
+live writable store state.
 
 ### Background Daemon Mode
 

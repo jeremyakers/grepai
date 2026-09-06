@@ -74,8 +74,8 @@ type Graph struct {
 	Edges []*Edge          `json:"edges"`
 
 	// mu protects all fields from concurrent access.
-	// Callers that need to read Nodes/Edges directly (e.g. for serialization)
-	// must acquire mu.RLock() for the duration of the read.
+	// Internal callers that read Nodes/Edges directly must hold mu. Public
+	// readers should use getters or Snapshot, which return detached values.
 	mu sync.RWMutex
 
 	// Indexes for fast lookup (not serialized)
@@ -115,7 +115,14 @@ func NewGraph() *Graph {
 //
 // TODO: consider map[string]int index for O(1) stale-entry removal during bulk operations
 func (g *Graph) AddNode(n *Node) {
+	n = cloneNode(n)
 	g.mu.Lock()
+	g.addNodeLocked(n)
+	g.mu.Unlock()
+	g.markMutated()
+}
+
+func (g *Graph) addNodeLocked(n *Node) {
 	// If node already exists, remove old index entries first
 	if old, exists := g.Nodes[n.ID]; exists {
 		if nodes, ok := g.byKind[old.Kind]; ok {
@@ -155,8 +162,26 @@ func (g *Graph) AddNode(n *Node) {
 	if n.Kind == KindArea || n.Kind == KindCategory || n.Kind == KindSubcategory {
 		g.byFeaturePath[n.Feature] = n
 	}
+}
+
+// UpdateNode applies one synchronized logical update to an existing node.
+// The callback receives an owned copy and cannot retain an internal pointer.
+func (g *Graph) UpdateNode(id string, update func(*Node)) bool {
+	if update == nil {
+		return false
+	}
+	g.mu.Lock()
+	node := g.Nodes[id]
+	if node == nil {
+		g.mu.Unlock()
+		return false
+	}
+	updated := cloneNode(node)
+	update(updated)
+	g.addNodeLocked(updated)
 	g.mu.Unlock()
 	g.markMutated()
+	return true
 }
 
 // RemoveNode removes a node and all its edges, updating indexes.
@@ -254,6 +279,7 @@ func (g *Graph) RemoveNode(id string) {
 
 // AddEdge adds an edge and updates adjacency indexes.
 func (g *Graph) AddEdge(e *Edge) {
+	e = cloneEdge(e)
 	g.mu.Lock()
 	g.Edges = append(g.Edges, e)
 	g.adjForward[e.From] = append(g.adjForward[e.From], e)
@@ -374,15 +400,21 @@ func (g *Graph) RemoveEdgesIf(predicate func(*Edge) bool) {
 
 	// Snapshot edge list under read lock so the predicate can call graph methods.
 	g.mu.RLock()
-	snapshot := make([]*Edge, len(g.Edges))
-	copy(snapshot, g.Edges)
+	type edgeCandidate struct {
+		original *Edge
+		clone    *Edge
+	}
+	snapshot := make([]edgeCandidate, len(g.Edges))
+	for i, edge := range g.Edges {
+		snapshot[i] = edgeCandidate{original: edge, clone: cloneEdge(edge)}
+	}
 	g.mu.RUnlock()
 
 	// Evaluate predicate without holding the lock.
 	toRemove := make(map[*Edge]bool)
-	for _, e := range snapshot {
-		if predicate(e) {
-			toRemove[e] = true
+	for _, candidate := range snapshot {
+		if predicate(candidate.clone) {
+			toRemove[candidate.original] = true
 		}
 	}
 	if len(toRemove) == 0 {
@@ -421,35 +453,42 @@ func (g *Graph) NodePath(id string) (string, bool) {
 func (g *Graph) GetNode(id string) *Node {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return g.Nodes[id]
+	return cloneNode(g.Nodes[id])
 }
 
 // GetNodesByKind returns all nodes of a given kind.
 func (g *Graph) GetNodesByKind(kind NodeKind) []*Node {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return g.byKind[kind]
+	return cloneNodes(g.byKind[kind])
 }
 
 // GetNodesByFile returns all nodes for a given file path.
 func (g *Graph) GetNodesByFile(path string) []*Node {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return g.byFile[path]
+	return cloneNodes(g.byFile[path])
 }
 
 // GetOutgoing returns all outgoing edges from a node.
 func (g *Graph) GetOutgoing(nodeID string) []*Edge {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return g.adjForward[nodeID]
+	return cloneEdges(g.adjForward[nodeID])
 }
 
 // GetIncoming returns all incoming edges to a node.
 func (g *Graph) GetIncoming(nodeID string) []*Edge {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return g.adjReverse[nodeID]
+	return cloneEdges(g.adjReverse[nodeID])
+}
+
+// GetEdges returns detached copies of all graph edges.
+func (g *Graph) GetEdges() []*Edge {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return cloneEdges(g.Edges)
 }
 
 // GetNeighbors returns neighbor node IDs in a given direction ("forward", "reverse", "both").
@@ -479,6 +518,19 @@ func (g *Graph) GetNeighbors(nodeID string, direction string) []string {
 	}
 
 	return result
+}
+
+// Snapshot returns a detached deep copy suitable for read-only callers.
+func (g *Graph) Snapshot() *Graph {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	snapshot := NewGraph()
+	for id, node := range g.Nodes {
+		snapshot.Nodes[id] = cloneNode(node)
+	}
+	snapshot.Edges = cloneEdges(g.Edges)
+	snapshot.rebuildIndexesLocked()
+	return snapshot
 }
 
 // Reset clears all graph data and rebuilds empty indexes atomically.

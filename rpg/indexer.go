@@ -31,6 +31,7 @@ const (
 // Formerly RPGIndexer.
 type RPGEncoder struct {
 	store       RPGStore
+	graph       *Graph
 	extractor   FeatureExtractor
 	hierarchy   *HierarchyBuilder
 	evolver     *Evolver
@@ -54,6 +55,9 @@ type ProgressObserver func(step string, current, total int)
 // NewRPGEncoder creates a new RPG encoder instance.
 func NewRPGEncoder(rpgStore RPGStore, extractor FeatureExtractor, projectRoot string, cfg RPGEncoderConfig) *RPGEncoder {
 	graph := rpgStore.GetGraph()
+	if provider, ok := rpgStore.(interface{ mutableGraph() *Graph }); ok {
+		graph = provider.mutableGraph()
+	}
 	hierarchy := NewHierarchyBuilder(graph, extractor)
 	evolver := NewEvolver(graph, extractor, hierarchy, cfg.DriftThreshold)
 
@@ -65,6 +69,7 @@ func NewRPGEncoder(rpgStore RPGStore, extractor FeatureExtractor, projectRoot st
 
 	return &RPGEncoder{
 		store:       rpgStore,
+		graph:       graph,
 		extractor:   extractor,
 		hierarchy:   hierarchy,
 		evolver:     evolver,
@@ -79,7 +84,7 @@ func (idx *RPGEncoder) BuildFull(ctx context.Context, symbolStore trace.SymbolSt
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	graph := idx.store.GetGraph()
+	graph := idx.graph
 
 	// Clear existing graph data in-place (not reassigning the pointer)
 	graph.Reset()
@@ -126,8 +131,6 @@ func (idx *RPGEncoder) BuildFull(ctx context.Context, symbolStore trace.SymbolSt
 			UpdatedAt: now,
 		}
 		setNodeFeatures(fileNode, fileFallbackAtomic, fileFallbackPrimary)
-		graph.AddNode(fileNode)
-
 		// Get symbols for this file from the symbol store
 		symbols, symErr := symbolStore.GetSymbolsForFile(ctx, filePath)
 		if symErr != nil {
@@ -181,6 +184,7 @@ func (idx *RPGEncoder) BuildFull(ctx context.Context, symbolStore trace.SymbolSt
 			fileNode.Summary = strings.TrimSpace(summary)
 		}
 		fileNode.UpdatedAt = time.Now()
+		graph.AddNode(fileNode)
 	}
 
 	if observer != nil {
@@ -274,7 +278,7 @@ func (idx *RPGEncoder) RefreshDerivedEdgesIncremental(ctx context.Context, symbo
 }
 
 func (idx *RPGEncoder) refreshDerivedEdgesFullLocked(ctx context.Context, symbolStore trace.SymbolStore) error {
-	graph := idx.store.GetGraph()
+	graph := idx.graph
 	graph.RemoveEdgesIf(func(e *Edge) bool {
 		return isDerivedEdgeType(e.Type)
 	})
@@ -302,7 +306,7 @@ func (idx *RPGEncoder) refreshDerivedEdgesIncrementalLocked(ctx context.Context,
 		return nil
 	}
 
-	graph := idx.store.GetGraph()
+	graph := idx.graph
 	changedSet := make(map[string]struct{}, len(changedFiles))
 	for _, file := range changedFiles {
 		if file == "" {
@@ -351,7 +355,7 @@ func (idx *RPGEncoder) LinkChunksForFile(ctx context.Context, filePath string, c
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
-	graph := idx.store.GetGraph()
+	graph := idx.graph
 
 	if err := idx.linkChunksToSymbols(graph, filePath, chunks); err != nil {
 		return fmt.Errorf("failed to link chunks: %w", err)
@@ -360,19 +364,17 @@ func (idx *RPGEncoder) LinkChunksForFile(ctx context.Context, filePath string, c
 	return nil
 }
 
-// GetGraph returns the underlying graph pointer. The pointer is NOT
-// concurrency-safe on its own. Use RPGEncoder.Stats() for safe
-// concurrent stats access. Direct graph access is safe when each
-// caller owns a separate store instance (e.g., MCP per-request pattern).
+// GetGraph returns a detached read-only snapshot. Mutating the returned graph
+// does not update the encoder or its store.
 func (idx *RPGEncoder) GetGraph() *Graph {
-	return idx.store.GetGraph()
+	return idx.graph.Snapshot()
 }
 
 // Stats returns graph statistics in a concurrency-safe manner.
 func (idx *RPGEncoder) Stats() GraphStats {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
-	return idx.store.GetGraph().Stats()
+	return idx.graph.Stats()
 }
 
 // GetEvolver returns the evolver for direct use.
@@ -597,7 +599,7 @@ func findBestCalleeNode(calleeName, callerFile string, symbolsByName map[string]
 
 func (idx *RPGEncoder) wireImportEdges(graph *Graph, changedFiles map[string]struct{}) {
 	importsSeen := make(map[string]bool)
-	for _, e := range graph.Edges {
+	for _, e := range graph.GetEdges() {
 		if e.Type != EdgeInvokes {
 			continue
 		}
@@ -818,7 +820,7 @@ func (idx *RPGEncoder) wireFeatureSimilarityIncremental(graph *Graph, changedFil
 func (idx *RPGEncoder) wireCoCallerAffinity(graph *Graph) {
 	// Build caller -> callees map from EdgeInvokes
 	callerToCallees := make(map[string][]string)
-	for _, e := range graph.Edges {
+	for _, e := range graph.GetEdges() {
 		if e.Type == EdgeInvokes {
 			callerToCallees[e.From] = append(callerToCallees[e.From], e.To)
 		}
@@ -886,7 +888,7 @@ func (idx *RPGEncoder) wireCoCallerAffinityIncremental(graph *Graph, changedFile
 	changedSymbols := collectChangedSymbolIDs(graph, changedFiles)
 
 	callerToCallees := make(map[string][]string)
-	for _, e := range graph.Edges {
+	for _, e := range graph.GetEdges() {
 		if e.Type == EdgeInvokes {
 			callerToCallees[e.From] = append(callerToCallees[e.From], e.To)
 		}

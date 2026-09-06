@@ -933,7 +933,7 @@ func discoverWorktreesForWatch(projectRoot string) []string {
 			seen[wtPathCanonical] = true
 			// Auto-init .grepai/ if needed (FindProjectRoot does this when called
 			// from within the worktree, but we're not in it, so init manually)
-			if !config.Exists(wtPathCanonical) {
+			if _, loadErr := config.Load(wtPathCanonical); loadErr != nil {
 				// Auto-init from main
 				if initErr := config.AutoInitWorktree(wtPathCanonical, projectRootCanonical); initErr != nil {
 					log.Printf("Warning: failed to auto-init worktree %s: %v", wtPathCanonical, initErr)

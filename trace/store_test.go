@@ -389,6 +389,45 @@ func TestGOBSymbolStore_MissingReaderCannotOverwriteLaterWriter(t *testing.T) {
 	}
 }
 
+func TestGOBSymbolStoreReturnsOwnedSlices(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	ctx := context.Background()
+	store := NewGOBSymbolStore(indexPath)
+	symbols := []Symbol{{Name: "Target", File: "main.go", Kind: KindFunction}}
+	refs := []Reference{{SymbolName: "Target", File: "main.go", Kind: RefKindCall, CallerName: "Caller"}}
+	if err := store.SaveFile(ctx, "main.go", symbols, refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Persist(ctx); err != nil {
+		t.Fatal(err)
+	}
+	symbols[0].Name = "input-mutated"
+	refs[0].CallerName = "input-mutated"
+	gotSymbols, _ := store.LookupSymbol(ctx, "Target")
+	gotSymbols[0].Name = "getter-mutated"
+	gotCallers, _ := store.LookupCallers(ctx, "Target")
+	gotCallers[0].CallerName = "getter-mutated"
+	gotForFile, _ := store.GetSymbolsForFile(ctx, "main.go")
+	gotForFile[0].Name = "file-getter-mutated"
+	gotSymbols, _ = store.LookupSymbol(ctx, "Target")
+	gotCallers, _ = store.LookupCallers(ctx, "Target")
+	if gotSymbols[0].Name != "Target" || gotCallers[0].CallerName != "Caller" {
+		t.Fatalf("store state changed through returned slice: symbols=%#v callers=%#v", gotSymbols, gotCallers)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := NewGOBSymbolStore(indexPath)
+	if err := reloaded.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	gotSymbols, _ = reloaded.LookupSymbol(ctx, "Target")
+	gotCallers, _ = reloaded.LookupCallers(ctx, "Target")
+	if len(gotSymbols) != 1 || gotSymbols[0].Name != "Target" || len(gotCallers) != 1 || gotCallers[0].CallerName != "Caller" {
+		t.Fatalf("persisted symbol data changed through alias: symbols=%#v callers=%#v", gotSymbols, gotCallers)
+	}
+}
+
 func TestGOBSymbolStore_DeleteFileRemovesExtractorVersion(t *testing.T) {
 	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
 	ctx := context.Background()

@@ -49,7 +49,7 @@ func (s *GOBStore) SaveChunks(ctx context.Context, chunks []Chunk) error {
 	s.mutationGeneration++
 
 	for _, chunk := range chunks {
-		s.chunks[chunk.ID] = chunk
+		s.chunks[chunk.ID] = cloneChunk(chunk)
 	}
 
 	return nil
@@ -91,7 +91,7 @@ func (s *GOBStore) Search(ctx context.Context, queryVector []float32, limit int,
 		}
 		score := cosineSimilarity(queryVector, chunk.Vector)
 		results = append(results, SearchResult{
-			Chunk: chunk,
+			Chunk: cloneChunk(chunk),
 			Score: score,
 		})
 	}
@@ -117,14 +117,15 @@ func (s *GOBStore) GetDocument(ctx context.Context, filePath string) (*Document,
 		return nil, nil
 	}
 
-	return &doc, nil
+	cloned := cloneDocument(doc)
+	return &cloned, nil
 }
 
 func (s *GOBStore) SaveDocument(ctx context.Context, doc Document) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.documents[doc.Path] = doc
+	s.documents[doc.Path] = cloneDocument(doc)
 	s.mutationGeneration++
 	return nil
 }
@@ -384,7 +385,7 @@ func (s *GOBStore) GetChunksForFile(ctx context.Context, filePath string) ([]Chu
 	chunks := make([]Chunk, 0, len(doc.ChunkIDs))
 	for _, id := range doc.ChunkIDs {
 		if chunk, ok := s.chunks[id]; ok {
-			chunks = append(chunks, chunk)
+			chunks = append(chunks, cloneChunk(chunk))
 		}
 	}
 	return chunks, nil
@@ -396,7 +397,7 @@ func (s *GOBStore) GetAllChunks(ctx context.Context) ([]Chunk, error) {
 
 	chunks := make([]Chunk, 0, len(s.chunks))
 	for _, chunk := range s.chunks {
-		chunks = append(chunks, chunk)
+		chunks = append(chunks, cloneChunk(chunk))
 	}
 	return chunks, nil
 }

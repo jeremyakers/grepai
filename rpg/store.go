@@ -10,7 +10,7 @@ type RPGStore interface {
 	Persist(ctx context.Context) error
 	// Close cleanly shuts down the store.
 	Close() error
-	// GetGraph returns the in-memory graph.
+	// GetGraph returns a detached graph snapshot for reading.
 	GetGraph() *Graph
 	// GetStats returns graph statistics.
 	GetStats(ctx context.Context) (*GraphStats, error)

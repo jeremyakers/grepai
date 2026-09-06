@@ -786,7 +786,7 @@ func autoInitFromMainWorktreeWithCopy(worktreeRoot, mainWorktree string, copyFil
 
 	// config.yaml is the completion marker and is copied last. If another
 	// initializer completed while this caller waited, its seed is ready to use.
-	if Exists(worktreeRoot) {
+	if projectConfigIsValid(worktreeRoot) {
 		return nil
 	}
 
@@ -805,30 +805,34 @@ func autoInitFromMainWorktreeWithCopy(worktreeRoot, mainWorktree string, copyFil
 
 	// Copy index.gob as seed (search works immediately)
 	dstIndex := filepath.Join(localGrepai, "index.gob")
+	created = append(created, dstIndex)
+	_ = os.Remove(dstIndex)
 	if err := copyFile(filepath.Join(mainGrepai, "index.gob"), dstIndex); err != nil {
 		cleanup()
 		return err
 	}
-	created = append(created, dstIndex)
 
 	// Copy symbols.gob as seed (trace works immediately)
 	dstSymbols := filepath.Join(localGrepai, "symbols.gob")
+	created = append(created, dstSymbols)
+	_ = os.Remove(dstSymbols)
 	if err := copyFile(filepath.Join(mainGrepai, "symbols.gob"), dstSymbols); err != nil {
 		cleanup()
 		return err
 	}
-	created = append(created, dstSymbols)
 
 	// Copy required config last so its presence means every seed copy finished.
 	srcConfig := filepath.Join(mainGrepai, "config.yaml")
 	dstConfig := filepath.Join(localGrepai, "config.yaml")
+	created = append(created, dstConfig)
+	_ = os.Remove(dstConfig)
 	if err := copyFile(srcConfig, dstConfig); err != nil {
 		cleanup()
 		return err
 	}
-	if _, err := os.Stat(dstConfig); os.IsNotExist(err) {
+	if !projectConfigIsValid(worktreeRoot) {
 		cleanup()
-		return fmt.Errorf("config.yaml not found in main worktree: %s", srcConfig)
+		return fmt.Errorf("valid config.yaml not found in main worktree: %s", srcConfig)
 	}
 
 	// Ensure .grepai/ is in .gitignore
@@ -837,17 +841,9 @@ func autoInitFromMainWorktreeWithCopy(worktreeRoot, mainWorktree string, copyFil
 	return nil
 }
 
-// copyFileIfExists copies src to dst if src exists. Returns error only if src
-// exists but copy fails. Returns nil if src doesn't exist.
-func copyFileIfExists(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	return os.WriteFile(dst, data, 0600)
+func projectConfigIsValid(projectRoot string) bool {
+	_, err := Load(projectRoot)
+	return err == nil
 }
 
 // ensureGitignoreEntry adds an entry to .gitignore if not already present.

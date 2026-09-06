@@ -353,7 +353,7 @@ func (s *GOBSymbolStore) LookupSymbol(ctx context.Context, name string) ([]Symbo
 	if symbols == nil {
 		return []Symbol{}, nil
 	}
-	return symbols, nil
+	return append([]Symbol(nil), symbols...), nil
 }
 
 // LookupCallers finds all references/callers of a symbol.

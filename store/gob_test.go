@@ -265,6 +265,59 @@ func TestGOBStore_MissingReaderCannotOverwriteLaterWriter(t *testing.T) {
 	}
 }
 
+func TestGOBStoreOwnsMutableInputsAndReturnsCopies(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "index.gob")
+	ctx := context.Background()
+	store := NewGOBStore(indexPath)
+	inputChunk := Chunk{ID: "chunk", FilePath: "main.go", Vector: []float32{1, 2}}
+	inputDoc := Document{Path: "main.go", ChunkIDs: []string{"chunk"}}
+	if err := store.SaveChunks(ctx, []Chunk{inputChunk}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveDocument(ctx, inputDoc); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Persist(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	inputChunk.Vector[0] = 99
+	inputDoc.ChunkIDs[0] = "changed"
+	doc, _ := store.GetDocument(ctx, "main.go")
+	doc.ChunkIDs[0] = "getter-changed"
+	chunks, _ := store.GetChunksForFile(ctx, "main.go")
+	chunks[0].Vector[0] = 88
+	all, _ := store.GetAllChunks(ctx)
+	all[0].Vector[1] = 77
+	results, _ := store.Search(ctx, []float32{1, 2}, 1, SearchOptions{})
+	results[0].Chunk.Vector[0] = 66
+	vector, ok, _ := store.LookupByContentHash(ctx, "")
+	if ok && len(vector) > 0 {
+		vector[0] = 55
+	}
+	doc, _ = store.GetDocument(ctx, "main.go")
+	chunks, _ = store.GetChunksForFile(ctx, "main.go")
+	if doc.ChunkIDs[0] != "chunk" || chunks[0].Vector[0] != 1 || chunks[0].Vector[1] != 2 {
+		t.Fatalf("store state changed through alias before close: doc=%#v chunks=%#v", doc, chunks)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded := NewGOBStore(indexPath)
+	if err := reloaded.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	doc, _ = reloaded.GetDocument(ctx, "main.go")
+	chunks, _ = reloaded.GetChunksForFile(ctx, "main.go")
+	if doc == nil || len(doc.ChunkIDs) != 1 || doc.ChunkIDs[0] != "chunk" {
+		t.Fatalf("persisted document was mutated through alias: %#v", doc)
+	}
+	if len(chunks) != 1 || len(chunks[0].Vector) != 2 || chunks[0].Vector[0] != 1 || chunks[0].Vector[1] != 2 {
+		t.Fatalf("persisted chunk was mutated through alias: %#v", chunks)
+	}
+}
+
 func TestGOBStore_DeleteByFileWithoutChunksDoesNotRewrite(t *testing.T) {
 	indexPath := filepath.Join(t.TempDir(), "index.gob")
 	ctx := context.Background()

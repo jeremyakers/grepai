@@ -161,10 +161,9 @@ func (s *GOBRPGStore) persistUnlocked() (uint64, error) {
 	generation := s.mutationGeneration.Load()
 	nodes := make(map[string]*Node, len(s.graph.Nodes))
 	for k, v := range s.graph.Nodes {
-		nodes[k] = v
+		nodes[k] = cloneNode(v)
 	}
-	edges := make([]*Edge, len(s.graph.Edges))
-	copy(edges, s.graph.Edges)
+	edges := cloneEdges(s.graph.Edges)
 	s.graph.mu.RUnlock()
 
 	data := gobRPGData{
@@ -225,12 +224,21 @@ func (s *GOBRPGStore) Close() error {
 	return s.Persist(context.Background())
 }
 
-// GetGraph returns the in-memory graph.
+// GetGraph returns a detached read-only snapshot. Mutating it does not update
+// the store; writers use explicit store/encoder mutation operations.
 func (s *GOBRPGStore) GetGraph() *Graph {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.graph
+	return s.graph.Snapshot()
 }
+
+func (s *GOBRPGStore) mutableGraph() *Graph { return s.graph }
+
+// AddNode adds or replaces a node through the store's tracked graph.
+func (s *GOBRPGStore) AddNode(node *Node) { s.graph.AddNode(node) }
+
+// AddEdge adds an edge through the store's tracked graph.
+func (s *GOBRPGStore) AddEdge(edge *Edge) { s.graph.AddEdge(edge) }
 
 // GetStats returns graph statistics.
 func (s *GOBRPGStore) GetStats(ctx context.Context) (*GraphStats, error) {

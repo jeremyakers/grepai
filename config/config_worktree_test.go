@@ -229,6 +229,81 @@ func TestAutoInitWorktreeSerializesCompleteSeedCopy(t *testing.T) {
 	}
 }
 
+func TestAutoInitWorktreeRollsBackEveryFailedCopyStage(t *testing.T) {
+	for _, stage := range []string{"index.gob", "symbols.gob", "config.yaml"} {
+		t.Run(stage, func(t *testing.T) {
+			mainDir := t.TempDir()
+			worktreeDir := t.TempDir()
+			mainGrepai := filepath.Join(mainDir, ".grepai")
+			if err := os.MkdirAll(mainGrepai, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for name, data := range map[string]string{"index.gob": "index", "symbols.gob": "symbols", "config.yaml": "version: 1\n"} {
+				if err := os.WriteFile(filepath.Join(mainGrepai, name), []byte(data), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fault := func(src, dst string) error {
+				if filepath.Base(dst) == stage {
+					if err := os.WriteFile(dst, []byte("partial"), 0o600); err != nil {
+						return err
+					}
+					return errors.New("injected copy failure")
+				}
+				return copyFileIfExists(src, dst)
+			}
+			if err := autoInitFromMainWorktreeWithCopy(worktreeDir, mainDir, fault); err == nil {
+				t.Fatal("auto-init succeeded despite injected failure")
+			}
+			if projectConfigIsValid(worktreeDir) {
+				t.Fatal("failed auto-init published a valid completion marker")
+			}
+			for _, name := range []string{"index.gob", "symbols.gob", "config.yaml"} {
+				if _, err := os.Stat(filepath.Join(worktreeDir, ".grepai", name)); !os.IsNotExist(err) {
+					t.Fatalf("failed auto-init left %s: %v", name, err)
+				}
+			}
+			entries, err := os.ReadDir(filepath.Join(worktreeDir, ".grepai"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.Contains(entry.Name(), ".tmp-") {
+					t.Fatalf("failed auto-init left temporary file %s", entry.Name())
+				}
+			}
+			if err := autoInitFromMainWorktree(worktreeDir, mainDir); err != nil {
+				t.Fatalf("retry failed: %v", err)
+			}
+			if !projectConfigIsValid(worktreeDir) {
+				t.Fatal("retry did not publish valid config")
+			}
+		})
+	}
+}
+
+func TestAutoInitWorktreeDoesNotTreatInvalidConfigAsComplete(t *testing.T) {
+	mainDir := t.TempDir()
+	worktreeDir := t.TempDir()
+	for _, root := range []string{mainDir, worktreeDir} {
+		if err := os.MkdirAll(filepath.Join(root, ".grepai"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(mainDir, ".grepai", "config.yaml"), []byte("version: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreeDir, ".grepai", "config.yaml"), []byte("watch: [broken\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := autoInitFromMainWorktree(worktreeDir, mainDir); err != nil {
+		t.Fatalf("auto-init failed: %v", err)
+	}
+	if !projectConfigIsValid(worktreeDir) {
+		t.Fatal("invalid completion marker was not replaced")
+	}
+}
+
 func TestWatchConfig_WorktreeDiscoveryEnabled(t *testing.T) {
 	boolPtr := func(v bool) *bool { return &v }
 

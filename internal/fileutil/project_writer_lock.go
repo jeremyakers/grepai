@@ -37,7 +37,7 @@ func AcquireProjectWriterLockContext(ctx context.Context, projectRoot string) (*
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, fmt.Errorf("%w: %v", activeErr, ctx.Err())
+			return nil, fmt.Errorf("%w: %w", activeErr, ctx.Err())
 		case <-timer.C:
 		}
 	}
