@@ -68,9 +68,7 @@ func (s *Summarizer) summarizeNodes(ctx context.Context, kind NodeKind, force bo
 			}
 			continue
 		}
-		if node.Summary != summary {
-			s.graph.UpdateNode(node.ID, func(stored *Node) { stored.Summary = summary })
-		}
+		node.Summary = summary
 		consecutiveFailures = 0
 	}
 	return nil

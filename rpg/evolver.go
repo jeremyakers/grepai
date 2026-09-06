@@ -84,17 +84,15 @@ func (ev *Evolver) HandleModify(ctx context.Context, filePath string, symbols []
 		atomicFeatures := ev.extractor.ExtractAtomicFeatures(ctx, sym.Name, sym.Signature, sym.Receiver, sym.Docstring)
 		primaryFeature := ev.extractor.ExtractFeature(ctx, sym.Name, sym.Signature, sym.Receiver, sym.Docstring)
 
-		if _, ok := existingSymbols[nodeID]; ok {
-			ev.graph.UpdateNode(nodeID, func(node *Node) {
-				setNodeFeatures(node, atomicFeatures, primaryFeature)
-				node.SymbolName = sym.Name
-				node.Receiver = sym.Receiver
-				node.Language = sym.Language
-				node.Signature = sym.Signature
-				node.StartLine = sym.Line
-				node.EndLine = normalizeEndLine(sym.Line, sym.EndLine)
-				node.UpdatedAt = now
-			})
+		if existing, ok := existingSymbols[nodeID]; ok {
+			setNodeFeatures(existing, atomicFeatures, primaryFeature)
+			existing.SymbolName = sym.Name
+			existing.Receiver = sym.Receiver
+			existing.Language = sym.Language
+			existing.Signature = sym.Signature
+			existing.StartLine = sym.Line
+			existing.EndLine = normalizeEndLine(sym.Line, sym.EndLine)
+			existing.UpdatedAt = now
 			continue
 		}
 
@@ -165,11 +163,6 @@ func (ev *Evolver) refreshFileSemantics(ctx context.Context, fileNode *Node, fil
 		fileNode.Summary = strings.TrimSpace(summary)
 	}
 	fileNode.UpdatedAt = now
-	ev.graph.UpdateNode(fileNode.ID, func(node *Node) {
-		setNodeFeatures(node, fileNode.Features, fileNode.Feature)
-		node.Summary = fileNode.Summary
-		node.UpdatedAt = fileNode.UpdatedAt
-	})
 }
 
 func (ev *Evolver) collectFileSymbolFeatures(filePath string) []string {

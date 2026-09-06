@@ -191,9 +191,7 @@ func (h *HierarchyBuilder) ClusterSymbols(symbols []*Node) map[string][]*Node {
 		}
 		if feature == "" {
 			feature = h.extractor.ExtractFeature(context.Background(), sn.SymbolName, sn.Signature, sn.Receiver, "")
-			features := []string{atomicFromPrimaryFeature(feature)}
-			setNodeFeatures(sn, features, feature)
-			h.graph.UpdateNode(sn.ID, func(node *Node) { setNodeFeatures(node, features, feature) })
+			setNodeFeatures(sn, []string{atomicFromPrimaryFeature(feature)}, feature)
 		}
 
 		clusterName := h.extractClusterKey(feature)
@@ -432,10 +430,7 @@ func (h *HierarchyBuilder) EnrichLabels() {
 	for _, area := range areas {
 		verbs := h.collectDescendantVerbs(area.ID)
 		if len(verbs) > 0 {
-			label := area.Feature + " [" + strings.Join(topN(verbs, 3), ", ") + "]"
-			if area.SemanticLabel != label {
-				h.graph.UpdateNode(area.ID, func(node *Node) { node.SemanticLabel = label })
-			}
+			area.SemanticLabel = area.Feature + " [" + strings.Join(topN(verbs, 3), ", ") + "]"
 		}
 	}
 
@@ -446,10 +441,7 @@ func (h *HierarchyBuilder) EnrichLabels() {
 	for _, cat := range cats {
 		verbs := h.collectDescendantVerbs(cat.ID)
 		if len(verbs) > 0 {
-			label := cat.Feature + " [" + strings.Join(topN(verbs, 3), ", ") + "]"
-			if cat.SemanticLabel != label {
-				h.graph.UpdateNode(cat.ID, func(node *Node) { node.SemanticLabel = label })
-			}
+			cat.SemanticLabel = cat.Feature + " [" + strings.Join(topN(verbs, 3), ", ") + "]"
 		}
 	}
 }

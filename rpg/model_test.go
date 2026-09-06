@@ -54,7 +54,7 @@ func TestAddNode(t *testing.T) {
 	g.AddNode(symNode)
 
 	// Verify node is in main map
-	if g.Nodes[symNode.ID] == nil || g.Nodes[symNode.ID].ID != symNode.ID {
+	if g.Nodes[symNode.ID] != symNode {
 		t.Error("Node not found in Nodes map")
 	}
 
@@ -62,7 +62,7 @@ func TestAddNode(t *testing.T) {
 	if len(g.byKind[KindSymbol]) != 1 {
 		t.Errorf("Expected 1 symbol node in byKind index, got %d", len(g.byKind[KindSymbol]))
 	}
-	if g.byKind[KindSymbol][0].ID != symNode.ID {
+	if g.byKind[KindSymbol][0] != symNode {
 		t.Error("Symbol node not correctly indexed in byKind")
 	}
 
@@ -70,7 +70,7 @@ func TestAddNode(t *testing.T) {
 	if len(g.byFile["file.go"]) != 1 {
 		t.Errorf("Expected 1 node in byFile index for file.go, got %d", len(g.byFile["file.go"]))
 	}
-	if g.byFile["file.go"][0].ID != symNode.ID {
+	if g.byFile["file.go"][0] != symNode {
 		t.Error("Node not correctly indexed in byFile")
 	}
 
@@ -84,7 +84,7 @@ func TestAddNode(t *testing.T) {
 	g.AddNode(areaNode)
 
 	// Verify byFeaturePath index for hierarchy nodes
-	if g.byFeaturePath["cli"] == nil || g.byFeaturePath["cli"].ID != areaNode.ID {
+	if g.byFeaturePath["cli"] != areaNode {
 		t.Error("Area node not correctly indexed in byFeaturePath")
 	}
 
@@ -97,7 +97,7 @@ func TestAddNode(t *testing.T) {
 	}
 	g.AddNode(catNode)
 
-	if g.byFeaturePath["cli/watch"] == nil || g.byFeaturePath["cli/watch"].ID != catNode.ID {
+	if g.byFeaturePath["cli/watch"] != catNode {
 		t.Error("Category node not correctly indexed in byFeaturePath")
 	}
 }
@@ -194,7 +194,7 @@ func TestAddEdge(t *testing.T) {
 	if len(g.Edges) != 1 {
 		t.Fatalf("Expected 1 edge, got %d", len(g.Edges))
 	}
-	if g.Edges[0].From != edge.From || g.Edges[0].To != edge.To || g.Edges[0].Type != edge.Type {
+	if g.Edges[0] != edge {
 		t.Error("Edge not found in Edges list")
 	}
 
@@ -202,7 +202,7 @@ func TestAddEdge(t *testing.T) {
 	if len(g.adjForward["node1"]) != 1 {
 		t.Fatalf("Expected 1 outgoing edge from node1, got %d", len(g.adjForward["node1"]))
 	}
-	if g.adjForward["node1"][0].To != edge.To {
+	if g.adjForward["node1"][0] != edge {
 		t.Error("Edge not correctly indexed in adjForward")
 	}
 
@@ -210,7 +210,7 @@ func TestAddEdge(t *testing.T) {
 	if len(g.adjReverse["node2"]) != 1 {
 		t.Fatalf("Expected 1 incoming edge to node2, got %d", len(g.adjReverse["node2"]))
 	}
-	if g.adjReverse["node2"][0].From != edge.From {
+	if g.adjReverse["node2"][0] != edge {
 		t.Error("Edge not correctly indexed in adjReverse")
 	}
 }
@@ -238,7 +238,7 @@ func TestRemoveEdgesBetween(t *testing.T) {
 	if len(g.Edges) != 1 {
 		t.Fatalf("Expected 1 edge remaining, got %d", len(g.Edges))
 	}
-	if g.Edges[0].From != edge2.From || g.Edges[0].To != edge2.To {
+	if g.Edges[0] != edge2 {
 		t.Error("Wrong edge remained")
 	}
 

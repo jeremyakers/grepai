@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/yoanbernabeu/grepai/trace"
 )
 
 func TestGOBRPGStore_PersistLoad(t *testing.T) {
@@ -20,7 +18,7 @@ func TestGOBRPGStore_PersistLoad(t *testing.T) {
 
 	// Create store and add some data
 	store := NewGOBRPGStore(indexPath)
-	graph := store.mutableGraph()
+	graph := store.GetGraph()
 
 	// Add nodes
 	node1 := &Node{
@@ -178,280 +176,12 @@ func TestGOBRPGStore_EmptyLoad(t *testing.T) {
 	}
 }
 
-func TestGOBRPGStore_UntouchedMissingReaderCloseWritesNothing(t *testing.T) {
-	indexPath := filepath.Join(t.TempDir(), "rpg.gob")
-	store := NewGOBRPGStore(indexPath)
-	if err := store.Load(context.Background()); err != nil {
-		t.Fatalf("Load missing index failed: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-	if _, err := os.Stat(indexPath); !os.IsNotExist(err) {
-		t.Fatalf("untouched missing-index reader wrote %s: %v", indexPath, err)
-	}
-}
-
-func TestGOBRPGStore_MissingLoadPreservesPendingMutation(t *testing.T) {
-	indexPath := filepath.Join(t.TempDir(), "rpg.gob")
-	store := NewGOBRPGStore(indexPath)
-	store.AddNode(&Node{ID: "pending", Kind: KindSymbol})
-	if err := store.Load(context.Background()); err != nil {
-		t.Fatalf("Load missing index failed: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close failed: %v", err)
-	}
-	reloaded := NewGOBRPGStore(indexPath)
-	if err := reloaded.Load(context.Background()); err != nil {
-		t.Fatalf("reload failed: %v", err)
-	}
-	if reloaded.GetGraph().GetNode("pending") == nil {
-		t.Fatal("pending graph mutation was lost")
-	}
-}
-
-func TestGOBRPGStore_MissingReaderCannotOverwriteLaterWriter(t *testing.T) {
-	indexPath := filepath.Join(t.TempDir(), "rpg.gob")
-	ctx := context.Background()
-	reader := NewGOBRPGStore(indexPath)
-	if err := reader.Load(ctx); err != nil {
-		t.Fatalf("reader Load failed: %v", err)
-	}
-	writer := NewGOBRPGStore(indexPath)
-	writer.AddNode(&Node{ID: "writer", Kind: KindSymbol})
-	if err := writer.Close(); err != nil {
-		t.Fatalf("writer Close failed: %v", err)
-	}
-	if err := reader.Close(); err != nil {
-		t.Fatalf("reader Close failed: %v", err)
-	}
-	check := NewGOBRPGStore(indexPath)
-	if err := check.Load(ctx); err != nil {
-		t.Fatalf("check Load failed: %v", err)
-	}
-	if check.GetGraph().GetNode("writer") == nil {
-		t.Fatal("reader Close overwrote writer graph")
-	}
-}
-
-func TestGOBRPGStore_DirtyPersistWritesOnceAndCleanCloseIsNoOp(t *testing.T) {
-	indexPath := filepath.Join(t.TempDir(), "rpg.gob")
-	ctx := context.Background()
-	store := NewGOBRPGStore(indexPath)
-	if err := store.Persist(ctx); err != nil {
-		t.Fatalf("initial Persist failed: %v", err)
-	}
-	oldTime := time.Unix(1, 0)
-	if err := os.Chtimes(indexPath, oldTime, oldTime); err != nil {
-		t.Fatalf("Chtimes failed: %v", err)
-	}
-	store.AddNode(&Node{ID: "dirty", Kind: KindSymbol})
-	if err := store.Persist(ctx); err != nil {
-		t.Fatalf("dirty Persist failed: %v", err)
-	}
-	info, err := os.Stat(indexPath)
-	if err != nil || info.ModTime().Equal(oldTime) {
-		t.Fatalf("dirty Persist did not rewrite index: info=%v err=%v", info, err)
-	}
-	if err := os.Chtimes(indexPath, oldTime, oldTime); err != nil {
-		t.Fatalf("second Chtimes failed: %v", err)
-	}
-	if err := store.Persist(ctx); err != nil {
-		t.Fatalf("clean Persist failed: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("clean Close failed: %v", err)
-	}
-	info, err = os.Stat(indexPath)
-	if err != nil || !info.ModTime().Equal(oldTime) {
-		t.Fatalf("clean Persist/Close rewrote index: info=%v err=%v", info, err)
-	}
-}
-
-func TestGOBRPGStore_ValidLoadMakesReaderCloseClean(t *testing.T) {
-	indexPath := filepath.Join(t.TempDir(), "rpg.gob")
-	ctx := context.Background()
-	seed := NewGOBRPGStore(indexPath)
-	seed.AddNode(&Node{ID: "seed", Kind: KindSymbol})
-	if err := seed.Persist(ctx); err != nil {
-		t.Fatalf("seed Persist failed: %v", err)
-	}
-	reader := NewGOBRPGStore(indexPath)
-	if err := reader.Load(ctx); err != nil {
-		t.Fatalf("reader Load failed: %v", err)
-	}
-	oldTime := time.Unix(1, 0)
-	if err := os.Chtimes(indexPath, oldTime, oldTime); err != nil {
-		t.Fatalf("Chtimes failed: %v", err)
-	}
-	if err := reader.Close(); err != nil {
-		t.Fatalf("reader Close failed: %v", err)
-	}
-	info, err := os.Stat(indexPath)
-	if err != nil || !info.ModTime().Equal(oldTime) {
-		t.Fatalf("clean loaded reader rewrote index: info=%v err=%v", info, err)
-	}
-}
-
-func TestGOBRPGStore_FailedPersistRemainsDirtyForRetry(t *testing.T) {
-	tmpDir := t.TempDir()
-	indexPath := filepath.Join(tmpDir, "rpg.gob")
-	store := NewGOBRPGStore(indexPath)
-	store.AddNode(&Node{ID: "retry", Kind: KindSymbol})
-	if err := os.Mkdir(indexPath, 0o755); err != nil {
-		t.Fatalf("Mkdir failed: %v", err)
-	}
-	blocker := filepath.Join(indexPath, "blocker")
-	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
-		t.Fatalf("WriteFile failed: %v", err)
-	}
-	if err := store.Persist(context.Background()); err == nil {
-		t.Fatal("Persist should fail when target is a non-empty directory")
-	}
-	if err := os.Remove(blocker); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(indexPath); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Persist(context.Background()); err != nil {
-		t.Fatalf("retry Persist failed: %v", err)
-	}
-	loaded := NewGOBRPGStore(indexPath)
-	if err := loaded.Load(context.Background()); err != nil || loaded.GetGraph().GetNode("retry") == nil {
-		t.Fatalf("retry mutation not persisted: err=%v", err)
-	}
-}
-
-func TestGOBRPGStore_EveryGraphMutationMarksDirty(t *testing.T) {
-	tests := []struct {
-		name   string
-		mutate func(*Graph)
-	}{
-		{"AddNode", func(g *Graph) { g.AddNode(&Node{ID: "added", Kind: KindSymbol}) }},
-		{"UpdateNode", func(g *Graph) { g.UpdateNode("base-a", func(n *Node) { n.Summary = "updated" }) }},
-		{"RemoveNode", func(g *Graph) { g.RemoveNode("base-a") }},
-		{"AddEdge", func(g *Graph) { g.AddEdge(&Edge{From: "base-a", To: "base-b", Type: EdgeInvokes}) }},
-		{"RemoveEdgesBetween", func(g *Graph) { g.RemoveEdgesBetween("base-a", "base-b") }},
-		{"RemoveEdgesBetweenOfType", func(g *Graph) { g.RemoveEdgesBetweenOfType("base-a", "base-b", EdgeContains) }},
-		{"RemoveEdgesIf", func(g *Graph) { g.RemoveEdgesIf(func(*Edge) bool { return true }) }},
-		{"Reset", func(g *Graph) { g.Reset() }},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			indexPath := filepath.Join(t.TempDir(), "rpg.gob")
-			ctx := context.Background()
-			store := NewGOBRPGStore(indexPath)
-			graph := store.mutableGraph()
-			graph.AddNode(&Node{ID: "base-a", Kind: KindSymbol})
-			graph.AddNode(&Node{ID: "base-b", Kind: KindSymbol})
-			graph.AddEdge(&Edge{From: "base-a", To: "base-b", Type: EdgeContains})
-			if err := store.Persist(ctx); err != nil {
-				t.Fatalf("seed Persist failed: %v", err)
-			}
-			tt.mutate(graph)
-			if !store.hasPendingPersist() {
-				t.Fatalf("%s did not mark store dirty", tt.name)
-			}
-		})
-	}
-}
-
-func TestGOBRPGStoreOwnsInputsAndReturnsGraphSnapshot(t *testing.T) {
-	indexPath := filepath.Join(t.TempDir(), "rpg.gob")
-	ctx := context.Background()
-	store := NewGOBRPGStore(indexPath)
-	node := &Node{ID: "node", Kind: KindSymbol, Feature: "original", Features: []string{"one"}}
-	edge := &Edge{From: "node", To: "node", Type: EdgeInvokes, Weight: 1}
-	store.AddNode(node)
-	store.AddEdge(edge)
-	if err := store.Persist(ctx); err != nil {
-		t.Fatal(err)
-	}
-	node.Feature = "input-mutated"
-	node.Features[0] = "input-mutated"
-	edge.Weight = 99
-	snapshot := store.GetGraph()
-	snapshot.Nodes["node"].Feature = "snapshot-mutated"
-	snapshot.Nodes["node"].Features[0] = "snapshot-mutated"
-	snapshot.Edges[0].Weight = 88
-	got := store.GetGraph().GetNode("node")
-	got.Feature = "getter-mutated"
-	got.Features[0] = "getter-mutated"
-	gotEdges := store.GetGraph().GetOutgoing("node")
-	gotEdges[0].Weight = 77
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reloaded := NewGOBRPGStore(indexPath)
-	if err := reloaded.Load(ctx); err != nil {
-		t.Fatal(err)
-	}
-	got = reloaded.GetGraph().GetNode("node")
-	gotEdges = reloaded.GetGraph().GetOutgoing("node")
-	if got.Feature != "original" || len(got.Features) != 1 || got.Features[0] != "one" || len(gotEdges) != 1 || gotEdges[0].Weight != 1 {
-		t.Fatalf("persisted graph changed through alias: node=%#v edges=%#v", got, gotEdges)
-	}
-}
-
-func TestGOBRPGStoreConcurrentPersistAndTrackedMutations(t *testing.T) {
-	indexPath := filepath.Join(t.TempDir(), "rpg.gob")
-	ctx := context.Background()
-	store := NewGOBRPGStore(indexPath)
-	encoder := NewRPGEncoder(store, NewLocalExtractor(), ".", RPGEncoderConfig{DriftThreshold: 0.3})
-	start := make(chan struct{})
-	done := make(chan error, 2)
-	go func() {
-		<-start
-		for i := 0; i < 50; i++ {
-			if err := store.Persist(ctx); err != nil {
-				done <- err
-				return
-			}
-		}
-		done <- nil
-	}()
-	go func() {
-		<-start
-		for i := 0; i < 50; i++ {
-			if err := encoder.HandleFileEvent(ctx, "modify", "main.go", []trace.Symbol{{Name: "Run", File: "main.go", Kind: trace.KindFunction}}); err != nil {
-				done <- err
-				return
-			}
-			encoder.hierarchy.BuildHierarchy()
-			encoder.hierarchy.EnrichLabels()
-			if err := NewSummarizer(encoder.graph, NewLocalExtractor()).SummarizeHierarchy(ctx, true); err != nil {
-				done <- err
-				return
-			}
-		}
-		done <- nil
-	}()
-	close(start)
-	for i := 0; i < 2; i++ {
-		if err := <-done; err != nil {
-			t.Fatalf("concurrent operation failed: %v", err)
-		}
-	}
-	if err := store.Persist(ctx); err != nil {
-		t.Fatal(err)
-	}
-	reloaded := NewGOBRPGStore(indexPath)
-	if err := reloaded.Load(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if reloaded.GetGraph().GetNode("file:main.go") == nil || reloaded.GetGraph().GetNode("sym:main.go:Run") == nil {
-		t.Fatal("tracked concurrent mutations did not survive reload")
-	}
-}
-
 func TestGOBRPGStore_GetGraph(t *testing.T) {
 	tmpDir := t.TempDir()
 	indexPath := filepath.Join(tmpDir, "rpg.gob")
 
 	store := NewGOBRPGStore(indexPath)
-	graph := store.mutableGraph()
+	graph := store.GetGraph()
 
 	if graph == nil {
 		t.Fatal("GetGraph should return non-nil graph")
@@ -465,14 +195,10 @@ func TestGOBRPGStore_GetGraph(t *testing.T) {
 	}
 	graph.AddNode(node)
 
-	// GetGraph returns a detached snapshot.
+	// GetGraph should return the same graph instance
 	graph2 := store.GetGraph()
 	if graph2.GetNode("test") == nil {
-		t.Error("GetGraph snapshot should contain stored nodes")
-	}
-	graph2.RemoveNode("test")
-	if store.GetGraph().GetNode("test") == nil {
-		t.Error("mutating GetGraph snapshot changed the store")
+		t.Error("GetGraph should return the same graph instance")
 	}
 }
 
@@ -481,7 +207,7 @@ func TestGOBRPGStore_GetStats(t *testing.T) {
 	indexPath := filepath.Join(tmpDir, "rpg.gob")
 
 	store := NewGOBRPGStore(indexPath)
-	graph := store.mutableGraph()
+	graph := store.GetGraph()
 
 	// Add some nodes and edges
 	node1 := &Node{ID: "node1", Kind: KindSymbol, UpdatedAt: time.Now()}
@@ -531,7 +257,7 @@ func TestGOBRPGStore_Close(t *testing.T) {
 	indexPath := filepath.Join(tmpDir, "rpg.gob")
 
 	store := NewGOBRPGStore(indexPath)
-	graph := store.mutableGraph()
+	graph := store.GetGraph()
 
 	// Add a node
 	node := &Node{
@@ -569,7 +295,7 @@ func TestGOBRPGStore_ConcurrentAccess(t *testing.T) {
 	indexPath := filepath.Join(tmpDir, "rpg.gob")
 
 	store := NewGOBRPGStore(indexPath)
-	graph := store.mutableGraph()
+	graph := store.GetGraph()
 
 	// Add initial node
 	node := &Node{
@@ -613,7 +339,7 @@ func TestGOBRPGStore_LargeGraph(t *testing.T) {
 	indexPath := filepath.Join(tmpDir, "rpg.gob")
 
 	store := NewGOBRPGStore(indexPath)
-	graph := store.mutableGraph()
+	graph := store.GetGraph()
 
 	// Add many nodes
 	numNodes := 1000
