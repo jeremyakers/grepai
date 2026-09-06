@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -110,28 +111,29 @@ func (s *PostgresSymbolStore) importGOBSnapshot(ctx context.Context, conn *pgxpo
 	for file := range gobStore.fileIndex {
 		files = append(files, file)
 	}
+	sort.Strings(files)
 	refsByFile := migrationRefsByFile(gobStore)
+	symbolsByFile := migrationSymbolsByFile(gobStore)
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin GOB symbol migration: %w", err)
 	}
+	started := time.Now()
 	for start, batch := 0, 0; start < len(files); start, batch = start+migrationBatchSize, batch+1 {
 		end := min(start+migrationBatchSize, len(files))
+		batchFiles := make([]migrationFileRows, 0, end-start)
 		for _, file := range files[start:end] {
-			symbols, err := gobStore.GetSymbolsForFile(ctx, file)
-			if err != nil {
-				return rollbackMigration(tx, fmt.Errorf("failed to read GOB symbols for migration: %w", err))
-			}
-			version := gobStore.fileExtractorVersions[file]
-			if err := s.saveFileTx(ctx, tx, file, gobStore.fileContentHashes[file], &version, symbols, refsByFile[file]); err != nil {
-				return rollbackMigration(tx, fmt.Errorf("failed to import GOB symbol batch: %w", err))
-			}
+			batchFiles = append(batchFiles, migrationFileRows{filePath: file, contentHash: gobStore.fileContentHashes[file], extractorVersion: gobStore.fileExtractorVersions[file], symbols: symbolsByFile[file], refs: refsByFile[file], modTime: time.Now().UTC()})
+		}
+		if err := copyMigrationFileBatch(ctx, tx, s.projectID, batchFiles); err != nil {
+			return rollbackMigration(tx, fmt.Errorf("failed to import GOB symbol batch: %w", err))
 		}
 		if s.migrationBatchHook != nil {
 			if err := s.migrationBatchHook(batch); err != nil {
 				return rollbackMigration(tx, fmt.Errorf("GOB symbol migration batch hook failed: %w", err))
 			}
 		}
+		log.Printf("trace: Postgres symbol migration progress: %d/%d files, batch %d, elapsed %s", end, len(files), batch+1, time.Since(started).Round(time.Second))
 	}
 	if _, err := tx.Exec(ctx, `UPDATE symbol_migrations SET state='completed',source_digest=$2,source_size=$3,completed_at=NOW() WHERE project_id=$1`, identityBytes(s.projectID), fingerprint.digest, fingerprint.size); err != nil {
 		return rollbackMigration(tx, fmt.Errorf("failed to complete symbol migration marker: %w", err))

@@ -35,3 +35,13 @@ func migrationRefsByFile(store *GOBSymbolStore) map[string][]Reference {
 	}
 	return result
 }
+
+func migrationSymbolsByFile(store *GOBSymbolStore) map[string][]Symbol {
+	result := make(map[string][]Symbol, len(store.fileIndex))
+	for _, symbols := range store.index.Symbols {
+		for _, symbol := range symbols {
+			result[symbol.File] = append(result[symbol.File], symbol)
+		}
+	}
+	return result
+}

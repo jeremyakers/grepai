@@ -76,37 +76,8 @@ func (s *PostgresSymbolStore) saveFileTx(ctx context.Context, tx pgx.Tx, filePat
 	if err := s.deleteFileTx(ctx, tx, filePath); err != nil {
 		return err
 	}
-	if len(symbols) > 0 {
-		rows := make([][]any, 0, len(symbols))
-		for _, sym := range symbols {
-			rows = append(rows, []any{identityBytes(s.projectID), identityBytes(sym.Name), identityBytes(sym.File), sym.Line, sym.EndLine, sanUTF8(string(sym.Kind)), sanUTF8(sym.Signature), sanUTF8(sym.Receiver), sanUTF8(sym.Package), sym.Exported, sanUTF8(sym.Language), sanUTF8(sym.Docstring), sanUTF8(sym.FeaturePath)})
-		}
-		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"symbols"}, []string{"project_id", "name", "file", "line", "end_line", "kind", "signature", "receiver", "package_name", "exported", "language", "docstring", "feature_path"}, pgx.CopyFromRows(rows)); err != nil {
-			return fmt.Errorf("failed to insert symbols: %w", err)
-		}
-	}
-	refRows := make([][]any, 0, len(refs))
-	edgeRows := make([][]any, 0, len(refs))
-	for ordinal, ref := range refs {
-		refRows = append(refRows, []any{identityBytes(s.projectID), identityBytes(ref.SymbolName), identityBytes(ref.File), ref.Line, ref.Column, sanUTF8(ref.Kind), sanUTF8(ref.Context), identityBytes(ref.CallerName), identityBytes(ref.CallerFile), ref.CallerLine, ordinal})
-		if ref.CallerName != "" && ref.CallerName != "<top-level>" {
-			edgeRows = append(edgeRows, []any{identityBytes(s.projectID), identityBytes(ref.CallerName), identityBytes(ref.SymbolName), identityBytes(ref.File), ref.Line, "direct", ordinal})
-		}
-	}
-	if len(refRows) > 0 {
-		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"refs"}, []string{"project_id", "symbol_name", "file", "line", "col", "ref_type", "context", "caller", "caller_file", "caller_line", "ordinal"}, pgx.CopyFromRows(refRows)); err != nil {
-			return fmt.Errorf("failed to insert references: %w", err)
-		}
-	}
-	if len(edgeRows) > 0 {
-		if _, err := tx.CopyFrom(ctx, pgx.Identifier{"call_edges"}, []string{"project_id", "caller", "callee", "file", "line", "call_type", "ordinal"}, pgx.CopyFromRows(edgeRows)); err != nil {
-			return fmt.Errorf("failed to insert call edges: %w", err)
-		}
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO symbol_files (project_id,path,content_hash,extractor_version,mod_time) VALUES ($1,$2,$3,$4,$5)`, identityBytes(s.projectID), identityBytes(filePath), sanUTF8(contentHash), sanUTF8(version), time.Now().UTC()); err != nil {
-		return fmt.Errorf("failed to insert symbol file: %w", err)
-	}
-	return nil
+	rows := buildPostgresFileRows(s.projectID, filePath, contentHash, version, symbols, refs, time.Now().UTC())
+	return copyPostgresRows(ctx, tx, rows)
 }
 
 func identityBytes(s string) []byte { return []byte(s) }
