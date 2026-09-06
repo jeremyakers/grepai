@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sort"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func symbolSchemaQueries() []string {
@@ -28,6 +30,7 @@ func symbolSchemaQueries() []string {
 		`CREATE TABLE IF NOT EXISTS symbol_migrations (project_id BYTEA PRIMARY KEY, state TEXT NOT NULL, source_path BYTEA NOT NULL, source_digest BYTEA, source_size BIGINT, started_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ)`,
 		`ALTER TABLE symbol_migrations ADD COLUMN IF NOT EXISTS source_digest BYTEA`,
 		`ALTER TABLE symbol_migrations ADD COLUMN IF NOT EXISTS source_size BIGINT`,
+		`CREATE TABLE IF NOT EXISTS symbol_store_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
 	}
 }
 
@@ -42,10 +45,27 @@ func identityColumnMigration(table, column string) string {
 	return fmt.Sprintf(`DO $$ BEGIN IF (SELECT data_type FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='%s' AND column_name='%s') <> 'bytea' THEN ALTER TABLE %s ALTER COLUMN %s DROP DEFAULT; ALTER TABLE %s ALTER COLUMN %s TYPE BYTEA USING convert_to(%s, 'UTF8'); END IF; END $$`, table, column, table, column, table, column, column)
 }
 
-func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) error {
+type symbolSchemaExecutor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func runSymbolSchemaDDL(ctx context.Context, executor symbolSchemaExecutor, hook func(int, string) error) error {
+	queryIndex := 0
+	exec := func(query, description string) error {
+		if hook != nil {
+			if err := hook(queryIndex, query); err != nil {
+				return fmt.Errorf("injected symbol schema DDL failure: %w", err)
+			}
+		}
+		queryIndex++
+		if _, err := executor.Exec(ctx, query); err != nil {
+			return fmt.Errorf("failed to %s: %w", description, err)
+		}
+		return nil
+	}
 	for _, query := range symbolSchemaQueries() {
-		if _, err := s.pool.Exec(ctx, query); err != nil {
-			return fmt.Errorf("failed to execute symbol schema query: %w", err)
+		if err := exec(query, "execute symbol schema query"); err != nil {
+			return err
 		}
 	}
 	tables := make([]string, 0, len(identityColumns))
@@ -55,8 +75,8 @@ func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) error {
 	sort.Strings(tables)
 	for _, table := range tables {
 		for _, column := range identityColumns[table] {
-			if _, err := s.pool.Exec(ctx, identityColumnMigration(table, column)); err != nil {
-				return fmt.Errorf("failed to migrate symbol identity column: %w", err)
+			if err := exec(identityColumnMigration(table, column), "migrate symbol identity column"); err != nil {
+				return err
 			}
 		}
 	}
@@ -71,8 +91,8 @@ func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_call_edges_project_callee ON call_edges(project_id, callee)`,
 		`CREATE INDEX IF NOT EXISTS idx_call_edges_project_file ON call_edges(project_id, file)`,
 	} {
-		if _, err := s.pool.Exec(ctx, query); err != nil {
-			return fmt.Errorf("failed to execute symbol index schema query: %w", err)
+		if err := exec(query, "execute symbol index schema query"); err != nil {
+			return err
 		}
 	}
 	return nil

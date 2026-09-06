@@ -19,10 +19,19 @@ type PostgresSymbolStore struct {
 	projectRoot        string
 	migrationBatchHook func(int) error
 	mutationHook       func(string, string) error
+	schemaDDLHook      func(int, string) error
 }
 
 func NewPostgresSymbolStore(ctx context.Context, dsn, projectID, projectRoot string) (*PostgresSymbolStore, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	poolConfig, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure postgres: %w", err)
+	}
+	return newPostgresSymbolStoreWithPoolConfig(ctx, poolConfig, projectID, projectRoot)
+}
+
+func newPostgresSymbolStoreWithPoolConfig(ctx context.Context, poolConfig *pgxpool.Config, projectID, projectRoot string) (*PostgresSymbolStore, error) {
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
 	}

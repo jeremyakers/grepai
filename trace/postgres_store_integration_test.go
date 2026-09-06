@@ -12,9 +12,169 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yoanbernabeu/grepai/config"
 )
+
+var schemaIntegrationCounter atomic.Uint64
+
+func isolatedSymbolSchemaConfig(t *testing.T) *pgxpool.Config {
+	t.Helper()
+	dsn := os.Getenv("GREPAI_POSTGRES_TEST_DSN")
+	if dsn == "" {
+		t.Skip("GREPAI_POSTGRES_TEST_DSN is not set")
+	}
+	ctx := context.Background()
+	admin, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	schema := fmt.Sprintf("grepai_symbol_schema_%d", schemaIntegrationCounter.Add(1))
+	identifier := pgx.Identifier{schema}.Sanitize()
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA `+identifier); err != nil {
+		admin.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = admin.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+identifier+` CASCADE`)
+		admin.Close()
+	})
+	poolConfig, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if poolConfig.ConnConfig.RuntimeParams == nil {
+		poolConfig.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	poolConfig.ConnConfig.RuntimeParams["search_path"] = schema
+	return poolConfig
+}
+
+func newIsolatedSchemaStore(t *testing.T, poolConfig *pgxpool.Config) *PostgresSymbolStore {
+	t.Helper()
+	store, err := newPostgresSymbolStoreWithPoolConfig(context.Background(), poolConfig.Copy(), "schema-project", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	return store
+}
+
+func TestPostgresSymbolSchemaFreshInitialization(t *testing.T) {
+	store := newIsolatedSchemaStore(t, isolatedSymbolSchemaConfig(t))
+	var version int
+	if err := store.pool.QueryRow(context.Background(), symbolSchemaVersionQuery).Scan(&version); err != nil || version != currentSymbolSchemaVersion {
+		t.Fatalf("schema version = %d, %v", version, err)
+	}
+	for _, table := range []string{"symbol_store_meta", "symbol_files", "symbols", "refs", "call_edges", "symbol_migrations"} {
+		var exists bool
+		if err := store.pool.QueryRow(context.Background(), `SELECT to_regclass(current_schema()||'.'||$1) IS NOT NULL`, table).Scan(&exists); err != nil || !exists {
+			t.Fatalf("table %s exists=%v, err=%v", table, exists, err)
+		}
+	}
+}
+
+func TestPostgresSymbolSchemaCurrentVersionAvoidsDDLLocks(t *testing.T) {
+	poolConfig := isolatedSymbolSchemaConfig(t)
+	first := newIsolatedSchemaStore(t, poolConfig)
+	tx, err := first.pool.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(context.Background(), `LOCK TABLE symbols IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	second, err := newPostgresSymbolStoreWithPoolConfig(ctx, poolConfig.Copy(), "schema-project", t.TempDir())
+	if err != nil {
+		t.Fatalf("current-version constructor entered DDL path: %v", err)
+	}
+	second.Close()
+}
+
+func TestPostgresSymbolSchemaExistingTablesWithoutMarkerInitializeOnce(t *testing.T) {
+	poolConfig := isolatedSymbolSchemaConfig(t)
+	first := newIsolatedSchemaStore(t, poolConfig)
+	if _, err := first.pool.Exec(context.Background(), `DROP TABLE symbol_store_meta`); err != nil {
+		t.Fatal(err)
+	}
+	second := newIsolatedSchemaStore(t, poolConfig)
+	var version int
+	if err := second.pool.QueryRow(context.Background(), symbolSchemaVersionQuery).Scan(&version); err != nil || version != currentSymbolSchemaVersion {
+		t.Fatalf("existing schema marker = %d, %v", version, err)
+	}
+}
+
+func TestPostgresSymbolSchemaStaleVersionUpgradesLast(t *testing.T) {
+	store := newIsolatedSchemaStore(t, isolatedSymbolSchemaConfig(t))
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE symbol_store_meta SET value=0 WHERE key='schema_version'`); err != nil {
+		t.Fatal(err)
+	}
+	hookCalls := 0
+	store.schemaDDLHook = func(_ int, _ string) error {
+		hookCalls++
+		var version int
+		if err := store.pool.QueryRow(ctx, symbolSchemaVersionQuery).Scan(&version); err != nil || version != 0 {
+			return fmt.Errorf("schema marker advanced before DDL completed: %d, %v", version, err)
+		}
+		return nil
+	}
+	if err := store.ensureSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	store.schemaDDLHook = nil
+	var version int
+	if err := store.pool.QueryRow(ctx, symbolSchemaVersionQuery).Scan(&version); err != nil || version != currentSymbolSchemaVersion || hookCalls == 0 {
+		t.Fatalf("version=%d hookCalls=%d err=%v", version, hookCalls, err)
+	}
+}
+
+func TestPostgresSymbolSchemaConcurrentFirstConstructors(t *testing.T) {
+	poolConfig := isolatedSymbolSchemaConfig(t)
+	roots := []string{t.TempDir(), t.TempDir()}
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for i := range 2 {
+		wg.Add(1)
+		go func(root string) {
+			defer wg.Done()
+			store, err := newPostgresSymbolStoreWithPoolConfig(context.Background(), poolConfig.Copy(), "schema-project", root)
+			if store != nil {
+				store.Close()
+			}
+			errs <- err
+		}(roots[i])
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestPostgresSymbolSchemaDDLFailureDoesNotAdvanceVersion(t *testing.T) {
+	store := newIsolatedSchemaStore(t, isolatedSymbolSchemaConfig(t))
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE symbol_store_meta SET value=0 WHERE key='schema_version'`); err != nil {
+		t.Fatal(err)
+	}
+	store.schemaDDLHook = func(int, string) error { return errors.New("injected DDL failure") }
+	if err := store.ensureSchema(ctx); err == nil {
+		t.Fatal("expected DDL failure")
+	}
+	var version int
+	if err := store.pool.QueryRow(ctx, symbolSchemaVersionQuery).Scan(&version); err != nil || version != 0 {
+		t.Fatalf("failed DDL advanced marker to %d: %v", version, err)
+	}
+}
 
 func newIntegrationSymbolStore(t *testing.T, projectID, projectRoot string) *PostgresSymbolStore {
 	t.Helper()
