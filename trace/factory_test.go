@@ -178,3 +178,19 @@ func TestMigrationRefsByFileReconstructsOriginalOrder(t *testing.T) {
 		t.Fatalf("migration ref order = %#v, want %#v", got, refs)
 	}
 }
+
+func TestMigrationRefsByFileIncludesTopLevelAndSymbolsByFile(t *testing.T) {
+	store := NewGOBSymbolStore("unused")
+	refs := []Reference{{SymbolName: "Top", File: "a.go", CallerName: "<top-level>"}}
+	symbols := []Symbol{{Name: "A", File: "a.go"}, {Name: "B", File: "b.go"}}
+	if err := store.SaveFile(context.Background(), "a.go", symbols, refs); err != nil {
+		t.Fatal(err)
+	}
+	if got := migrationRefsByFile(store)["a.go"]; !reflect.DeepEqual(got, refs) {
+		t.Fatalf("top-level refs = %#v", got)
+	}
+	grouped := migrationSymbolsByFile(store)
+	if len(grouped["a.go"]) != 1 || len(grouped["b.go"]) != 1 {
+		t.Fatalf("symbols by file = %#v", grouped)
+	}
+}

@@ -36,3 +36,11 @@ func TestReadSymbolStatusClosesStoreOnStatsFailure(t *testing.T) {
 		t.Fatalf("ready=%v total=%d closes=%d", ready, total, store.closes)
 	}
 }
+
+func TestReadSymbolStatusReturnsReadyAndClosesOnSuccess(t *testing.T) {
+	store := &closeCountingSymbolStore{}
+	ready, total := readAndCloseSymbolStatus(context.Background(), store)
+	if !ready || total != 3 || store.closes != 1 {
+		t.Fatalf("ready=%v total=%d closes=%d", ready, total, store.closes)
+	}
+}

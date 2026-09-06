@@ -217,8 +217,11 @@ func TestPostgresSymbolStoreRoundTrip(t *testing.T) {
 	if err := store.SaveFileWithSignature(ctx, "b.go", "hash-b", "extractor-v1", []Symbol{{Name: "B", Kind: KindFunction, File: "b.go", Line: 1}}, []Reference{{SymbolName: "C", Kind: RefKindCall, File: "b.go", Line: 3, CallerName: "B", CallerFile: "b.go", CallerLine: 1}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.SaveFile(ctx, "c.go", []Symbol{{Name: "C", Kind: KindFunction, File: "c.go", Line: 1}}, nil); err != nil {
+	if err := store.SaveFile(ctx, "c.go", []Symbol{{Name: "C", Kind: KindFunction, File: "c.go", Line: 1}}, []Reference{{SymbolName: "A", Kind: RefKindCall, File: "c.go", Line: 3, CallerName: "C", CallerFile: "c.go", CallerLine: 1}}); err != nil {
 		t.Fatal(err)
+	}
+	if err := store.Load(ctx); err != nil {
+		t.Fatalf("reload of active Postgres store failed: %v", err)
 	}
 
 	if got, _ := store.LookupSymbol(ctx, "A"); len(got) != 1 || got[0].Signature != "func A()" {
@@ -258,9 +261,10 @@ func TestPostgresSymbolStoreRoundTrip(t *testing.T) {
 	}
 	// GOBSymbolStore builds call-graph edges from every ref with a CallerName,
 	// including read/write refs (it does not filter by ref kind), so the
-	// faithful result here is 3 nodes and 3 edges: A->B, A->value (a read
-	// ref), B->C. Postgres must match that behavior exactly.
-	if len(graph.Nodes) != 3 || len(graph.Edges) != 3 {
+	// faithful result here is 3 nodes and 4 edges: A->B, A->value (a read
+	// ref), B->C, C->A. Postgres must match that behavior exactly and stop
+	// traversal at the visited A node.
+	if len(graph.Nodes) != 3 || len(graph.Edges) != 4 {
 		t.Fatalf("GetCallGraph nodes=%v edges=%v", graph.Nodes, graph.Edges)
 	}
 	if hash, ok := store.GetFileContentHash("a.go"); !ok || hash != "hash-a" {
@@ -301,7 +305,7 @@ func TestPostgresSymbolStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	// bad.go (from the UTF-8 case above) contributes no symbols, 1 ref, 1 file.
-	if stats.TotalFiles != 3 || stats.TotalSymbols != 2 || stats.TotalReferences != 2 {
+	if stats.TotalFiles != 3 || stats.TotalSymbols != 2 || stats.TotalReferences != 3 {
 		t.Fatalf("stats = %#v", stats)
 	}
 	if stats.IndexSize <= 0 {
