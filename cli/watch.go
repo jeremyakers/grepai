@@ -1040,10 +1040,10 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 	if err != nil {
 		return err
 	}
-	if err := symbolStore.Load(ctx); err != nil {
-		log.Printf("Warning: failed to load symbol index for %s: %v", projectRoot, err)
-	}
 	defer symbolStore.Close()
+	if err := runAfterWatcherSymbolLoad(ctx, cfg.Trace.StoreBackend, projectRoot, symbolStore, nil); err != nil {
+		return err
+	}
 
 	extractor := trace.NewRegexExtractor()
 
@@ -2826,18 +2826,18 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := symbolStore.Load(ctx); err != nil {
-		log.Printf("Warning: failed to load symbol index for %s: %v", project.Path, err)
-	}
-
 	tracedLanguages := projectCfg.Trace.EnabledLanguages
 	if len(tracedLanguages) == 0 {
 		tracedLanguages = config.DefaultConfig().Trace.EnabledLanguages
 	}
 
-	stats, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, projectCfg.Watch.LastIndexTime, isBackgroundChild, nil, nil, processorRegistry)
+	var stats *indexer.IndexStats
+	err = initializeWorkspaceSymbolStore(ctx, projectCfg.Trace.StoreBackend, project.Path, symbolStore, func() error {
+		var scanErr error
+		stats, scanErr = runInitialScan(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, projectCfg.Watch.LastIndexTime, isBackgroundChild, nil, nil, processorRegistry)
+		return scanErr
+	})
 	if err != nil {
-		_ = symbolStore.Close()
 		return nil, nil, err
 	}
 	if stats.FilesIndexed > 0 || stats.ChunksCreated > 0 {

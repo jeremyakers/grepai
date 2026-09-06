@@ -1916,14 +1916,7 @@ func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequ
 			}
 			ss, loadErr := trace.NewSymbolStoreWithWorkspace(ctx, projectCfg, p.Path, &ws.Store)
 			if loadErr == nil {
-				loadErr = ss.Load(ctx)
-			}
-			if loadErr == nil {
-				if symbolStats, statsErr := ss.GetStats(ctx); statsErr == nil && symbolStats.TotalSymbols > 0 {
-					ps.SymbolsReady = true
-					ps.TotalSymbols = symbolStats.TotalSymbols
-				}
-				ss.Close()
+				ps.SymbolsReady, ps.TotalSymbols = readAndCloseSymbolStatus(ctx, ss)
 			}
 			wsStatus.Projects = append(wsStatus.Projects, ps)
 		}
@@ -1963,13 +1956,7 @@ func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequ
 	symbolStore, symbolStoreErr := trace.NewSymbolStore(ctx, cfg, s.projectRoot)
 	symbolsReady := false
 	if symbolStoreErr == nil {
-		symbolStoreErr = symbolStore.Load(ctx)
-	}
-	if symbolStoreErr == nil {
-		if symbolStats, err := symbolStore.GetStats(ctx); err == nil && symbolStats.TotalSymbols > 0 {
-			symbolsReady = true
-		}
-		symbolStore.Close()
+		symbolsReady, _ = readAndCloseSymbolStatus(ctx, symbolStore)
 	}
 
 	status := IndexStatus{
