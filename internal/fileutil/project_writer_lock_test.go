@@ -101,11 +101,18 @@ func TestProjectWriterLockReleasePermitsReacquisition(t *testing.T) {
 }
 
 func TestProjectWriterLockCanonicalizesRelativeAndSymlinkPaths(t *testing.T) {
-	projectRoot := t.TempDir()
 	cwd, err := os.Getwd()
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Keep the relative-path fixture on the checkout's volume. Windows CI uses
+	// C: for t.TempDir and D: for the checkout, and filepath.Rel cannot span
+	// drive letters.
+	projectRoot, err := os.MkdirTemp(cwd, ".writer-lock-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(projectRoot)
 	relativeRoot, err := filepath.Rel(cwd, projectRoot)
 	if err != nil {
 		t.Fatal(err)
