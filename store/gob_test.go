@@ -256,6 +256,106 @@ func TestGOBStore_DeleteByFileWithoutChunksDoesNotRewrite(t *testing.T) {
 	}
 }
 
+func TestGOBStore_DeleteDocumentMarksDirty(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "index.gob")
+	ctx := context.Background()
+	seed := NewGOBStore(indexPath)
+	if err := seed.SaveDocument(ctx, Document{Path: "main.go", Hash: "hash"}); err != nil {
+		t.Fatalf("SaveDocument failed: %v", err)
+	}
+	if err := seed.Persist(ctx); err != nil {
+		t.Fatalf("seed Persist failed: %v", err)
+	}
+
+	store := NewGOBStore(indexPath)
+	if err := store.Load(ctx); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if err := store.DeleteDocument(ctx, "main.go"); err != nil {
+		t.Fatalf("DeleteDocument failed: %v", err)
+	}
+	if err := store.Persist(ctx); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+	reloaded := NewGOBStore(indexPath)
+	if err := reloaded.Load(ctx); err != nil {
+		t.Fatalf("reload failed: %v", err)
+	}
+	doc, err := reloaded.GetDocument(ctx, "main.go")
+	if err != nil {
+		t.Fatalf("GetDocument failed: %v", err)
+	}
+	if doc != nil {
+		t.Fatalf("deleted document survived persist: %#v", doc)
+	}
+}
+
+func TestGOBStore_LoadFallsBackWhenLockFileCannotOpen(t *testing.T) {
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "index.gob")
+	ctx := context.Background()
+	seed := NewGOBStore(indexPath)
+	if err := seed.SaveDocument(ctx, Document{Path: "main.go", Hash: "hash"}); err != nil {
+		t.Fatalf("SaveDocument failed: %v", err)
+	}
+	if err := seed.Persist(ctx); err != nil {
+		t.Fatalf("seed Persist failed: %v", err)
+	}
+
+	store := NewGOBStore(indexPath)
+	store.lockPath = dir // OpenFile(O_RDWR) on a directory fails; Load must use its fallback.
+	if err := store.Load(ctx); err != nil {
+		t.Fatalf("fallback Load failed: %v", err)
+	}
+	doc, err := store.GetDocument(ctx, "main.go")
+	if err != nil || doc == nil || doc.Hash != "hash" {
+		t.Fatalf("fallback Load document = %#v, %v", doc, err)
+	}
+}
+
+func TestGOBStore_LoadUnreadableIndexReturnsError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX directory permissions required")
+	}
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "index.gob")
+	if err := os.WriteFile(indexPath, []byte("index"), 0o600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatalf("Chmod failed: %v", err)
+	}
+	defer os.Chmod(dir, 0o700)
+
+	store := NewGOBStore(indexPath)
+	if err := store.Load(context.Background()); err == nil {
+		t.Fatal("Load succeeded for unreadable index")
+	}
+}
+
+func TestGOBStore_LoadCorruptIndexInReadOnlyDirReturnsError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX directory permissions required")
+	}
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "index.gob")
+	if err := os.WriteFile(indexPath, []byte("not gob"), 0o600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if err := os.WriteFile(indexPath+".lock", nil, 0o600); err != nil {
+		t.Fatalf("lock WriteFile failed: %v", err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("Chmod failed: %v", err)
+	}
+	defer os.Chmod(dir, 0o700)
+
+	store := NewGOBStore(indexPath)
+	if err := store.Load(context.Background()); err == nil {
+		t.Fatal("Load succeeded when corrupt index could not be quarantined")
+	}
+}
+
 func TestGOBStore_DirtyPersistWritesOnce(t *testing.T) {
 	indexPath := filepath.Join(t.TempDir(), "index.gob")
 	store := NewGOBStore(indexPath)

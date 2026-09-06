@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -390,6 +391,60 @@ func TestGOBSymbolStore_SaveFileWithSignaturePersistsBothFingerprints(t *testing
 	version, versionOK := reloaded.GetFileExtractorVersion("main.go")
 	if !hashOK || hash != "hash" || !versionOK || version != "extractor-v1" {
 		t.Fatalf("fingerprints = hash(%q,%v) version(%q,%v)", hash, hashOK, version, versionOK)
+	}
+}
+
+func TestGOBSymbolStore_LoadFallsBackWhenLockFileCannotOpen(t *testing.T) {
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "symbols.gob")
+	ctx := context.Background()
+	seed := NewGOBSymbolStore(indexPath)
+	if err := seed.SaveFile(ctx, "main.go", []Symbol{{Name: "main", File: "main.go"}}, nil); err != nil {
+		t.Fatalf("SaveFile failed: %v", err)
+	}
+	if err := seed.Persist(ctx); err != nil {
+		t.Fatalf("seed Persist failed: %v", err)
+	}
+
+	store := NewGOBSymbolStore(indexPath)
+	store.lockPath = dir // OpenFile(O_RDWR) on a directory fails; Load must use its fallback.
+	if err := store.Load(ctx); err != nil {
+		t.Fatalf("fallback Load failed: %v", err)
+	}
+	symbols, err := store.LookupSymbol(ctx, "main")
+	if err != nil || len(symbols) != 1 || symbols[0].File != "main.go" {
+		t.Fatalf("fallback Load symbols = %#v, %v", symbols, err)
+	}
+}
+
+func TestGOBSymbolStore_LoadUnreadableIndexReturnsError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX directory permissions required")
+	}
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "symbols.gob")
+	if err := os.WriteFile(indexPath, []byte("symbols"), 0o600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatalf("Chmod failed: %v", err)
+	}
+	defer os.Chmod(dir, 0o700)
+
+	store := NewGOBSymbolStore(indexPath)
+	if err := store.Load(context.Background()); err == nil {
+		t.Fatal("Load succeeded for unreadable symbol index")
+	}
+}
+
+func TestGOBSymbolStore_LoadCorruptIndexReturnsError(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	if err := os.WriteFile(indexPath, []byte("not gob"), 0o600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	store := NewGOBSymbolStore(indexPath)
+	if err := store.Load(context.Background()); err == nil {
+		t.Fatal("Load succeeded for corrupt symbol index")
 	}
 }
 
