@@ -37,8 +37,7 @@ func TestIndexStatusHandlerProjectReportsSymbolReadiness(t *testing.T) {
 
 func TestIndexStatusHandlerWorkspaceReportsEachProject(t *testing.T) {
 	// Given an isolated workspace with two configured symbol projects.
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := isolateMCPTestHome(t)
 	projects := make([]config.ProjectEntry, 0, 2)
 	for _, name := range []string{"one", "two"} {
 		root := filepath.Join(home, name)

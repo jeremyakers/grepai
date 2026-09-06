@@ -17,12 +17,11 @@ type failingWatchSymbolStore struct {
 func (s *failingWatchSymbolStore) Load(context.Context) error { return s.loadErr }
 func (s *failingWatchSymbolStore) Close() error               { s.closes++; return nil }
 
-func TestSingleProjectPostgresSymbolLoadStopsBeforeScan(t *testing.T) {
+func TestPostgresLoadPolicyStopsCallbackBeforeScan(t *testing.T) {
 	store := &failingWatchSymbolStore{loadErr: errors.New("migration failed")}
 	scans := 0
 	err := runAfterWatcherSymbolLoad(context.Background(), "postgres", "project", store, func() error { scans++; return nil })
-	_ = store.Close() // models the immediately-installed single-project defer
-	if err == nil || scans != 0 || store.closes != 1 {
+	if err == nil || scans != 0 || store.closes != 0 {
 		t.Fatalf("err=%v scans=%d closes=%d", err, scans, store.closes)
 	}
 }

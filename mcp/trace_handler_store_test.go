@@ -42,6 +42,22 @@ func traceHandlerRequest(arguments map[string]any) mark3.CallToolRequest {
 	return mark3.CallToolRequest{Params: mark3.CallToolParams{Arguments: arguments}}
 }
 
+func isolateMCPTestHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	workspacePath, err := config.GetWorkspaceConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(home, workspacePath)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		t.Fatalf("workspace config escaped isolated home: home=%q path=%q rel=%q err=%v", home, workspacePath, relative, err)
+	}
+	return home
+}
+
 func TestTraceHandlersProjectUseBatchAndFallback(t *testing.T) {
 	// Given a real project symbol index.
 	root := t.TempDir()
@@ -67,8 +83,7 @@ func TestTraceHandlersProjectUseBatchAndFallback(t *testing.T) {
 
 func TestTraceHandlersWorkspacePreserveOriginatingProject(t *testing.T) {
 	// Given a workspace with duplicate symbol names in two projects.
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := isolateMCPTestHome(t)
 	projects := make([]config.ProjectEntry, 0, 2)
 	for _, name := range []string{"one", "two"} {
 		root := filepath.Join(home, name)
@@ -103,20 +118,70 @@ func TestTraceHandlersWorkspacePreserveOriginatingProject(t *testing.T) {
 	}
 }
 
-func TestTraceHandlersValidateRequiredArgumentsAndFormat(t *testing.T) {
+func TestTraceCallersRequiresSymbol(t *testing.T) {
 	server := &Server{}
-	for _, run := range []func() (*mark3.CallToolResult, error){
-		func() (*mark3.CallToolResult, error) {
-			return server.handleTraceCallers(context.Background(), traceHandlerRequest(map[string]any{}))
-		},
-		func() (*mark3.CallToolResult, error) {
-			return server.handleTraceCallees(context.Background(), traceHandlerRequest(map[string]any{"symbol": "Target", "format": "xml"}))
-		},
-	} {
-		result, err := run()
-		if err != nil || !strings.Contains(strings.ToLower(textResultPayload(t, result)), "required") && !strings.Contains(textResultPayload(t, result), "format") {
-			t.Fatalf("expected handler validation error, result=%v err=%v", result, err)
-		}
+	result, err := server.handleTraceCallers(context.Background(), traceHandlerRequest(map[string]any{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := textResultPayload(t, result); got != "symbol parameter is required" {
+		t.Fatalf("missing-symbol error = %q", got)
+	}
+}
+
+func TestTraceCalleesRejectsUnsupportedFormat(t *testing.T) {
+	server := &Server{}
+	result, err := server.handleTraceCallees(context.Background(), traceHandlerRequest(map[string]any{"symbol": "Target", "format": "xml"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := textResultPayload(t, result); got != "format must be 'json' or 'toon'" {
+		t.Fatalf("unsupported-format error = %q", got)
+	}
+}
+
+type countingBatchSymbolStore struct {
+	trace.SymbolStore
+	symbols     map[string][]trace.Symbol
+	batchCalls  int
+	lookupCalls int
+	batchNames  []string
+}
+
+func (s *countingBatchSymbolStore) LookupSymbolsBatch(_ context.Context, names []string) (map[string][]trace.Symbol, error) {
+	s.batchCalls++
+	s.batchNames = append([]string(nil), names...)
+	return s.symbols, nil
+}
+
+func (s *countingBatchSymbolStore) LookupSymbol(context.Context, string) ([]trace.Symbol, error) {
+	s.lookupCalls++
+	return nil, nil
+}
+
+func TestLookupSymbolsByOriginBatchesOncePerStoreWithoutPointLookups(t *testing.T) {
+	one := &countingBatchSymbolStore{symbols: map[string][]trace.Symbol{"Shared": {{Name: "Shared", File: "one.go"}}}}
+	two := &countingBatchSymbolStore{symbols: map[string][]trace.Symbol{"Shared": {{Name: "Shared", File: "two.go"}}}}
+	refs := []storeReference{
+		{ref: trace.Reference{CallerName: "Shared", CallerFile: "one.go"}, storeIndex: 0},
+		{ref: trace.Reference{CallerName: "Shared", CallerFile: "one.go"}, storeIndex: 0},
+		{ref: trace.Reference{CallerName: "Missing", CallerFile: "missing.go", CallerLine: 9}, storeIndex: 0},
+		{ref: trace.Reference{CallerName: "Shared", CallerFile: "two.go"}, storeIndex: 1},
+	}
+
+	resolved := lookupSymbolsByOrigin(context.Background(), []trace.SymbolStore{one, two}, refs, true, "caller")
+
+	if one.batchCalls != 1 || two.batchCalls != 1 || one.lookupCalls != 0 || two.lookupCalls != 0 {
+		t.Fatalf("calls: one batch/lookup=%d/%d two=%d/%d", one.batchCalls, one.lookupCalls, two.batchCalls, two.lookupCalls)
+	}
+	if len(one.batchNames) != 2 || len(two.batchNames) != 1 {
+		t.Fatalf("batch names were not unique: one=%v two=%v", one.batchNames, two.batchNames)
+	}
+	if got := resolveRefCallerSymbol(resolved[1], refs[3].ref); got.File != "two.go" {
+		t.Fatalf("originating store resolution = %#v", got)
+	}
+	if got := resolveRefCallerSymbol(resolved[0], refs[2].ref); got.Name != "Missing" || got.File != "missing.go" || got.Line != 9 {
+		t.Fatalf("missing-symbol fallback = %#v", got)
 	}
 }
 

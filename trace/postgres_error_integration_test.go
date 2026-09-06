@@ -81,6 +81,10 @@ func TestPostgresMigrationRejectsCorruptGOBWithoutMutation(t *testing.T) {
 	if err := store.pool.QueryRow(context.Background(), `SELECT (SELECT COUNT(*) FROM symbols WHERE project_id=$1)+(SELECT COUNT(*) FROM refs WHERE project_id=$1)+(SELECT COUNT(*) FROM call_edges WHERE project_id=$1)+(SELECT COUNT(*) FROM symbol_files WHERE project_id=$1)`, identityBytes(store.projectID)).Scan(&rows); err != nil || rows != 0 {
 		t.Fatalf("corrupt migration rows=%d err=%v", rows, err)
 	}
+	var markerRows int
+	if err := store.pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM symbol_migrations WHERE project_id=$1 AND state IN ('migrating','completed')`, identityBytes(store.projectID)).Scan(&markerRows); err != nil || markerRows != 0 {
+		t.Fatalf("corrupt migration marker rows=%d err=%v", markerRows, err)
+	}
 }
 
 func TestPostgresCanceledContextOperationsReturnErrors(t *testing.T) {
