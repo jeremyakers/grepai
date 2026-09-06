@@ -19,7 +19,11 @@ func advisoryKey(namespace string, values ...string) (int32, int32) {
 		_, _ = hash.Write([]byte(value))
 	}
 	digest := hash.Sum(nil)
-	return int32(binary.BigEndian.Uint32(digest[:4])), int32(binary.BigEndian.Uint32(digest[4:8]))
+	return advisoryKeyPart(digest[:4]), advisoryKeyPart(digest[4:8])
+}
+
+func advisoryKeyPart(value []byte) int32 {
+	return int32(value[0])<<24 | int32(value[1])<<16 | int32(value[2])<<8 | int32(value[3])
 }
 
 func migrationAdvisoryKey(projectID string) (int32, int32) {

@@ -2,6 +2,7 @@ package trace
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -45,12 +46,18 @@ func (s *PostgresSymbolStore) SaveFileWithSignature(ctx context.Context, filePat
 	return s.saveFile(ctx, filePath, contentHash, &extractorVersion, symbols, refs)
 }
 
-func (s *PostgresSymbolStore) saveFile(ctx context.Context, filePath, contentHash string, extractorVersion *string, symbols []Symbol, refs []Reference) error {
+func (s *PostgresSymbolStore) saveFile(ctx context.Context, filePath, contentHash string, extractorVersion *string, symbols []Symbol, refs []Reference) (retErr error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin symbol file transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			retErr = errors.Join(retErr, fmt.Errorf("failed to rollback symbol file transaction: %w", rollbackErr))
+		}
+	}()
 	if err := s.lockFileMutation(ctx, tx, "save", filePath); err != nil {
 		return err
 	}
@@ -90,12 +97,18 @@ func sanUTF8(s string) string {
 	return strings.ToValidUTF8(s, "�")
 }
 
-func (s *PostgresSymbolStore) DeleteFile(ctx context.Context, filePath string) error {
+func (s *PostgresSymbolStore) DeleteFile(ctx context.Context, filePath string) (retErr error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin delete transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			retErr = errors.Join(retErr, fmt.Errorf("failed to rollback delete transaction: %w", rollbackErr))
+		}
+	}()
 	if err := s.lockFileMutation(ctx, tx, "delete", filePath); err != nil {
 		return err
 	}

@@ -116,6 +116,26 @@ func TestMigrationAdvisoryKeyIsStableAndProjectScoped(t *testing.T) {
 	}
 }
 
+func TestAdvisoryKeyPartPreservesSignedBitPattern(t *testing.T) {
+	tests := []struct {
+		name  string
+		value []byte
+		want  int32
+	}{
+		{name: "positive one", value: []byte{0, 0, 0, 1}, want: 1},
+		{name: "maximum positive", value: []byte{0x7f, 0xff, 0xff, 0xff}, want: 2147483647},
+		{name: "minimum negative", value: []byte{0x80, 0, 0, 0}, want: -2147483648},
+		{name: "negative one", value: []byte{0xff, 0xff, 0xff, 0xff}, want: -1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := advisoryKeyPart(test.value); got != test.want {
+				t.Fatalf("advisoryKeyPart(%x) = %d, want %d", test.value, got, test.want)
+			}
+		})
+	}
+}
+
 func TestSymbolSchemaUsesLosslessIdentityColumnsAndMigrationState(t *testing.T) {
 	schema := strings.Join(symbolSchemaQueries(), "\n")
 	for _, required := range []string{
