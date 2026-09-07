@@ -65,6 +65,9 @@ func (w *Watcher) handleEvent(event fsnotify.Event) error {
 	if err != nil {
 		return &FatalError{Operation: "resolve filesystem event path", Path: event.Name, Cause: err}
 	}
+	if relPath == "." && (event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename)) {
+		return &FatalError{Operation: "watch root", Path: w.root, Cause: errWatchRootLost}
+	}
 
 	if strings.HasPrefix(filepath.Base(relPath), ".") || w.ignore.ShouldIgnore(relPath) {
 		return nil
