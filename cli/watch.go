@@ -1484,10 +1484,19 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 	if cfg.discoverWorktrees == nil {
 		cfg.discoverWorktrees = discoverWorktreesForWatch
 	}
-	if cfg.fatalObserver != nil {
-		observer := cfg.fatalObserver
-		var fatalOnce sync.Once
-		cfg.fatalObserver = func() { fatalOnce.Do(observer) }
+	var readinessMu sync.Mutex
+	fatalObserved := false
+	fatalObserver := cfg.fatalObserver
+	var fatalOnce sync.Once
+	cfg.fatalObserver = func() {
+		fatalOnce.Do(func() {
+			readinessMu.Lock()
+			defer readinessMu.Unlock()
+			fatalObserved = true
+			if fatalObserver != nil {
+				fatalObserver()
+			}
+		})
 	}
 	if cfg.sessionRunner == nil {
 		cfg.sessionRunner = func(
@@ -1559,6 +1568,11 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 				return nil
 			}
 		}
+		readinessMu.Lock()
+		defer readinessMu.Unlock()
+		if fatalObserved {
+			return nil
+		}
 		if err := cfg.initialReadyObserver(len(initialRoots)); err != nil {
 			return &watcher.FatalError{Operation: "publish daemon readiness", Path: mainRoot, Cause: err}
 		}
@@ -1620,6 +1634,9 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 				cfg.activityObserver,
 				cfg.statsObserver,
 			)
+			if isFatalWatcherError(err) {
+				cfg.fatalObserver()
+			}
 			sessionResults <- watchSessionResult{
 				projectRoot: project,
 				generation:  generation,
