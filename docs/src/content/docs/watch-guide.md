@@ -194,6 +194,7 @@ Use 'grepai watch --stop' to stop the watcher
 ```
 
 The daemon waits for full initialization (embedder connection, initial scan) before returning success.
+It only reports ready after every required filesystem watch is registered. If registration fails at startup or while adding a newly created directory, the watcher persists its indexes and exits instead of continuing with partial coverage. Workspace mode applies the same rule to every project: one fatal watcher error stops the workspace watcher.
 
 #### Checking Status
 
@@ -297,6 +298,8 @@ sudo sysctl fs.inotify.max_user_watches=524288
 # Increase permanently
 echo "fs.inotify.max_user_watches=524288" | sudo tee -a /etc/sysctl.conf
 ```
+
+If the watcher reports `no space left on device` (`ENOSPC`) while registering a directory, this refers to the per-user inotify watch quota, **not filesystem disk space**. The quota is shared by all processes owned by the user, so another editor, language server, or watcher can exhaust it after grepai starts. Increase `fs.inotify.max_user_watches` or stop unnecessary watcher processes, then restart `grepai watch`.
 
 ### Use Cases
 

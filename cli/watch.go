@@ -688,7 +688,7 @@ func startRPGRealtimeWorkers(ctx context.Context, projectLabel string, symbolSto
 }
 
 //nolint:unused // Retained for upcoming watch-loop refactor across fg/bg modes.
-func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore *trace.GOBSymbolStore, w *watcher.Watcher, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, tracedLanguages []string, projectRoot string, cfg *config.Config, isBackgroundChild bool, processors ...*framework.ProcessorRegistry) error {
+func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore *trace.GOBSymbolStore, w watchSource, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, tracedLanguages []string, projectRoot string, cfg *config.Config, isBackgroundChild bool, processors ...*framework.ProcessorRegistry) error {
 	// Handle signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -743,6 +743,10 @@ func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore *trace.
 
 		case event := <-w.Events():
 			handleFileEvent(ctx, idx, scanner, extractor, symbolStore, nil, nil, tracedLanguages, projectRoot, cfg, &lastConfigWrite, nil, event, nil, nil, processors...)
+
+		case err := <-w.Errors():
+			_ = persistAndExit()
+			return fmt.Errorf("filesystem watcher failed for %s: %w", projectRoot, err)
 		}
 	}
 }
@@ -1169,9 +1173,10 @@ func emitInitialStatsSnapshot(ctx context.Context, vectorStore store.VectorStore
 	}
 }
 
-func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore *trace.GOBSymbolStore, w *watcher.Watcher, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, rpgEncoder *rpg.RPGEncoder, rpgStore rpg.RPGStore, tracedLanguages []string, projectRoot string, cfg *config.Config, onEvent watchEventObserver, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) error {
+func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore *trace.GOBSymbolStore, w watchSource, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, rpgEncoder *rpg.RPGEncoder, rpgStore rpg.RPGStore, tracedLanguages []string, projectRoot string, cfg *config.Config, onEvent watchEventObserver, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) error {
 	persistTicker := time.NewTicker(30 * time.Second)
 	defer persistTicker.Stop()
+	defer w.Close()
 
 	var lastConfigWrite time.Time
 	var rpgManager *rpgRealtimeManager
@@ -1214,6 +1219,20 @@ func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore 
 				onEvent(projectRoot, event)
 			}
 			handleFileEvent(ctx, idx, scanner, extractor, symbolStore, rpgEncoder, st, tracedLanguages, projectRoot, cfg, &lastConfigWrite, rpgManager, event, onActivity, onStats, processors...)
+
+		case err := <-w.Errors():
+			if persistErr := st.Persist(ctx); persistErr != nil {
+				log.Printf("Warning: failed to persist index on watcher failure for %s: %v", projectRoot, persistErr)
+			}
+			if persistErr := symbolStore.Persist(ctx); persistErr != nil {
+				log.Printf("Warning: failed to persist symbol index on watcher failure for %s: %v", projectRoot, persistErr)
+			}
+			if rpgStore != nil {
+				if persistErr := rpgStore.Persist(ctx); persistErr != nil {
+					log.Printf("Warning: failed to persist RPG graph on watcher failure for %s: %v", projectRoot, persistErr)
+				}
+			}
+			return fmt.Errorf("filesystem watcher failed for %s: %w", projectRoot, err)
 		}
 	}
 }
@@ -1735,6 +1754,13 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 				emitLifecycle(result.projectRoot, "error", "session stopped unexpectedly")
 				scheduleRetry(result.projectRoot)
 				continue
+			}
+
+			if isFatalWatcherError(result.err) {
+				emitLifecycle(result.projectRoot, "error", result.err.Error())
+				supervisorCancel()
+				shutdownSessions("filesystem watcher failed")
+				return result.err
 			}
 
 			if result.projectRoot == mainRoot {
@@ -2601,43 +2627,13 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 	}
 	defer st.Close()
 
-	runtimes := make(map[string]*workspaceProjectRuntime, len(ws.Projects))
-	watchers := make([]*watcher.Watcher, 0, len(ws.Projects))
-
-	for _, project := range ws.Projects {
-		if !isBackgroundChild {
-			fmt.Printf("\nIndexing project: %s (%s)\n", project.Name, project.Path)
-		} else {
-			log.Printf("Indexing project: %s (%s)", project.Name, project.Path)
-		}
-
-		runtime, w, rtErr := initializeWorkspaceRuntime(ctx, ws, project, emb, st, isBackgroundChild)
-		if rtErr != nil {
-			log.Printf("Warning: failed to initialize runtime for %s: %v", project.Name, rtErr)
-			continue
-		}
-
-		projectKey := canonicalPath(project.Path)
-		runtimes[projectKey] = runtime
-		watchers = append(watchers, w)
+	runtimes, watchers, err := initializeWorkspaceRuntimes(ctx, ws, emb, st, isBackgroundChild, initializeWorkspaceRuntime)
+	if err != nil {
+		return err
 	}
 
 	defer func() {
-		for _, w := range watchers {
-			w.Close()
-		}
-		for _, runtime := range runtimes {
-			if runtime.symbolStore != nil {
-				if err := runtime.symbolStore.Close(); err != nil {
-					log.Printf("Warning: failed to close symbol store for %s: %v", runtime.project.Path, err)
-				}
-			}
-			if runtime.rpgStore != nil {
-				if err := runtime.rpgStore.Close(); err != nil {
-					log.Printf("Warning: failed to close RPG store for %s: %v", runtime.project.Path, err)
-				}
-			}
-		}
+		closeWorkspaceRuntimes(runtimes, watchers)
 	}()
 
 	// Write ready file
@@ -2665,19 +2661,15 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 
 	// Collect events from all watchers
 	eventChan := make(chan workspaceWatchEvent, 100)
+	fatalChan := make(chan error, 1)
+	forwardCtx, stopForwarders := context.WithCancel(ctx)
+	defer stopForwarders()
 	for _, runtime := range runtimes {
 		runtime := runtime
 		if runtime.watcher == nil {
 			continue
 		}
-		go func() {
-			for event := range runtime.watcher.Events() {
-				eventChan <- workspaceWatchEvent{
-					projectPath: runtime.project.Path,
-					event:       event,
-				}
-			}
-		}()
+		go forwardWorkspaceWatcher(forwardCtx, runtime, eventChan, fatalChan)
 	}
 
 	// persistAndShutdown persists all stores before returning from the event loop.
@@ -2732,6 +2724,10 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 				}
 			}
 
+		case err := <-fatalChan:
+			persistAndShutdown()
+			return err
+
 		case event := <-eventChan:
 			projectKey := canonicalPath(event.projectPath)
 			runtime := runtimes[projectKey]
@@ -2780,10 +2776,10 @@ type workspaceProjectRuntime struct {
 	tracedLanguages []string
 	lastConfigWrite time.Time
 	manager         *rpgRealtimeManager
-	watcher         *watcher.Watcher
+	watcher         watchSource
 }
 
-func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, project config.ProjectEntry, emb embedder.Embedder, sharedStore store.VectorStore, isBackgroundChild bool) (*workspaceProjectRuntime, *watcher.Watcher, error) {
+func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, project config.ProjectEntry, emb embedder.Embedder, sharedStore store.VectorStore, isBackgroundChild bool) (*workspaceProjectRuntime, watchSource, error) {
 	projectCfg := config.DefaultConfig()
 	if config.Exists(project.Path) {
 		loadedCfg, err := config.Load(project.Path)

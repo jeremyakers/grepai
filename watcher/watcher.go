@@ -3,10 +3,8 @@ package watcher
 import (
 	"context"
 	"io/fs"
-	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -31,10 +29,16 @@ type FileEvent struct {
 type Watcher struct {
 	root       string
 	watcher    *fsnotify.Watcher
+	addWatch   func(string) error
 	ignore     *indexer.IgnoreMatcher
 	debounceMs int
 	events     chan FileEvent
+	errors     chan error
 	done       chan struct{}
+	closeOnce  sync.Once
+	closeErr   error
+
+	processingDone chan struct{}
 
 	// Debouncing state
 	pending   map[string]FileEvent
@@ -45,27 +49,32 @@ type Watcher struct {
 func NewWatcher(root string, ignore *indexer.IgnoreMatcher, debounceMs int) (*Watcher, error) {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
-		return nil, err
+		return nil, &RegistrationError{Operation: "create filesystem watcher", Path: root, Cause: err}
 	}
 
-	return &Watcher{
+	w := &Watcher{
 		root:       root,
 		watcher:    fsw,
 		ignore:     ignore,
 		debounceMs: debounceMs,
 		events:     make(chan FileEvent, 100),
+		errors:     make(chan error, 1),
 		done:       make(chan struct{}),
 		pending:    make(map[string]FileEvent),
-	}, nil
+	}
+	w.addWatch = fsw.Add
+	return w, nil
 }
 
 func (w *Watcher) Start(ctx context.Context) error {
 	// Add root directory and all subdirectories
-	if err := w.addRecursive(w.root); err != nil {
+	if err := w.addRecursive(w.root, true); err != nil {
+		_ = w.Close()
 		return err
 	}
 
 	// Start event processing
+	w.processingDone = make(chan struct{})
 	go w.processEvents(ctx)
 
 	return nil
@@ -75,9 +84,22 @@ func (w *Watcher) Events() <-chan FileEvent {
 	return w.events
 }
 
+// Errors returns fatal errors that stop event processing.
+func (w *Watcher) Errors() <-chan error {
+	return w.errors
+}
+
 func (w *Watcher) Close() error {
-	close(w.done)
-	return w.watcher.Close()
+	w.closeOnce.Do(func() {
+		close(w.done)
+		w.pendingMu.Lock()
+		if w.timer != nil {
+			w.timer.Stop()
+		}
+		w.pendingMu.Unlock()
+		w.closeErr = w.watcher.Close()
+	})
+	return w.closeErr
 }
 
 // addRecursive walks the tree rooted at root and registers an fsnotify watch
@@ -87,15 +109,18 @@ func (w *Watcher) Close() error {
 // 100k+ files this roughly halves the syscall count of the initial/restart
 // tree walk, which matters because watch startup blocks on this before it
 // starts serving fsnotify events.
-func (w *Watcher) addRecursive(root string) error {
+func (w *Watcher) addRecursive(root string, rootRequired bool) error {
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil // Skip inaccessible paths
+			if os.IsNotExist(err) && (!rootRequired || path != root) {
+				return nil
+			}
+			return &RegistrationError{Operation: "walk watch tree", Path: path, Cause: err}
 		}
 
 		relPath, err := filepath.Rel(w.root, path)
 		if err != nil {
-			return nil
+			return &RegistrationError{Operation: "resolve watch path", Path: path, Cause: err}
 		}
 
 		// Handle directories: use ShouldSkipDir to respect .grepaiignore negations
@@ -105,8 +130,11 @@ func (w *Watcher) addRecursive(root string) error {
 			}
 			// Directory is not skipped; watch it if not individually ignored
 			if !w.ignore.ShouldIgnore(relPath) {
-				if err := w.watcher.Add(path); err != nil {
-					log.Printf("Failed to watch %s: %v", path, err)
+				if err := w.addWatch(path); err != nil {
+					if os.IsNotExist(err) {
+						return nil
+					}
+					return &RegistrationError{Operation: "add watch", Path: path, Cause: err}
 				}
 			}
 			return nil
@@ -119,130 +147,4 @@ func (w *Watcher) addRecursive(root string) error {
 
 		return nil
 	})
-}
-
-func (w *Watcher) processEvents(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-w.done:
-			return
-		case event, ok := <-w.watcher.Events:
-			if !ok {
-				return
-			}
-			w.handleEvent(event)
-		case err, ok := <-w.watcher.Errors:
-			if !ok {
-				return
-			}
-			log.Printf("Watcher error: %v", err)
-		}
-	}
-}
-
-func (w *Watcher) handleEvent(event fsnotify.Event) {
-	relPath, err := filepath.Rel(w.root, event.Name)
-	if err != nil {
-		return
-	}
-
-	// Ignore hidden files and ignored paths
-	if strings.HasPrefix(filepath.Base(relPath), ".") {
-		return
-	}
-	if w.ignore.ShouldIgnore(relPath) {
-		return
-	}
-
-	// Check if it's a supported file
-	ext := strings.ToLower(filepath.Ext(event.Name))
-	if !indexer.SupportedExtensions[ext] {
-		// Check if it's a directory (for watching new directories)
-		info, err := os.Stat(event.Name)
-		if err != nil || !info.IsDir() {
-			return
-		}
-
-		// New directory created, add to watcher
-		if event.Has(fsnotify.Create) {
-			if err := w.addRecursive(event.Name); err != nil {
-				log.Printf("Failed to add new directory %s: %v", event.Name, err)
-			}
-		}
-		return
-	}
-
-	var evType EventType
-	switch {
-	case event.Has(fsnotify.Create):
-		evType = EventCreate
-	case event.Has(fsnotify.Write):
-		evType = EventModify
-	case event.Has(fsnotify.Remove):
-		evType = EventDelete
-	case event.Has(fsnotify.Rename):
-		evType = EventRename
-	default:
-		return
-	}
-
-	w.debounceEvent(FileEvent{
-		Type: evType,
-		Path: relPath,
-	})
-}
-
-func (w *Watcher) debounceEvent(event FileEvent) {
-	w.pendingMu.Lock()
-	defer w.pendingMu.Unlock()
-
-	// Merge events: delete > create/modify
-	existing, exists := w.pending[event.Path]
-	if exists && existing.Type == EventDelete && event.Type != EventDelete {
-		// Keep delete if file was deleted then recreated quickly
-		// This will be handled as delete + create
-	} else {
-		w.pending[event.Path] = event
-	}
-
-	// Reset timer
-	if w.timer != nil {
-		w.timer.Stop()
-	}
-	w.timer = time.AfterFunc(time.Duration(w.debounceMs)*time.Millisecond, w.flush)
-}
-
-func (w *Watcher) flush() {
-	w.pendingMu.Lock()
-	events := make([]FileEvent, 0, len(w.pending))
-	for _, event := range w.pending {
-		events = append(events, event)
-	}
-	w.pending = make(map[string]FileEvent)
-	w.pendingMu.Unlock()
-
-	for _, event := range events {
-		select {
-		case w.events <- event:
-		default:
-			log.Printf("Event channel full, dropping event for %s", event.Path)
-		}
-	}
-}
-
-func (e EventType) String() string {
-	switch e {
-	case EventCreate:
-		return "CREATE"
-	case EventModify:
-		return "MODIFY"
-	case EventDelete:
-		return "DELETE"
-	case EventRename:
-		return "RENAME"
-	default:
-		return "UNKNOWN"
-	}
 }

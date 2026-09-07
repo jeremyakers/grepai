@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Incomplete File Watching After Runtime Watch Exhaustion**: File and workspace watchers now fail fast, persist their indexes, and clean up daemon readiness/PID state when a directory watch cannot be registered or fsnotify reports a fatal error. On Linux, `ENOSPC` from watch registration means the per-user inotify watch quota is exhausted, not that the filesystem is out of disk space (#304)
+
 ## [0.36.1] - 2026-09-01
 
 ### Fixed

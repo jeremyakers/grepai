@@ -1,0 +1,167 @@
+package watcher
+
+import (
+	"context"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+
+	"github.com/fsnotify/fsnotify"
+	"github.com/yoanbernabeu/grepai/indexer"
+)
+
+func newTestWatcher(t *testing.T, root string) *Watcher {
+	t.Helper()
+	ignore, err := indexer.NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatalf("NewIgnoreMatcher() error = %v", err)
+	}
+	w, err := NewWatcher(root, ignore, 0)
+	if err != nil {
+		t.Fatalf("NewWatcher() error = %v", err)
+	}
+	return w
+}
+
+func TestStartAddENOSPCFailsAndClosesWatcher(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "child")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := newTestWatcher(t, root)
+	originalAdd := w.addWatch
+	w.addWatch = func(path string) error {
+		if path == child {
+			return syscall.ENOSPC
+		}
+		return originalAdd(path)
+	}
+
+	err := w.Start(context.Background())
+	var registrationErr *RegistrationError
+	if !errors.As(err, &registrationErr) {
+		t.Fatalf("Start() error = %T %v, want *RegistrationError", err, err)
+	}
+	if !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("Start() error = %v, want errors.Is(ENOSPC)", err)
+	}
+	if registrationErr.Operation != "add watch" || registrationErr.Path != child {
+		t.Fatalf("registration error = %#v", registrationErr)
+	}
+	if !strings.Contains(err.Error(), "inotify watch limit") || strings.Contains(err.Error(), "disk") {
+		t.Fatalf("Start() error is not actionable: %v", err)
+	}
+	if w.processingDone != nil {
+		t.Fatal("Start() launched event processing after registration failure")
+	}
+	if err := w.watcher.Add(root); err == nil {
+		t.Fatal("fsnotify watcher remained open after failed startup")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close() after failed Start = %v", err)
+	}
+}
+
+func TestRegistrationErrorPreservesResourceErrors(t *testing.T) {
+	for _, cause := range []error{syscall.ENOSPC, syscall.EMFILE, syscall.ENFILE} {
+		err := &RegistrationError{Operation: "add watch", Path: "/project", Cause: cause}
+		var registrationErr *RegistrationError
+		if !errors.As(err, &registrationErr) || !errors.Is(err, cause) {
+			t.Errorf("RegistrationError with %v does not preserve type and cause", cause)
+		}
+	}
+}
+
+func TestStartIgnoresVanishedDirectory(t *testing.T) {
+	root := t.TempDir()
+	child := filepath.Join(root, "vanished")
+	if err := os.Mkdir(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := newTestWatcher(t, root)
+	originalAdd := w.addWatch
+	w.addWatch = func(path string) error {
+		if path == child {
+			return syscall.ENOENT
+		}
+		return originalAdd(path)
+	}
+
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	<-w.processingDone
+}
+
+func TestStartMissingRootFailsAndClosesWatcher(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "missing")
+	w := newTestWatcher(t, root)
+
+	err := w.Start(context.Background())
+	var registrationErr *RegistrationError
+	if !errors.As(err, &registrationErr) || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Start() error = %T %v, want missing-root RegistrationError", err, err)
+	}
+	if registrationErr.Operation != "walk watch tree" || registrationErr.Path != root {
+		t.Fatalf("registration error = %#v", registrationErr)
+	}
+	if w.processingDone != nil {
+		t.Fatal("Start() launched event processing for missing root")
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close() after failed Start = %v", err)
+	}
+}
+
+func TestRuntimeDirectoryAddFailurePublishesFatalAndStops(t *testing.T) {
+	root := t.TempDir()
+	w := newTestWatcher(t, root)
+	created := filepath.Join(root, "created")
+	originalAdd := w.addWatch
+	w.addWatch = func(path string) error {
+		if path == created {
+			return syscall.ENOSPC
+		}
+		return originalAdd(path)
+	}
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer w.Close()
+	if err := os.Mkdir(created, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w.watcher.Events <- fsnotify.Event{Name: created, Op: fsnotify.Create}
+
+	err := <-w.Errors()
+	var registrationErr *RegistrationError
+	if !errors.As(err, &registrationErr) || !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("Errors() = %T %v, want ENOSPC registration error", err, err)
+	}
+	<-w.processingDone
+}
+
+func TestUnderlyingFSNotifyErrorPublishesFatalAndStops(t *testing.T) {
+	root := t.TempDir()
+	w := newTestWatcher(t, root)
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer w.Close()
+	w.watcher.Errors <- fsnotify.ErrEventOverflow
+
+	err := <-w.Errors()
+	var fatalErr *FatalError
+	if !errors.As(err, &fatalErr) || !errors.Is(err, fsnotify.ErrEventOverflow) {
+		t.Fatalf("Errors() = %T %v, want overflow FatalError", err, err)
+	}
+	<-w.processingDone
+}
