@@ -27,16 +27,24 @@ type FileEvent struct {
 }
 
 type Watcher struct {
-	root       string
-	watcher    *fsnotify.Watcher
-	addWatch   func(string) error
-	ignore     *indexer.IgnoreMatcher
-	debounceMs int
-	events     chan FileEvent
-	errors     chan error
-	done       chan struct{}
-	closeOnce  sync.Once
-	closeErr   error
+	root          string
+	watcher       *fsnotify.Watcher
+	addWatch      func(string) error
+	statPath      func(string) (fs.FileInfo, error)
+	relPath       func(string, string) (string, error)
+	backendEvents <-chan fsnotify.Event
+	backendErrors <-chan error
+	ignore        *indexer.IgnoreMatcher
+	debounceMs    int
+	events        chan FileEvent
+	errors        chan error
+	done          chan struct{}
+	stopOnce      sync.Once
+	closeOnce     sync.Once
+	closeErr      error
+	stateMu       sync.Mutex
+	ownerStopped  bool
+	fatalOnce     sync.Once
 
 	processingDone chan struct{}
 
@@ -63,6 +71,10 @@ func NewWatcher(root string, ignore *indexer.IgnoreMatcher, debounceMs int) (*Wa
 		pending:    make(map[string]FileEvent),
 	}
 	w.addWatch = fsw.Add
+	w.statPath = os.Stat
+	w.relPath = filepath.Rel
+	w.backendEvents = fsw.Events
+	w.backendErrors = fsw.Errors
 	return w, nil
 }
 
@@ -91,7 +103,10 @@ func (w *Watcher) Errors() <-chan error {
 
 func (w *Watcher) Close() error {
 	w.closeOnce.Do(func() {
-		close(w.done)
+		w.stateMu.Lock()
+		w.ownerStopped = true
+		w.stateMu.Unlock()
+		w.stop()
 		w.pendingMu.Lock()
 		if w.timer != nil {
 			w.timer.Stop()
@@ -100,6 +115,19 @@ func (w *Watcher) Close() error {
 		w.closeErr = w.watcher.Close()
 	})
 	return w.closeErr
+}
+
+func (w *Watcher) stop() {
+	w.stopOnce.Do(func() { close(w.done) })
+}
+
+func (w *Watcher) stopped() bool {
+	select {
+	case <-w.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // addRecursive walks the tree rooted at root and registers an fsnotify watch
@@ -118,7 +146,7 @@ func (w *Watcher) addRecursive(root string, rootRequired bool) error {
 			return &RegistrationError{Operation: "walk watch tree", Path: path, Cause: err}
 		}
 
-		relPath, err := filepath.Rel(w.root, path)
+		relPath, err := w.relPath(w.root, path)
 		if err != nil {
 			return &RegistrationError{Operation: "resolve watch path", Path: path, Cause: err}
 		}
@@ -131,7 +159,7 @@ func (w *Watcher) addRecursive(root string, rootRequired bool) error {
 			// Directory is not skipped; watch it if not individually ignored
 			if !w.ignore.ShouldIgnore(relPath) {
 				if err := w.addWatch(path); err != nil {
-					if os.IsNotExist(err) {
+					if os.IsNotExist(err) && (!rootRequired || path != root) {
 						return nil
 					}
 					return &RegistrationError{Operation: "add watch", Path: path, Cause: err}

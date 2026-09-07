@@ -3,7 +3,11 @@ package watcher
 import (
 	"errors"
 	"fmt"
-	"syscall"
+)
+
+var (
+	errBackendClosed  = errors.New("fsnotify channel closed unexpectedly")
+	errEventQueueFull = errors.New("file event queue is full")
 )
 
 // RegistrationError reports a failure to register filesystem coverage.
@@ -40,10 +44,3 @@ func (e *FatalError) Error() string {
 }
 
 func (e *FatalError) Unwrap() error { return e.Cause }
-
-func inotifyLimitHint(err error) string {
-	if errors.Is(err, syscall.ENOSPC) {
-		return "inotify watch limit reached; increase fs.inotify.max_user_watches or stop other file watchers"
-	}
-	return ""
-}

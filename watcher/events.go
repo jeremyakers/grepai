@@ -2,7 +2,6 @@ package watcher
 
 import (
 	"context"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,16 +19,22 @@ func (w *Watcher) processEvents(ctx context.Context) {
 			return
 		case <-w.done:
 			return
-		case event, ok := <-w.watcher.Events:
+		case event, ok := <-w.backendEvents:
 			if !ok {
+				if ctx.Err() == nil && !w.stopped() {
+					w.publishFatal(&FatalError{Operation: "filesystem event channel closed", Path: w.root, Cause: errBackendClosed})
+				}
 				return
 			}
 			if err := w.handleEvent(event); err != nil {
 				w.publishFatal(err)
 				return
 			}
-		case err, ok := <-w.watcher.Errors:
+		case err, ok := <-w.backendErrors:
 			if !ok {
+				if ctx.Err() == nil && !w.stopped() {
+					w.publishFatal(&FatalError{Operation: "filesystem error channel closed", Path: w.root, Cause: errBackendClosed})
+				}
 				return
 			}
 			w.publishFatal(&FatalError{Operation: "process filesystem events", Path: w.root, Cause: err})
@@ -39,33 +44,48 @@ func (w *Watcher) processEvents(ctx context.Context) {
 }
 
 func (w *Watcher) publishFatal(err error) {
-	select {
-	case w.errors <- err:
-	default:
-	}
+	w.fatalOnce.Do(func() {
+		w.stateMu.Lock()
+		defer w.stateMu.Unlock()
+		if w.ownerStopped {
+			return
+		}
+		select {
+		case w.errors <- err:
+		default:
+		}
+		w.stop()
+	})
 }
 
 func (w *Watcher) handleEvent(event fsnotify.Event) error {
-	relPath, err := filepath.Rel(w.root, event.Name)
+	relPath, err := w.relPath(w.root, event.Name)
 	if err != nil {
-		return nil
+		return &FatalError{Operation: "resolve filesystem event path", Path: event.Name, Cause: err}
 	}
 
 	if strings.HasPrefix(filepath.Base(relPath), ".") || w.ignore.ShouldIgnore(relPath) {
 		return nil
 	}
 
-	ext := strings.ToLower(filepath.Ext(event.Name))
-	if !indexer.SupportedExtensions[ext] {
-		info, err := os.Stat(event.Name)
-		if err != nil || !info.IsDir() {
-			return nil
+	if event.Has(fsnotify.Create) {
+		info, err := w.statPath(event.Name)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return &FatalError{Operation: "stat created path", Path: event.Name, Cause: err}
 		}
-		if event.Has(fsnotify.Create) {
+		if info.IsDir() {
 			if err := w.addRecursive(event.Name, false); err != nil {
 				return &FatalError{Operation: "register new directory", Path: event.Name, Cause: err}
 			}
+			return nil
 		}
+	}
+
+	ext := strings.ToLower(filepath.Ext(event.Name))
+	if !indexer.SupportedExtensions[ext] {
 		return nil
 	}
 
@@ -110,9 +130,12 @@ func (w *Watcher) flush() {
 
 	for _, event := range events {
 		select {
+		case <-w.done:
+			return
 		case w.events <- event:
 		default:
-			log.Printf("Event channel full, dropping event for %s", event.Path)
+			w.publishFatal(&FatalError{Operation: "enqueue file event", Path: event.Path, Cause: errEventQueueFull})
+			return
 		}
 	}
 }

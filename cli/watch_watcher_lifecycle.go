@@ -8,7 +8,9 @@ import (
 
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/embedder"
+	"github.com/yoanbernabeu/grepai/rpg"
 	"github.com/yoanbernabeu/grepai/store"
+	"github.com/yoanbernabeu/grepai/trace"
 	"github.com/yoanbernabeu/grepai/watcher"
 )
 
@@ -86,9 +88,17 @@ func initializeWorkspaceRuntimes(ctx context.Context, ws *config.Workspace, emb 
 }
 
 func closeWorkspaceRuntimes(runtimes map[string]*workspaceProjectRuntime, watchers []watchSource) {
+	closeWatchSources(watchers)
+	closeWorkspaceStores(runtimes)
+}
+
+func closeWatchSources(watchers []watchSource) {
 	for _, w := range watchers {
 		_ = w.Close()
 	}
+}
+
+func closeWorkspaceStores(runtimes map[string]*workspaceProjectRuntime) {
 	for _, runtime := range runtimes {
 		if runtime.symbolStore != nil {
 			if err := runtime.symbolStore.Close(); err != nil {
@@ -101,4 +111,38 @@ func closeWorkspaceRuntimes(runtimes map[string]*workspaceProjectRuntime, watche
 			}
 		}
 	}
+}
+
+func persistProjectStores(ctx context.Context, st store.VectorStore, symbolStore *trace.GOBSymbolStore, rpgStore rpg.RPGStore) error {
+	var errs []error
+	if err := st.Persist(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("persist vector index: %w", err))
+	}
+	if err := symbolStore.Persist(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("persist symbol index: %w", err))
+	}
+	if rpgStore != nil {
+		if err := rpgStore.Persist(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("persist RPG graph: %w", err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func persistWorkspaceStores(ctx context.Context, st store.VectorStore, runtimes map[string]*workspaceProjectRuntime) error {
+	var errs []error
+	if err := st.Persist(ctx); err != nil {
+		errs = append(errs, fmt.Errorf("persist workspace vector index: %w", err))
+	}
+	for _, runtime := range runtimes {
+		if err := runtime.symbolStore.Persist(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("persist symbol index for %s: %w", runtime.project.Name, err))
+		}
+		if runtime.rpgStore != nil {
+			if err := runtime.rpgStore.Persist(ctx); err != nil {
+				errs = append(errs, fmt.Errorf("persist RPG graph for %s: %w", runtime.project.Name, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
 }

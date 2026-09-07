@@ -193,8 +193,9 @@ Use 'grepai watch --status' to check status
 Use 'grepai watch --stop' to stop the watcher
 ```
 
-The daemon waits for full initialization (embedder connection, initial scan) before returning success.
-It only reports ready after every required filesystem watch is registered. If registration fails at startup or while adding a newly created directory, the watcher persists its indexes and exits instead of continuing with partial coverage. Workspace mode applies the same rule to every project: one fatal watcher error stops the workspace watcher.
+The daemon waits for full initialization (embedder connection, initial scan) before returning success. Ready markers include the child PID, so a marker left by an older process cannot make a failed restart appear healthy.
+
+It only reports ready after every required filesystem watch is registered. If registration fails at startup or while adding a newly created directory, fsnotify stops unexpectedly, or the internal event queue fills, the watcher exits instead of continuing with partial or stale coverage. Fatal shutdown withdraws readiness and releases filesystem watches before attempting bounded index persistence. Workspace mode applies the same rule to every project: one fatal watcher error stops the workspace watcher.
 
 #### Checking Status
 

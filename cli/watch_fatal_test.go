@@ -37,11 +37,15 @@ func (w *fakeWatchSource) Close() error {
 
 type persistCountingStore struct {
 	mockVectorStore
-	persists int
+	persists  int
+	onPersist func()
 }
 
 func (s *persistCountingStore) Persist(context.Context) error {
 	s.persists++
+	if s.onPersist != nil {
+		s.onPersist()
+	}
 	return nil
 }
 
@@ -50,11 +54,19 @@ func TestRunProjectWatchLoopFatalWatcherErrorPersistsAndCloses(t *testing.T) {
 	source := newFakeWatchSource()
 	fatal := &watcher.FatalError{Operation: "process filesystem events", Path: root, Cause: syscall.ENOSPC}
 	source.errors <- fatal
-	vectorStore := &persistCountingStore{}
+	readyWithdrawn := false
+	vectorStore := &persistCountingStore{onPersist: func() {
+		if source.closed == 0 {
+			t.Fatal("project watcher was still open when fatal persistence started")
+		}
+		if !readyWithdrawn {
+			t.Fatal("ready marker was still published when fatal persistence started")
+		}
+	}}
 	symbolStore := trace.NewGOBSymbolStore(filepath.Join(root, "symbols.gob"))
 	cfg := config.DefaultConfig()
 
-	err := runProjectWatchLoop(context.Background(), vectorStore, symbolStore, source, nil, nil, nil, nil, nil, nil, root, cfg, nil, nil, nil)
+	err := runProjectWatchLoop(context.Background(), vectorStore, symbolStore, source, nil, nil, nil, nil, nil, nil, root, cfg, nil, nil, nil, func() { readyWithdrawn = true })
 	if !errors.Is(err, syscall.ENOSPC) {
 		t.Fatalf("runProjectWatchLoop() error = %v, want ENOSPC", err)
 	}

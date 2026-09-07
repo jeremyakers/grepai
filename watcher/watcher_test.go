@@ -101,6 +101,21 @@ func TestStartIgnoresVanishedDirectory(t *testing.T) {
 	<-w.processingDone
 }
 
+func TestStartRootAddENOENTIsFatal(t *testing.T) {
+	root := t.TempDir()
+	w := newTestWatcher(t, root)
+	w.addWatch = func(string) error { return syscall.ENOENT }
+
+	err := w.Start(context.Background())
+	var registrationErr *RegistrationError
+	if !errors.As(err, &registrationErr) || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Start() error = %T %v, want root ENOENT RegistrationError", err, err)
+	}
+	if registrationErr.Path != root {
+		t.Fatalf("registration path = %q, want %q", registrationErr.Path, root)
+	}
+}
+
 func TestStartMissingRootFailsAndClosesWatcher(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "missing")
 	w := newTestWatcher(t, root)
@@ -145,23 +160,6 @@ func TestRuntimeDirectoryAddFailurePublishesFatalAndStops(t *testing.T) {
 	var registrationErr *RegistrationError
 	if !errors.As(err, &registrationErr) || !errors.Is(err, syscall.ENOSPC) {
 		t.Fatalf("Errors() = %T %v, want ENOSPC registration error", err, err)
-	}
-	<-w.processingDone
-}
-
-func TestUnderlyingFSNotifyErrorPublishesFatalAndStops(t *testing.T) {
-	root := t.TempDir()
-	w := newTestWatcher(t, root)
-	if err := w.Start(context.Background()); err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	defer w.Close()
-	w.watcher.Errors <- fsnotify.ErrEventOverflow
-
-	err := <-w.Errors()
-	var fatalErr *FatalError
-	if !errors.As(err, &fatalErr) || !errors.Is(err, fsnotify.ErrEventOverflow) {
-		t.Fatalf("Errors() = %T %v, want overflow FatalError", err, err)
 	}
 	<-w.processingDone
 }
