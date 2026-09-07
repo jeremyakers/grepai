@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/embedder"
@@ -22,6 +23,39 @@ type watchSource interface {
 func closeUnlessAborted(ctx context.Context, aborted *bool, closeFn func() error) {
 	if !*aborted && !isFatalWatcherError(context.Cause(ctx)) {
 		_ = closeFn()
+	}
+}
+
+const fatalWatcherCloseWait = 10 * time.Millisecond
+
+func abortWatcherReadiness(abortStores *bool, watchers []watchSource, scope string, err error, onFatal func()) error {
+	*abortStores = true
+	if onFatal != nil {
+		onFatal()
+	}
+	closeWatchSourcesPromptly(watchers)
+	if isFatalWatcherError(err) {
+		return err
+	}
+	return &watcher.FatalError{Operation: "publish watcher readiness", Path: scope, Cause: err}
+}
+
+func closeWatchSourcesPromptly(watchers []watchSource) {
+	done := make(chan struct{}, len(watchers))
+	for _, source := range watchers {
+		go func(w watchSource) {
+			_ = w.Close()
+			done <- struct{}{}
+		}(source)
+	}
+	deadline := time.NewTimer(fatalWatcherCloseWait)
+	defer deadline.Stop()
+	for range watchers {
+		select {
+		case <-done:
+		case <-deadline.C:
+			return
+		}
 	}
 }
 

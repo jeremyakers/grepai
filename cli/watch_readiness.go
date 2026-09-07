@@ -27,6 +27,8 @@ func removeProjectDaemonMarkers(logDir, worktreeID string) error {
 
 var errNotReady = errors.New("not ready")
 
+var backgroundExitTimeout = 5 * time.Second
+
 func waitForBackgroundReady(exitCh <-chan struct{}, expectedPID int, isReady func(int) bool, timeout, pollInterval time.Duration) error {
 	check := func() error {
 		select {
@@ -74,8 +76,11 @@ func waitForBackgroundExit(exitCh <-chan struct{}, timeout time.Duration) error 
 
 func abortBackgroundStart(primary error, childPID int, exitCh <-chan struct{}, cleanup func() error) error {
 	stopErr := watchStopProcess(childPID)
-	exitErr := waitForBackgroundExit(exitCh, 5*time.Second)
-	cleanupErr := cleanup()
+	exitErr := waitForBackgroundExit(exitCh, backgroundExitTimeout)
+	var cleanupErr error
+	if stopErr == nil && exitErr == nil {
+		cleanupErr = cleanup()
+	}
 	if stopErr != nil {
 		stopErr = fmt.Errorf("stop failed background process %d: %w", childPID, stopErr)
 	}

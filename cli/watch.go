@@ -992,7 +992,21 @@ func watchProject(ctx context.Context, projectRoot string, emb embedder.Embedder
 	return watchProjectWithEventObserver(ctx, projectRoot, emb, isBackgroundChild, onReady, nil, nil, nil, nil, nil, nil, nil)
 }
 
-func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver, onFatal func()) error {
+func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver, onFatal func()) (resultErr error) {
+	var fatalOnce sync.Once
+	notifyFatal := func() {
+		fatalOnce.Do(func() {
+			if onFatal != nil {
+				onFatal()
+			}
+		})
+	}
+	defer func() {
+		if isFatalWatcherError(resultErr) {
+			notifyFatal()
+		}
+	}()
+
 	// Load configuration
 	cfg, err := config.Load(projectRoot)
 	if err != nil {
@@ -1119,7 +1133,12 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 		abortStores = isFatalWatcherError(err)
 		return fmt.Errorf("failed to initialize watcher for %s: %w", projectRoot, err)
 	}
-	defer w.Close()
+	abortWatcherClose := false
+	defer func() {
+		if !abortWatcherClose {
+			_ = w.Close()
+		}
+	}()
 
 	if err := w.Start(ctx); err != nil {
 		abortStores = isFatalWatcherError(err)
@@ -1132,13 +1151,15 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 		}
 		return nil
 	}); err != nil {
-		abortStores = isFatalWatcherError(err)
-		return fmt.Errorf("watcher failed before readiness for %s: %w", projectRoot, err)
+		abortWatcherClose = true
+		fatalErr := abortWatcherReadiness(&abortStores, []watchSource{w}, projectRoot, err, notifyFatal)
+		return fmt.Errorf("watcher failed before readiness for %s: %w", projectRoot, fatalErr)
 	}
 
 	// Run watch loop (responds to ctx.Done() for graceful shutdown)
-	err = runProjectWatchLoop(ctx, st, symbolStore, w, idx, scanner, extractor, rpgEncoder, rpgStore, tracedLanguages, projectRoot, cfg, onEvent, onActivity, onStats, onFatal, processorRegistry)
+	err = runProjectWatchLoop(ctx, st, symbolStore, w, idx, scanner, extractor, rpgEncoder, rpgStore, tracedLanguages, projectRoot, cfg, onEvent, onActivity, onStats, notifyFatal, processorRegistry)
 	abortStores = isFatalWatcherError(err)
+	abortWatcherClose = abortStores
 	return err
 }
 
@@ -1195,7 +1216,7 @@ func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore 
 				if onFatal != nil {
 					onFatal()
 				}
-				_ = w.Close()
+				closeWatchSourcesPromptly([]watchSource{w})
 				return cause
 			}
 			if err := st.Persist(ctx); err != nil {
@@ -1235,7 +1256,7 @@ func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore 
 			if onFatal != nil {
 				onFatal()
 			}
-			_ = w.Close()
+			closeWatchSourcesPromptly([]watchSource{w})
 			return primary
 		}
 	}
@@ -1462,6 +1483,11 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 	if cfg.discoverWorktrees == nil {
 		cfg.discoverWorktrees = discoverWorktreesForWatch
 	}
+	if cfg.fatalObserver != nil {
+		observer := cfg.fatalObserver
+		var fatalOnce sync.Once
+		cfg.fatalObserver = func() { fatalOnce.Do(observer) }
+	}
 	if cfg.sessionRunner == nil {
 		cfg.sessionRunner = func(
 			ctx context.Context,
@@ -1532,7 +1558,10 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 				return nil
 			}
 		}
-		return cfg.initialReadyObserver(len(initialRoots))
+		if err := cfg.initialReadyObserver(len(initialRoots)); err != nil {
+			return &watcher.FatalError{Operation: "publish daemon readiness", Path: mainRoot, Cause: err}
+		}
+		return nil
 	}
 
 	sessionResults := make(chan watchSessionResult, 64)
@@ -2049,12 +2078,6 @@ func runWatchForeground() error {
 		emb,
 		withWatchSupervisorBackgroundChild(isBackgroundChild),
 		withWatchSupervisorInitialLinkedWorktrees(linkedWorktrees),
-		withWatchSupervisorInitialReadySelector(func(mainRoot, currentRoot string) bool {
-			if !isBackgroundChild {
-				return true
-			}
-			return canonicalPath(mainRoot) == canonicalPath(currentRoot)
-		}),
 		withWatchSupervisorInitialReadyObserver(func(_ int) error {
 			return initialReadyObserver(initialTotalProjects)
 		}),
@@ -2653,8 +2676,11 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 
 	var closeWatchersOnce sync.Once
 	closeWatchers := func() { closeWatchersOnce.Do(func() { closeWatchSources(watchers) }) }
+	abortWatcherClose := false
 	defer func() {
-		closeWatchers()
+		if !abortWatcherClose {
+			closeWatchers()
+		}
 		if !abortStores {
 			closeWorkspaceStores(runtimes)
 		}
@@ -2686,8 +2712,10 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		if err := withWatchSourcesReady(watchers, func() error {
 			return daemon.WriteWorkspaceReadyFile(logDir, ws.Name)
 		}); err != nil {
-			abortStores = isFatalWatcherError(err)
-			return fmt.Errorf("failed to publish workspace readiness: %w", err)
+			stopForwarders()
+			abortWatcherClose = true
+			fatalErr := abortWatcherReadiness(&abortStores, watchers, ws.Name, err, nil)
+			return fmt.Errorf("failed to publish workspace readiness: %w", fatalErr)
 		}
 	}
 
