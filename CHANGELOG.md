@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Incomplete or Stale File Watching**: File, worktree, and workspace watchers now fail closed when a directory watch cannot be registered, fsnotify closes or reports an error, or the internal event queue cannot keep up. Fatal shutdown first withdraws daemon readiness and releases watches, then attempts bounded index persistence. Ready markers are PID-validated and stale PID cleanup removes the matching marker. On Linux, registration `ENOSPC` means the per-user inotify watch quota is exhausted, not that the filesystem is out of disk space (#304)
+- **Incomplete or Stale File Watching**: File, worktree, and workspace watchers now fail closed when a directory watch cannot be registered, fsnotify closes or reports an error, or the internal event queue cannot keep up. Fatal coverage shutdown withdraws daemon readiness and releases watches without flushing potentially untrustworthy derived state; the next startup's full scan repairs the indexes. Ready markers are PID-validated, write failures stop startup, timed-out children are stopped and cleaned up, and stale PID cleanup removes the matching marker. On Linux, registration `ENOSPC` means the per-user inotify watch quota is exhausted, not that the filesystem is out of disk space (#304)
 
 ## [0.36.1] - 2026-09-01
 

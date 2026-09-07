@@ -3,22 +3,23 @@ package cli
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"syscall"
 	"testing"
 
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/embedder"
-	"github.com/yoanbernabeu/grepai/indexer"
 	"github.com/yoanbernabeu/grepai/store"
 	"github.com/yoanbernabeu/grepai/trace"
 	"github.com/yoanbernabeu/grepai/watcher"
 )
 
 type fakeWatchSource struct {
-	events chan watcher.FileEvent
-	errors chan error
-	closed int
+	events   chan watcher.FileEvent
+	errors   chan error
+	closed   int
+	readyErr error
 }
 
 func newFakeWatchSource() *fakeWatchSource {
@@ -30,51 +31,36 @@ func newFakeWatchSource() *fakeWatchSource {
 
 func (w *fakeWatchSource) Events() <-chan watcher.FileEvent { return w.events }
 func (w *fakeWatchSource) Errors() <-chan error             { return w.errors }
+
+func (w *fakeWatchSource) Ready(publish func() error) error {
+	if w.readyErr != nil {
+		return w.readyErr
+	}
+	if publish == nil {
+		return nil
+	}
+	return publish()
+}
+
 func (w *fakeWatchSource) Close() error {
 	w.closed++
 	return nil
 }
 
-type persistCountingStore struct {
-	mockVectorStore
-	persists  int
-	onPersist func()
-}
-
-func (s *persistCountingStore) Persist(context.Context) error {
-	s.persists++
-	if s.onPersist != nil {
-		s.onPersist()
-	}
-	return nil
-}
-
-func TestRunProjectWatchLoopFatalWatcherErrorPersistsAndCloses(t *testing.T) {
-	root := t.TempDir()
+func TestWorkspaceReadinessRefusesPreloadedWatcherFatal(t *testing.T) {
+	fatal := &watcher.FatalError{Operation: "watch", Cause: syscall.ENOSPC}
 	source := newFakeWatchSource()
-	fatal := &watcher.FatalError{Operation: "process filesystem events", Path: root, Cause: syscall.ENOSPC}
-	source.errors <- fatal
-	readyWithdrawn := false
-	vectorStore := &persistCountingStore{onPersist: func() {
-		if source.closed == 0 {
-			t.Fatal("project watcher was still open when fatal persistence started")
-		}
-		if !readyWithdrawn {
-			t.Fatal("ready marker was still published when fatal persistence started")
-		}
-	}}
-	symbolStore := trace.NewGOBSymbolStore(filepath.Join(root, "symbols.gob"))
-	cfg := config.DefaultConfig()
-
-	err := runProjectWatchLoop(context.Background(), vectorStore, symbolStore, source, nil, nil, nil, nil, nil, nil, root, cfg, nil, nil, nil, func() { readyWithdrawn = true })
-	if !errors.Is(err, syscall.ENOSPC) {
-		t.Fatalf("runProjectWatchLoop() error = %v, want ENOSPC", err)
+	source.readyErr = fatal
+	published := false
+	err := withWatchSourcesReady([]watchSource{source}, func() error {
+		published = true
+		return nil
+	})
+	if !errors.Is(err, fatal) {
+		t.Fatalf("withWatchSourcesReady() error = %v, want fatal", err)
 	}
-	if vectorStore.persists != 1 {
-		t.Fatalf("vector store persisted %d times, want 1", vectorStore.persists)
-	}
-	if source.closed != 1 {
-		t.Fatalf("watcher closed %d times, want 1", source.closed)
+	if published {
+		t.Fatal("workspace ready callback ran after watcher fatal")
 	}
 }
 
@@ -85,31 +71,6 @@ func TestFatalWatcherErrorClassificationPreservesWrapping(t *testing.T) {
 	}
 	if isFatalWatcherError(errors.New("optional initialization warning")) {
 		t.Fatal("ordinary initialization error was classified as fatal")
-	}
-}
-
-func TestDynamicWatchSupervisorLinkedWatcherFatalStopsAllSessions(t *testing.T) {
-	mainRoot := t.TempDir()
-	linkedRoot := t.TempDir()
-	fatal := &watcher.FatalError{Operation: "process filesystem events", Path: linkedRoot, Cause: syscall.ENOSPC}
-	runner := func(ctx context.Context, projectRoot string, _ embedder.Embedder, _ bool, onReady func(), _ watchSessionEventObserver, _ func(int, int, string), _ func(indexer.BatchProgressInfo), _ func(string, int, int), _ watchActivityObserver, _ watchStatsObserver) error {
-		if projectRoot == linkedRoot {
-			return fatal
-		}
-		onReady()
-		<-ctx.Done()
-		return ctx.Err()
-	}
-
-	err := runDynamicWatchSupervisor(
-		context.Background(),
-		mainRoot,
-		nil,
-		withWatchSupervisorInitialLinkedWorktrees([]string{linkedRoot}),
-		withWatchSupervisorSessionRunner(runner),
-	)
-	if !errors.Is(err, syscall.ENOSPC) {
-		t.Fatalf("runDynamicWatchSupervisor() error = %v, want ENOSPC", err)
 	}
 }
 
@@ -143,6 +104,8 @@ func TestForwardWorkspaceWatcherFatalIdentifiesProjectAndStops(t *testing.T) {
 
 func TestInitializeWorkspaceRuntimesRegistrationFailureCleansPriorRuntime(t *testing.T) {
 	first := newFakeWatchSource()
+	symbolPath := filepath.Join(t.TempDir(), "symbols.gob")
+	symbolStore := trace.NewGOBSymbolStore(symbolPath)
 	ws := &config.Workspace{Projects: []config.ProjectEntry{
 		{Name: "first", Path: "/first"},
 		{Name: "second", Path: "/second"},
@@ -151,7 +114,7 @@ func TestInitializeWorkspaceRuntimesRegistrationFailureCleansPriorRuntime(t *tes
 	initFn := func(context.Context, *config.Workspace, config.ProjectEntry, embedder.Embedder, store.VectorStore, bool) (*workspaceProjectRuntime, watchSource, error) {
 		initCalls++
 		if initCalls == 1 {
-			return &workspaceProjectRuntime{project: ws.Projects[0], watcher: first}, first, nil
+			return &workspaceProjectRuntime{project: ws.Projects[0], watcher: first, symbolStore: symbolStore}, first, nil
 		}
 		return nil, nil, &watcher.RegistrationError{Operation: "add watch", Path: "/second", Cause: syscall.ENOSPC}
 	}
@@ -162,6 +125,9 @@ func TestInitializeWorkspaceRuntimesRegistrationFailureCleansPriorRuntime(t *tes
 	}
 	if first.closed != 1 {
 		t.Fatalf("prior watcher closed %d times, want 1", first.closed)
+	}
+	if _, statErr := os.Stat(symbolPath); !os.IsNotExist(statErr) {
+		t.Fatalf("fatal workspace startup serialized symbol store: %v", statErr)
 	}
 }
 

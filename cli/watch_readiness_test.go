@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,7 +9,6 @@ import (
 
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/daemon"
-	"github.com/yoanbernabeu/grepai/watcher"
 )
 
 func TestWaitForBackgroundReadyChecksChildExitFirst(t *testing.T) {
@@ -70,7 +68,9 @@ func TestStartBackgroundWatchRejectsStaleReadyWhenChildFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	original := watchSpawnBackground
-	t.Cleanup(func() { watchSpawnBackground = original })
+	originalStop := watchStopProcess
+	t.Cleanup(func() { watchSpawnBackground = original; watchStopProcess = originalStop })
+	watchStopProcess = func(int) error { return errors.New("child already exited") }
 	watchSpawnBackground = func(dir string, _ []string) (int, <-chan struct{}, error) {
 		if daemon.IsReady(dir) {
 			t.Fatal("stale ready marker was not removed before spawn")
@@ -95,7 +95,9 @@ func TestStartBackgroundWorkspaceRejectsStaleReadyWhenChildFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	original := watchSpawnWorkspace
-	t.Cleanup(func() { watchSpawnWorkspace = original })
+	originalStop := watchStopProcess
+	t.Cleanup(func() { watchSpawnWorkspace = original; watchStopProcess = originalStop })
+	watchStopProcess = func(int) error { return errors.New("child already exited") }
 	watchSpawnWorkspace = func(dir, name string, _ []string) (int, <-chan struct{}, error) {
 		if daemon.IsWorkspaceReady(dir, name) {
 			t.Fatal("stale workspace ready marker was not removed before spawn")
@@ -125,33 +127,91 @@ func TestStartBackgroundWatchMatchingReadyPathUnaffected(t *testing.T) {
 	}
 }
 
-func TestCleanupAndPersistFatalCleansBeforeBoundedPersistence(t *testing.T) {
-	primary := &watcher.FatalError{Operation: "watch", Cause: errors.New("fatal")}
-	cleaned := false
-	persistStarted := false
-	err := cleanupAndPersistFatal(primary, func() {
-		cleaned = true
-	}, func(ctx context.Context) error {
-		persistStarted = true
-		if !cleaned {
-			t.Fatal("persistence started before watcher/ready cleanup")
+func TestStartBackgroundWatchTimeoutStopsChildAndCleansMarkers(t *testing.T) {
+	logDir := t.TempDir()
+	exitCh := make(chan struct{})
+	originalSpawn := watchSpawnBackground
+	originalWait := watchWaitForReady
+	originalStop := watchStopProcess
+	t.Cleanup(func() {
+		watchSpawnBackground = originalSpawn
+		watchWaitForReady = originalWait
+		watchStopProcess = originalStop
+	})
+	watchSpawnBackground = func(dir string, _ []string) (int, <-chan struct{}, error) {
+		if err := os.WriteFile(filepath.Join(dir, "grepai-watch.pid"), []byte("4242\n"), 0o600); err != nil {
+			t.Fatal(err)
 		}
-		<-ctx.Done()
-		return ctx.Err()
-	}, 0)
-	if !persistStarted {
-		t.Fatal("persistence was not attempted")
+		if err := os.WriteFile(filepath.Join(dir, "grepai-watch.ready"), []byte("ready\n4242\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return 4242, exitCh, nil
 	}
-	if !errors.Is(err, primary) || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("cleanupAndPersistFatal() error = %v, want primary and deadline errors", err)
+	watchWaitForReady = func(<-chan struct{}, int, func(int) bool, time.Duration, time.Duration) error {
+		return errors.New("startup timeout")
+	}
+	stopCalled := false
+	watchStopProcess = func(pid int) error {
+		stopCalled = pid == 4242
+		close(exitCh)
+		return nil
+	}
+
+	if err := startBackgroundWatch(logDir, ""); err == nil {
+		t.Fatal("startBackgroundWatch() succeeded after timeout")
+	}
+	if !stopCalled {
+		t.Fatal("timed-out child was not stopped")
+	}
+	if _, err := os.Stat(filepath.Join(logDir, "grepai-watch.pid")); !os.IsNotExist(err) {
+		t.Fatalf("PID marker remains: %v", err)
+	}
+	if daemon.IsReady(logDir) {
+		t.Fatal("ready marker remains after timeout")
 	}
 }
 
-func TestCleanupAndPersistFatalJoinsPersistenceFailure(t *testing.T) {
-	primary := errors.New("watch failed")
-	persistErr := errors.New("persist failed")
-	err := cleanupAndPersistFatal(primary, func() {}, func(context.Context) error { return persistErr }, time.Second)
-	if !errors.Is(err, primary) || !errors.Is(err, persistErr) {
-		t.Fatalf("cleanupAndPersistFatal() error = %v, want both causes", err)
+func TestStartBackgroundWorkspaceTimeoutStopsChildAndCleansMarkers(t *testing.T) {
+	logDir := t.TempDir()
+	ws := &config.Workspace{Name: "ws"}
+	exitCh := make(chan struct{})
+	originalSpawn := watchSpawnWorkspace
+	originalWait := watchWaitForReady
+	originalStop := watchStopProcess
+	t.Cleanup(func() {
+		watchSpawnWorkspace = originalSpawn
+		watchWaitForReady = originalWait
+		watchStopProcess = originalStop
+	})
+	watchSpawnWorkspace = func(dir, name string, _ []string) (int, <-chan struct{}, error) {
+		if err := os.WriteFile(daemon.GetWorkspacePIDFile(dir, name), []byte("4242\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(daemon.GetWorkspaceReadyFile(dir, name), []byte("ready\n4242\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return 4242, exitCh, nil
+	}
+	watchWaitForReady = func(<-chan struct{}, int, func(int) bool, time.Duration, time.Duration) error {
+		return errors.New("startup timeout")
+	}
+	stopCalled := false
+	watchStopProcess = func(int) error {
+		stopCalled = true
+		close(exitCh)
+		return nil
+	}
+
+	if err := startBackgroundWorkspaceWatch(logDir, ws); err == nil {
+		t.Fatal("startBackgroundWorkspaceWatch() succeeded after timeout")
+	}
+	if !stopCalled {
+		t.Fatal("timed-out workspace child was not stopped")
+	}
+	if _, err := os.Stat(daemon.GetWorkspacePIDFile(logDir, ws.Name)); !os.IsNotExist(err) {
+		t.Fatalf("workspace PID marker remains: %v", err)
+	}
+	if daemon.IsWorkspaceReady(logDir, ws.Name) {
+		t.Fatal("workspace ready marker remains after timeout")
 	}
 }

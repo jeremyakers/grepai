@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"time"
@@ -16,7 +15,15 @@ func removeProjectReadyMarker(logDir, worktreeID string) error {
 	return daemon.RemoveReadyFile(logDir)
 }
 
-const fatalPersistTimeout = 30 * time.Second
+func removeProjectDaemonMarkers(logDir, worktreeID string) error {
+	if worktreeID != "" {
+		return errors.Join(
+			daemon.RemoveWorktreeReadyFile(logDir, worktreeID),
+			daemon.RemoveWorktreePIDFile(logDir, worktreeID),
+		)
+	}
+	return errors.Join(daemon.RemoveReadyFile(logDir), daemon.RemovePIDFile(logDir))
+}
 
 var errNotReady = errors.New("not ready")
 
@@ -54,12 +61,26 @@ func waitForBackgroundReady(exitCh <-chan struct{}, expectedPID int, isReady fun
 	}
 }
 
-func cleanupAndPersistFatal(primary error, cleanup func(), persist func(context.Context) error, timeout time.Duration) error {
-	cleanup()
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	if err := persist(ctx); err != nil {
-		return errors.Join(primary, fmt.Errorf("persist after watcher failure: %w", err))
+func waitForBackgroundExit(exitCh <-chan struct{}, timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-exitCh:
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("background process did not exit within %v", timeout)
 	}
-	return primary
+}
+
+func abortBackgroundStart(primary error, childPID int, exitCh <-chan struct{}, cleanup func() error) error {
+	stopErr := watchStopProcess(childPID)
+	exitErr := waitForBackgroundExit(exitCh, 5*time.Second)
+	cleanupErr := cleanup()
+	if stopErr != nil {
+		stopErr = fmt.Errorf("stop failed background process %d: %w", childPID, stopErr)
+	}
+	if cleanupErr != nil {
+		cleanupErr = fmt.Errorf("remove failed background markers: %w", cleanupErr)
+	}
+	return errors.Join(primary, stopErr, exitErr, cleanupErr)
 }

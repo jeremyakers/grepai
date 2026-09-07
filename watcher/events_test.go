@@ -188,3 +188,21 @@ func TestUnderlyingFSNotifyErrorPublishesFatalAndStops(t *testing.T) {
 	}
 	<-w.processingDone
 }
+
+func TestReadyRefusesAlreadyPublishedFatal(t *testing.T) {
+	w := newTestWatcher(t, t.TempDir())
+	defer w.Close()
+	fatal := &FatalError{Operation: "watch", Cause: syscall.ENOSPC}
+	w.publishFatal(fatal)
+	called := false
+	err := w.Ready(func() error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, fatal) {
+		t.Fatalf("Ready() error = %v, want fatal error", err)
+	}
+	if called {
+		t.Fatal("Ready() invoked callback after fatal publication")
+	}
+}

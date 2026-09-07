@@ -8,6 +8,7 @@ import (
 var (
 	errBackendClosed  = errors.New("fsnotify channel closed unexpectedly")
 	errEventQueueFull = errors.New("file event queue is full")
+	errWatcherStopped = errors.New("filesystem watcher stopped before readiness")
 )
 
 // RegistrationError reports a failure to register filesystem coverage.

@@ -44,6 +44,7 @@ type Watcher struct {
 	closeErr      error
 	stateMu       sync.Mutex
 	ownerStopped  bool
+	fatalErr      error
 	fatalOnce     sync.Once
 
 	processingDone chan struct{}
@@ -99,6 +100,22 @@ func (w *Watcher) Events() <-chan FileEvent {
 // Errors returns fatal errors that stop event processing.
 func (w *Watcher) Errors() <-chan error {
 	return w.errors
+}
+
+// Ready invokes publish while fatal publication is excluded.
+func (w *Watcher) Ready(publish func() error) error {
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
+	if w.fatalErr != nil {
+		return w.fatalErr
+	}
+	if w.ownerStopped {
+		return errWatcherStopped
+	}
+	if publish == nil {
+		return nil
+	}
+	return publish()
 }
 
 func (w *Watcher) Close() error {

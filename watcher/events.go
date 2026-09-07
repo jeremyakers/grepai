@@ -50,6 +50,7 @@ func (w *Watcher) publishFatal(err error) {
 		if w.ownerStopped {
 			return
 		}
+		w.fatalErr = err
 		select {
 		case w.errors <- err:
 		default:

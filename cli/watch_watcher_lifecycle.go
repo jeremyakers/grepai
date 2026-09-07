@@ -8,16 +8,21 @@ import (
 
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/embedder"
-	"github.com/yoanbernabeu/grepai/rpg"
 	"github.com/yoanbernabeu/grepai/store"
-	"github.com/yoanbernabeu/grepai/trace"
 	"github.com/yoanbernabeu/grepai/watcher"
 )
 
 type watchSource interface {
 	Events() <-chan watcher.FileEvent
 	Errors() <-chan error
+	Ready(func() error) error
 	Close() error
+}
+
+func closeUnlessAborted(ctx context.Context, aborted *bool, closeFn func() error) {
+	if !*aborted && !isFatalWatcherError(context.Cause(ctx)) {
+		_ = closeFn()
+	}
 }
 
 type workspaceWatcherError struct {
@@ -75,7 +80,7 @@ func initializeWorkspaceRuntimes(ctx context.Context, ws *config.Workspace, emb 
 		if err != nil {
 			var registrationErr *watcher.RegistrationError
 			if errors.As(err, &registrationErr) {
-				closeWorkspaceRuntimes(runtimes, watchers)
+				closeWatchSources(watchers)
 				return nil, nil, fmt.Errorf("failed to initialize watcher for project %s (%s): %w", project.Name, project.Path, err)
 			}
 			log.Printf("Warning: failed to initialize runtime for %s: %v", project.Name, err)
@@ -98,6 +103,15 @@ func closeWatchSources(watchers []watchSource) {
 	}
 }
 
+func withWatchSourcesReady(watchers []watchSource, publish func() error) error {
+	if len(watchers) == 0 {
+		return publish()
+	}
+	return watchers[0].Ready(func() error {
+		return withWatchSourcesReady(watchers[1:], publish)
+	})
+}
+
 func closeWorkspaceStores(runtimes map[string]*workspaceProjectRuntime) {
 	for _, runtime := range runtimes {
 		if runtime.symbolStore != nil {
@@ -111,22 +125,6 @@ func closeWorkspaceStores(runtimes map[string]*workspaceProjectRuntime) {
 			}
 		}
 	}
-}
-
-func persistProjectStores(ctx context.Context, st store.VectorStore, symbolStore *trace.GOBSymbolStore, rpgStore rpg.RPGStore) error {
-	var errs []error
-	if err := st.Persist(ctx); err != nil {
-		errs = append(errs, fmt.Errorf("persist vector index: %w", err))
-	}
-	if err := symbolStore.Persist(ctx); err != nil {
-		errs = append(errs, fmt.Errorf("persist symbol index: %w", err))
-	}
-	if rpgStore != nil {
-		if err := rpgStore.Persist(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("persist RPG graph: %w", err))
-		}
-	}
-	return errors.Join(errs...)
 }
 
 func persistWorkspaceStores(ctx context.Context, st store.VectorStore, runtimes map[string]*workspaceProjectRuntime) error {
