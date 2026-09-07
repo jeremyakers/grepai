@@ -82,7 +82,7 @@ func NewWatcher(root string, ignore *indexer.IgnoreMatcher, debounceMs int) (*Wa
 func (w *Watcher) Start(ctx context.Context) error {
 	// Add root directory and all subdirectories
 	if err := w.addRecursive(w.root, true); err != nil {
-		_ = w.Close()
+		w.Abort()
 		return err
 	}
 
@@ -120,18 +120,26 @@ func (w *Watcher) Ready(publish func() error) error {
 
 func (w *Watcher) Close() error {
 	w.closeOnce.Do(func() {
-		w.stateMu.Lock()
-		w.ownerStopped = true
-		w.stateMu.Unlock()
-		w.stop()
-		w.pendingMu.Lock()
-		if w.timer != nil {
-			w.timer.Stop()
-		}
-		w.pendingMu.Unlock()
+		w.Abort()
 		w.closeErr = w.watcher.Close()
 	})
 	return w.closeErr
+}
+
+// Abort synchronously stops event ownership without closing the fsnotify
+// backend. Fatal CLI paths rely on immediate process exit to reclaim its file
+// descriptor; embedded callers may call Close after handling the fatal error.
+func (w *Watcher) Abort() {
+	w.stateMu.Lock()
+	w.ownerStopped = true
+	w.stateMu.Unlock()
+	w.stop()
+	w.pendingMu.Lock()
+	if w.timer != nil {
+		w.timer.Stop()
+		w.timer = nil
+	}
+	w.pendingMu.Unlock()
 }
 
 func (w *Watcher) stop() {

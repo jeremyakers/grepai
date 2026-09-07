@@ -167,6 +167,13 @@ The watcher periodically saves the index:
 - **Shutdown save**: Clean save on Ctrl+C or SIGTERM
 - **Location**: `.grepai/index.gob` (or PostgreSQL)
 
+Fatal filesystem coverage errors use a different shutdown path: event handling
+is aborted immediately and potentially untrustworthy derived state is not
+persisted. The CLI returns and exits without waiting for the filesystem backend
+to close, so the operating system reclaims its watcher descriptors at process
+exit. Embedded library callers that keep the process alive may call `Close`
+after handling the returned fatal error to release the backend explicitly.
+
 ### Background Daemon Mode
 
 Run the watcher as a background daemon with built-in lifecycle management:

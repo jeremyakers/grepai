@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"time"
 
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/embedder"
@@ -17,6 +16,7 @@ type watchSource interface {
 	Events() <-chan watcher.FileEvent
 	Errors() <-chan error
 	Ready(func() error) error
+	Abort()
 	Close() error
 }
 
@@ -26,36 +26,21 @@ func closeUnlessAborted(ctx context.Context, aborted *bool, closeFn func() error
 	}
 }
 
-const fatalWatcherCloseWait = 10 * time.Millisecond
-
 func abortWatcherReadiness(abortStores *bool, watchers []watchSource, scope string, err error, onFatal func()) error {
 	*abortStores = true
 	if onFatal != nil {
 		onFatal()
 	}
-	closeWatchSourcesPromptly(watchers)
+	abortWatchSources(watchers)
 	if isFatalWatcherError(err) {
 		return err
 	}
 	return &watcher.FatalError{Operation: "publish watcher readiness", Path: scope, Cause: err}
 }
 
-func closeWatchSourcesPromptly(watchers []watchSource) {
-	done := make(chan struct{}, len(watchers))
-	for _, source := range watchers {
-		go func(w watchSource) {
-			_ = w.Close()
-			done <- struct{}{}
-		}(source)
-	}
-	deadline := time.NewTimer(fatalWatcherCloseWait)
-	defer deadline.Stop()
-	for range watchers {
-		select {
-		case <-done:
-		case <-deadline.C:
-			return
-		}
+func abortWatchSources(watchers []watchSource) {
+	for _, w := range watchers {
+		w.Abort()
 	}
 }
 
@@ -114,7 +99,7 @@ func initializeWorkspaceRuntimes(ctx context.Context, ws *config.Workspace, emb 
 		if err != nil {
 			var registrationErr *watcher.RegistrationError
 			if errors.As(err, &registrationErr) {
-				closeWatchSources(watchers)
+				abortWatchSources(watchers)
 				return nil, nil, fmt.Errorf("failed to initialize watcher for project %s (%s): %w", project.Name, project.Path, err)
 			}
 			log.Printf("Warning: failed to initialize runtime for %s: %v", project.Name, err)

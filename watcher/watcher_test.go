@@ -27,7 +27,7 @@ func newTestWatcher(t *testing.T, root string) *Watcher {
 	return w
 }
 
-func TestStartAddENOSPCFailsAndClosesWatcher(t *testing.T) {
+func TestStartAddENOSPCFailsAndAbortsWatcher(t *testing.T) {
 	root := t.TempDir()
 	child := filepath.Join(root, "child")
 	if err := os.Mkdir(child, 0o755); err != nil {
@@ -59,8 +59,8 @@ func TestStartAddENOSPCFailsAndClosesWatcher(t *testing.T) {
 	if w.processingDone != nil {
 		t.Fatal("Start() launched event processing after registration failure")
 	}
-	if err := w.watcher.Add(root); err == nil {
-		t.Fatal("fsnotify watcher remained open after failed startup")
+	if err := w.watcher.Add(root); err != nil {
+		t.Fatalf("fatal abort closed fsnotify backend: %v", err)
 	}
 	if err := w.Close(); err != nil {
 		t.Fatalf("Close() after failed Start = %v", err)
@@ -104,6 +104,7 @@ func TestStartIgnoresVanishedDirectory(t *testing.T) {
 func TestStartRootAddENOENTIsFatal(t *testing.T) {
 	root := t.TempDir()
 	w := newTestWatcher(t, root)
+	defer w.Close()
 	w.addWatch = func(string) error { return syscall.ENOENT }
 
 	err := w.Start(context.Background())

@@ -19,6 +19,7 @@ type fakeWatchSource struct {
 	events   chan watcher.FileEvent
 	errors   chan error
 	closed   int
+	aborted  int
 	readyErr error
 }
 
@@ -46,6 +47,8 @@ func (w *fakeWatchSource) Close() error {
 	w.closed++
 	return nil
 }
+
+func (w *fakeWatchSource) Abort() { w.aborted++ }
 
 func TestWorkspaceReadinessRefusesPreloadedWatcherFatal(t *testing.T) {
 	fatal := &watcher.FatalError{Operation: "watch", Cause: syscall.ENOSPC}
@@ -103,7 +106,8 @@ func TestForwardWorkspaceWatcherFatalIdentifiesProjectAndStops(t *testing.T) {
 }
 
 func TestInitializeWorkspaceRuntimesRegistrationFailureCleansPriorRuntime(t *testing.T) {
-	first := newFakeWatchSource()
+	first := newNonCooperativeCloseWatchSource()
+	defer close(first.blockClose)
 	symbolPath := filepath.Join(t.TempDir(), "symbols.gob")
 	symbolStore := trace.NewGOBSymbolStore(symbolPath)
 	ws := &config.Workspace{Projects: []config.ProjectEntry{
@@ -119,12 +123,22 @@ func TestInitializeWorkspaceRuntimesRegistrationFailureCleansPriorRuntime(t *tes
 		return nil, nil, &watcher.RegistrationError{Operation: "add watch", Path: "/second", Cause: syscall.ENOSPC}
 	}
 
-	_, _, err := initializeWorkspaceRuntimes(context.Background(), ws, nil, nil, false, initFn)
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := initializeWorkspaceRuntimes(context.Background(), ws, nil, nil, false, initFn)
+		result <- err
+	}()
+	var err error
+	select {
+	case <-first.closeStarted:
+		t.Fatal("registration failure invoked non-cooperative watcher Close")
+	case err = <-result:
+	}
 	if !errors.Is(err, syscall.ENOSPC) {
 		t.Fatalf("initializeWorkspaceRuntimes() error = %v, want ENOSPC", err)
 	}
-	if first.closed != 1 {
-		t.Fatalf("prior watcher closed %d times, want 1", first.closed)
+	if first.aborted != 1 || first.closed != 0 {
+		t.Fatalf("prior watcher aborts/closes = %d/%d, want 1/0", first.aborted, first.closed)
 	}
 	if _, statErr := os.Stat(symbolPath); !os.IsNotExist(statErr) {
 		t.Fatalf("fatal workspace startup serialized symbol store: %v", statErr)

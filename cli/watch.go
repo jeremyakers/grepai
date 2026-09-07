@@ -1142,6 +1142,7 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 
 	if err := w.Start(ctx); err != nil {
 		abortStores = isFatalWatcherError(err)
+		abortWatcherClose = abortStores
 		return fmt.Errorf("failed to start watcher for %s: %w", projectRoot, err)
 	}
 
@@ -1216,7 +1217,7 @@ func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore 
 				if onFatal != nil {
 					onFatal()
 				}
-				closeWatchSourcesPromptly([]watchSource{w})
+				w.Abort()
 				return cause
 			}
 			if err := st.Persist(ctx); err != nil {
@@ -1256,7 +1257,7 @@ func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore 
 			if onFatal != nil {
 				onFatal()
 			}
-			closeWatchSourcesPromptly([]watchSource{w})
+			w.Abort()
 			return primary
 		}
 	}
@@ -2704,8 +2705,9 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		select {
 		case fatalErr := <-fatalChan:
 			abortStores = true
+			abortWatcherClose = true
 			stopForwarders()
-			closeWatchers()
+			abortWatchSources(watchers)
 			return fatalErr
 		default:
 		}
@@ -2774,13 +2776,14 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 
 		case err := <-fatalChan:
 			abortStores = true
+			abortWatcherClose = true
 			if isBackgroundChild {
 				if removeErr := daemon.RemoveWorkspaceReadyFile(logDir, ws.Name); removeErr != nil {
 					log.Printf("Warning: failed to withdraw workspace ready marker: %v", removeErr)
 				}
 			}
 			stopForwarders()
-			closeWatchers()
+			abortWatchSources(watchers)
 			return err
 
 		case event := <-eventChan:
@@ -2940,8 +2943,10 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		return nil, nil, fmt.Errorf("failed to create watcher: %w", err)
 	}
 	if err := w.Start(ctx); err != nil {
-		w.Close()
-		if !isFatalWatcherError(err) {
+		if isFatalWatcherError(err) {
+			w.Abort()
+		} else {
+			_ = w.Close()
 			if rpgStore != nil {
 				_ = rpgStore.Close()
 			}

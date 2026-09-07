@@ -46,8 +46,8 @@ func (w *Watcher) processEvents(ctx context.Context) {
 func (w *Watcher) publishFatal(err error) {
 	w.fatalOnce.Do(func() {
 		w.stateMu.Lock()
-		defer w.stateMu.Unlock()
 		if w.ownerStopped {
+			w.stateMu.Unlock()
 			return
 		}
 		w.fatalErr = err
@@ -55,7 +55,8 @@ func (w *Watcher) publishFatal(err error) {
 		case w.errors <- err:
 		default:
 		}
-		w.stop()
+		w.stateMu.Unlock()
+		w.Abort()
 	})
 }
 
@@ -110,6 +111,9 @@ func (w *Watcher) handleEvent(event fsnotify.Event) error {
 func (w *Watcher) debounceEvent(event FileEvent) {
 	w.pendingMu.Lock()
 	defer w.pendingMu.Unlock()
+	if w.stopped() {
+		return
+	}
 	existing, exists := w.pending[event.Path]
 	if !exists || existing.Type != EventDelete || event.Type == EventDelete {
 		w.pending[event.Path] = event

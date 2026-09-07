@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/yoanbernabeu/grepai/watcher"
 )
@@ -29,29 +28,40 @@ func (w *nonCooperativeCloseWatchSource) Close() error {
 	return nil
 }
 
+func (w *nonCooperativeCloseWatchSource) Abort() { w.aborted++ }
+
 func testReadyCallbackFatalReturnsPromptly(t *testing.T, scope string, sources []watchSource) {
 	t.Helper()
 	markerErr := errors.New("ready marker write failed")
 	abortStores := false
 	storeCloseCalled := make(chan struct{}, 1)
 	result := make(chan error, 1)
+	for _, source := range sources {
+		if blocking, ok := source.(*nonCooperativeCloseWatchSource); ok {
+			defer close(blocking.blockClose)
+		}
+	}
 	go func() {
 		err := abortWatcherReadiness(&abortStores, sources, scope, markerErr, nil)
 		closeUnlessAborted(context.Background(), &abortStores, func() error {
 			storeCloseCalled <- struct{}{}
-			select {}
+			return nil
 		})
 		result <- err
 	}()
 
-	select {
-	case err := <-result:
-		var fatalErr *watcher.FatalError
-		if !errors.As(err, &fatalErr) || !errors.Is(err, markerErr) {
-			t.Fatalf("abortWatcherReadiness() error = %T %v, want fatal marker error", err, err)
+	err := <-result
+	var fatalErr *watcher.FatalError
+	if !errors.As(err, &fatalErr) || !errors.Is(err, markerErr) {
+		t.Fatalf("abortWatcherReadiness() error = %T %v, want fatal marker error", err, err)
+	}
+	for _, source := range sources {
+		blocking := source.(*nonCooperativeCloseWatchSource)
+		select {
+		case <-blocking.closeStarted:
+			t.Fatal("fatal helper invoked non-cooperative Close")
+		default:
 		}
-	case <-time.After(time.Second):
-		t.Fatal("ready callback fatal path blocked on watcher/store close")
 	}
 	select {
 	case <-storeCloseCalled:
@@ -63,10 +73,8 @@ func testReadyCallbackFatalReturnsPromptly(t *testing.T, scope string, sources [
 func TestProjectReadyCallbackErrorIsFatalWithoutBlockingClose(t *testing.T) {
 	source := newNonCooperativeCloseWatchSource()
 	testReadyCallbackFatalReturnsPromptly(t, "project /repo", []watchSource{source})
-	select {
-	case <-source.closeStarted:
-	case <-time.After(time.Second):
-		t.Fatal("project watcher close was not started")
+	if source.aborted != 1 {
+		t.Fatalf("project watcher aborted %d times, want 1", source.aborted)
 	}
 }
 
@@ -75,10 +83,8 @@ func TestWorkspaceReadyCallbackErrorIsFatalWithoutBlockingCloses(t *testing.T) {
 	second := newNonCooperativeCloseWatchSource()
 	testReadyCallbackFatalReturnsPromptly(t, "workspace ws", []watchSource{first, second})
 	for i, source := range []*nonCooperativeCloseWatchSource{first, second} {
-		select {
-		case <-source.closeStarted:
-		case <-time.After(time.Second):
-			t.Fatalf("workspace watcher %d close was not started", i)
+		if source.aborted != 1 {
+			t.Fatalf("workspace watcher %d aborted %d times, want 1", i, source.aborted)
 		}
 	}
 }

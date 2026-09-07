@@ -26,7 +26,7 @@ func (s *persistCountingStore) Persist(context.Context) error {
 	return nil
 }
 
-func TestRunProjectWatchLoopFatalWatcherErrorSkipsPersistenceAndCloses(t *testing.T) {
+func TestRunProjectWatchLoopFatalWatcherErrorSkipsPersistenceAndAborts(t *testing.T) {
 	root := t.TempDir()
 	source := newFakeWatchSource()
 	fatal := &watcher.FatalError{Operation: "process filesystem events", Path: root, Cause: syscall.ENOSPC}
@@ -43,8 +43,8 @@ func TestRunProjectWatchLoopFatalWatcherErrorSkipsPersistenceAndCloses(t *testin
 	if vectorStore.persists != 0 {
 		t.Fatalf("vector store persisted %d times, want 0", vectorStore.persists)
 	}
-	if source.closed != 1 {
-		t.Fatalf("watcher closed %d times, want 1", source.closed)
+	if source.aborted != 1 || source.closed != 0 {
+		t.Fatalf("watcher aborts/closes = %d/%d, want 1/0", source.aborted, source.closed)
 	}
 	if !readyWithdrawn {
 		t.Fatal("ready marker was not withdrawn before fatal return")
@@ -114,8 +114,8 @@ func TestRunProjectWatchLoopFatalCancellationSkipsPersistence(t *testing.T) {
 	if st.persists != 0 {
 		t.Fatalf("fatal cancellation persisted %d times, want 0", st.persists)
 	}
-	if source.closed != 1 {
-		t.Fatalf("watcher closed %d times, want 1", source.closed)
+	if source.aborted != 1 || source.closed != 0 {
+		t.Fatalf("watcher aborts/closes = %d/%d, want 1/0", source.aborted, source.closed)
 	}
 }
 
