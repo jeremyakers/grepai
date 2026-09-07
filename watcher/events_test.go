@@ -176,11 +176,13 @@ func TestBackendClosureAfterContextCancellationIsClean(t *testing.T) {
 
 func TestUnderlyingFSNotifyErrorPublishesFatalAndStops(t *testing.T) {
 	w := newTestWatcher(t, t.TempDir())
+	backendErrors := make(chan error)
+	w.backendEvents, w.backendErrors = make(chan fsnotify.Event), backendErrors
 	if err := w.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	w.watcher.Errors <- fsnotify.ErrEventOverflow
+	backendErrors <- fsnotify.ErrEventOverflow
 	err := <-w.Errors()
 	var fatalErr *FatalError
 	if !errors.As(err, &fatalErr) || !errors.Is(err, fsnotify.ErrEventOverflow) {

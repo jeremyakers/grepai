@@ -12,8 +12,8 @@ import (
 )
 
 func TestDynamicWatchSupervisorLinkedWatcherFatalStopsAllSessions(t *testing.T) {
-	mainRoot := t.TempDir()
-	linkedRoot := t.TempDir()
+	mainRoot := canonicalPath(t.TempDir())
+	linkedRoot := canonicalPath(t.TempDir())
 	fatal := &watcher.FatalError{Operation: "process filesystem events", Path: linkedRoot, Cause: syscall.ENOSPC}
 	runner := func(ctx context.Context, projectRoot string, _ embedder.Embedder, _ bool, onReady func(), _ watchSessionEventObserver, _ func(int, int, string), _ func(indexer.BatchProgressInfo), _ func(string, int, int), _ watchActivityObserver, _ watchStatsObserver) error {
 		if projectRoot == linkedRoot {

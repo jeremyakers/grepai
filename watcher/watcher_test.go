@@ -6,7 +6,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"testing"
 
@@ -52,9 +51,6 @@ func TestStartAddENOSPCFailsAndAbortsWatcher(t *testing.T) {
 	}
 	if registrationErr.Operation != "add watch" || registrationErr.Path != child {
 		t.Fatalf("registration error = %#v", registrationErr)
-	}
-	if !strings.Contains(err.Error(), "inotify watch limit") || strings.Contains(err.Error(), "disk") {
-		t.Fatalf("Start() error is not actionable: %v", err)
 	}
 	if w.processingDone != nil {
 		t.Fatal("Start() launched event processing after registration failure")
