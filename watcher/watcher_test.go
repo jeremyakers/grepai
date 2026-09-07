@@ -135,8 +135,17 @@ func TestStartMissingRootFailsAndClosesWatcher(t *testing.T) {
 
 func TestRuntimeDirectoryAddFailurePublishesFatalAndStops(t *testing.T) {
 	root := t.TempDir()
-	w := newTestWatcher(t, root)
 	created := filepath.Join(root, "created")
+	if err := os.Mkdir(created, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := newTestWatcher(t, root)
+	backendEvents := make(chan fsnotify.Event)
+	w.backendEvents, w.backendErrors = backendEvents, make(chan error)
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer w.Close()
 	originalAdd := w.addWatch
 	w.addWatch = func(path string) error {
 		if path == created {
@@ -144,14 +153,7 @@ func TestRuntimeDirectoryAddFailurePublishesFatalAndStops(t *testing.T) {
 		}
 		return originalAdd(path)
 	}
-	if err := w.Start(context.Background()); err != nil {
-		t.Fatalf("Start() error = %v", err)
-	}
-	defer w.Close()
-	if err := os.Mkdir(created, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	w.watcher.Events <- fsnotify.Event{Name: created, Op: fsnotify.Create}
+	backendEvents <- fsnotify.Event{Name: created, Op: fsnotify.Create}
 
 	err := <-w.Errors()
 	var registrationErr *RegistrationError
