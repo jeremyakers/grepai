@@ -748,12 +748,9 @@ func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore trace.S
 }
 
 func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore trace.SymbolStore, tracedLanguages []string, lastIndexTime time.Time, isBackgroundChild bool, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), processors ...*framework.ProcessorRegistry) (*indexer.IndexStats, error) {
-	fingerprints, ok := symbolStore.(interface {
-		GetFileContentHash(string) (string, bool)
-		GetFileExtractorVersion(string) (string, bool)
-	})
-	if !ok {
-		return nil, fmt.Errorf("symbol store does not support file fingerprints")
+	fingerprints, err := loadWatchSymbolFingerprints(ctx, symbolStore)
+	if err != nil {
+		return nil, err
 	}
 	// Initial scan with progress
 	if !isBackgroundChild {
@@ -763,7 +760,6 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	}
 
 	var stats *indexer.IndexStats
-	var err error
 	if !isBackgroundChild {
 		stats, err = idx.IndexAllWithBatchProgress(ctx,
 			func(info indexer.ProgressInfo) {
@@ -829,7 +825,7 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 		// re-processes files whose source didn't change.
 		if !lastIndexTime.IsZero() {
 			fileModTime := time.Unix(file.ModTime, 0)
-			if (fileModTime.Before(lastIndexTime) || fileModTime.Equal(lastIndexTime)) && symbolStore.IsFileIndexed(file.Path) {
+			if (fileModTime.Before(lastIndexTime) || fileModTime.Equal(lastIndexTime)) && fingerprints.IsFileIndexed(file.Path) {
 				if v, ok := fingerprints.GetFileExtractorVersion(file.Path); ok && v == extractor.Version() {
 					continue
 				}
@@ -862,7 +858,7 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 			continue
 		}
 		if err := symbolStore.SaveFileWithSignature(ctx, fileInfo.Path, fileInfo.Hash, extractor.Version(), symbols, refs); err != nil {
-			log.Printf("Warning: failed to save symbols for %s: %v", fileInfo.Path, err)
+			return nil, fmt.Errorf("failed to save symbols for %s: %w", fileInfo.Path, err)
 		}
 		symbolCount += len(symbols)
 	}
@@ -2157,7 +2153,7 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			log.Printf("Failed to index %s: %v", event.Path, err)
 			return
 		}
-		log.Printf("Indexed %s (%d chunks)", event.Path, chunks)
+		log.Printf("Indexed %q (%d chunks)", event.Path, chunks) //nolint:gosec // G706: %q escapes the path; the remaining argument is an integer.
 
 		// Report stats (files/chunks)
 		if onStats != nil {
@@ -2190,7 +2186,7 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			} else if err := symbolStore.SaveFileWithSignature(ctx, fileInfo.Path, fileInfo.Hash, extractor.Version(), symbols, refs); err != nil {
 				log.Printf("Failed to save symbols for %s: %v", event.Path, err)
 			} else {
-				log.Printf("Extracted %d symbols from %s", len(symbols), event.Path)
+				log.Printf("Extracted %d symbols from %q", len(symbols), event.Path) //nolint:gosec // G706: %q escapes the path; the remaining argument is an integer.
 
 				if onStats != nil {
 					onStats(projectRoot, watchStatsDelta{
@@ -2218,7 +2214,7 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 					if rpgManager != nil {
 						rpgManager.MarkFileDirty(fileInfo.Path)
 						dirtyCount, _, _, _ := rpgManager.Snapshot()
-						log.Printf("rpg_event_applied_ms=%d file=%s event=%s rpg_dirty_files_count=%d",
+						log.Printf("rpg_event_applied_ms=%d file=%q event=%s rpg_dirty_files_count=%d", //nolint:gosec // G706: path is quoted; other values are integers and fixed EventType labels.
 							time.Since(start).Milliseconds(),
 							fileInfo.Path,
 							eventType.String(),
@@ -2254,7 +2250,7 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			} else if rpgManager != nil {
 				rpgManager.MarkFileDirty(event.Path)
 				dirtyCount, _, _, _ := rpgManager.Snapshot()
-				log.Printf("rpg_event_applied_ms=%d file=%s event=%s rpg_dirty_files_count=%d",
+				log.Printf("rpg_event_applied_ms=%d file=%q event=%s rpg_dirty_files_count=%d", //nolint:gosec // G706: path is quoted; other values are integers and fixed EventType labels.
 					time.Since(start).Milliseconds(),
 					event.Path,
 					eventType.String(),
@@ -2611,50 +2607,18 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 	}
 	defer st.Close()
 
-	runtimes := make(map[string]*workspaceProjectRuntime, len(ws.Projects))
-	watchers := make([]*watcher.Watcher, 0, len(ws.Projects))
-
-	for _, project := range ws.Projects {
+	runtimes, watchers, err := initializeWorkspaceRuntimesBeforeReady(ctx, ws, emb, st, isBackgroundChild, initializeWorkspaceRuntime, func() error {
 		if !isBackgroundChild {
-			fmt.Printf("\nIndexing project: %s (%s)\n", project.Name, project.Path)
-		} else {
-			log.Printf("Indexing project: %s (%s)", project.Name, project.Path)
+			return nil
 		}
-
-		runtime, w, rtErr := initializeWorkspaceRuntime(ctx, ws, project, emb, st, isBackgroundChild)
-		if rtErr != nil {
-			log.Printf("Warning: failed to initialize runtime for %s: %v", project.Name, rtErr)
-			continue
-		}
-
-		projectKey := canonicalPath(project.Path)
-		runtimes[projectKey] = runtime
-		watchers = append(watchers, w)
+		return daemon.WriteWorkspaceReadyFile(logDir, ws.Name)
+	})
+	if err != nil {
+		return err
 	}
+	defer closeWorkspaceRuntimes(runtimes, watchers)
 
-	defer func() {
-		for _, w := range watchers {
-			w.Close()
-		}
-		for _, runtime := range runtimes {
-			if runtime.symbolStore != nil {
-				if err := runtime.symbolStore.Close(); err != nil {
-					log.Printf("Warning: failed to close symbol store for %s: %v", runtime.project.Path, err)
-				}
-			}
-			if runtime.rpgStore != nil {
-				if err := runtime.rpgStore.Close(); err != nil {
-					log.Printf("Warning: failed to close RPG store for %s: %v", runtime.project.Path, err)
-				}
-			}
-		}
-	}()
-
-	// Write ready file
 	if isBackgroundChild {
-		if err := daemon.WriteWorkspaceReadyFile(logDir, ws.Name); err != nil {
-			return fmt.Errorf("failed to write ready file: %w", err)
-		}
 		defer func() {
 			if err := daemon.RemoveWorkspaceReadyFile(logDir, ws.Name); err != nil {
 				log.Printf("Warning: failed to remove ready file on exit: %v", err)
@@ -2670,7 +2634,7 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 	if !isBackgroundChild {
 		fmt.Printf("\nWatching %d projects for changes... (Press Ctrl+C to stop)\n", len(runtimes))
 	} else {
-		log.Printf("Watching %d projects for changes...", len(runtimes))
+		log.Printf("Watching %d projects for changes...", len(runtimes)) //nolint:gosec // G706: only an integer length is formatted; it cannot inject log lines.
 	}
 
 	// Collect events from all watchers

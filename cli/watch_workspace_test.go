@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,8 +13,71 @@ import (
 
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/daemon"
+	"github.com/yoanbernabeu/grepai/embedder"
 	"github.com/yoanbernabeu/grepai/indexer"
+	"github.com/yoanbernabeu/grepai/store"
+	"github.com/yoanbernabeu/grepai/watcher"
 )
+
+func TestInitializeWorkspaceRuntimesFailureIsAllOrNothingBeforeReady(t *testing.T) {
+	wantErr := errors.New("fingerprint snapshot failed")
+	tests := []struct {
+		name        string
+		failOnCall  int
+		wantCloses  int
+		wantInitRun int
+	}{
+		{name: "first project fails", failOnCall: 1, wantCloses: 0, wantInitRun: 1},
+		{name: "second project fails", failOnCall: 2, wantCloses: 1, wantInitRun: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ws := &config.Workspace{Name: "ws", Projects: []config.ProjectEntry{
+				{Name: "first", Path: "/first"},
+				{Name: "second", Path: "/second"},
+			}}
+			opened := &failingWatchSymbolStore{}
+			initCalls := 0
+			initializer := func(_ context.Context, _ *config.Workspace, project config.ProjectEntry, _ embedder.Embedder, _ store.VectorStore, _ bool) (*workspaceProjectRuntime, *watcher.Watcher, error) {
+				initCalls++
+				if initCalls == test.failOnCall {
+					return nil, nil, wantErr
+				}
+				return &workspaceProjectRuntime{project: project, symbolStore: opened}, nil, nil
+			}
+			readyCalls := 0
+
+			_, _, err := initializeWorkspaceRuntimesBeforeReady(context.Background(), ws, nil, nil, true, initializer, func() error {
+				readyCalls++
+				return nil
+			})
+
+			if !errors.Is(err, wantErr) || !strings.Contains(err.Error(), ws.Projects[test.failOnCall-1].Name) {
+				t.Fatalf("error = %v, want wrapped project error %v", err, wantErr)
+			}
+			if initCalls != test.wantInitRun || opened.closes != test.wantCloses || readyCalls != 0 {
+				t.Fatalf("init calls=%d closes=%d ready calls=%d; want %d/%d/0", initCalls, opened.closes, readyCalls, test.wantInitRun, test.wantCloses)
+			}
+		})
+	}
+}
+
+func TestInitializeWorkspaceRuntimesBeforeReadyPreservesEmptyWorkspace(t *testing.T) {
+	ws := &config.Workspace{Name: "empty"}
+	readyCalls := 0
+	initializer := func(context.Context, *config.Workspace, config.ProjectEntry, embedder.Embedder, store.VectorStore, bool) (*workspaceProjectRuntime, *watcher.Watcher, error) {
+		t.Fatal("initializer called for empty workspace")
+		return nil, nil, nil
+	}
+
+	runtimes, watchers, err := initializeWorkspaceRuntimesBeforeReady(context.Background(), ws, nil, nil, true, initializer, func() error {
+		readyCalls++
+		return nil
+	})
+	if err != nil || len(runtimes) != 0 || len(watchers) != 0 || readyCalls != 1 {
+		t.Fatalf("runtimes=%d watchers=%d ready=%d err=%v; want empty success and one ready publication", len(runtimes), len(watchers), readyCalls, err)
+	}
+}
 
 func withWatchGlobals(t *testing.T, workspace string, status, stop, background bool) {
 	t.Helper()
