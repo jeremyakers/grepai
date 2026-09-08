@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,31 +13,37 @@ import (
 )
 
 func TestProjectChildFailureBeforeWatcherSetupRemovesReadyMarker(t *testing.T) {
+	if os.Getenv("GREPAI_TEST_PROJECT_CHILD_FAILURE") == "1" {
+		watchLogDir = os.Getenv("GREPAI_TEST_LOG_DIR")
+		if err := os.Chdir(os.Getenv("GREPAI_TEST_WORKING_DIR")); err != nil {
+			t.Fatal(err)
+		}
+		if err := runWatchForeground(); err == nil {
+			t.Fatal("runWatchForeground() succeeded without project configuration")
+		}
+		if daemon.IsReady(watchLogDir) {
+			t.Fatal("project ready marker remains after pre-registration failure")
+		}
+		return
+	}
+
 	logDir := t.TempDir()
 	workingDir := t.TempDir()
 	if err := daemon.WriteReadyFile(logDir); err != nil {
 		t.Fatal(err)
 	}
-	originalDir, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chdir(workingDir); err != nil {
-		t.Fatal(err)
-	}
-	originalLogDir := watchLogDir
-	originalLogFlags, originalLogPrefix := log.Flags(), log.Prefix()
-	watchLogDir = logDir
-	t.Setenv("GREPAI_BACKGROUND", "1")
-	t.Cleanup(func() {
-		watchLogDir = originalLogDir
-		log.SetFlags(originalLogFlags)
-		log.SetPrefix(originalLogPrefix)
-		_ = os.Chdir(originalDir)
-	})
 
-	if err := runWatchForeground(); err == nil {
-		t.Fatal("runWatchForeground() succeeded without project configuration")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestProjectChildFailureBeforeWatcherSetupRemovesReadyMarker$")
+	cmd.Env = append(os.Environ(),
+		"GREPAI_BACKGROUND=1",
+		"GREPAI_TEST_PROJECT_CHILD_FAILURE=1",
+		"GREPAI_TEST_LOG_DIR="+logDir,
+		"GREPAI_TEST_WORKING_DIR="+workingDir,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("project child helper failed: %v\n%s", err, output)
 	}
 	if daemon.IsReady(logDir) {
 		t.Fatal("project ready marker remains after pre-registration failure")
