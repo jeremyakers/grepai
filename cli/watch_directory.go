@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/yoanbernabeu/grepai/store"
 	"github.com/yoanbernabeu/grepai/trace"
@@ -23,6 +24,21 @@ type indexedFileLister interface {
 
 var errWatchPathReplaced = errors.New("watched path has a non-regular replacement")
 
+func watchPathAbsent(err error) bool {
+	return os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR)
+}
+
+func validateWatchProjectRoot(projectRoot string, stat watchPathStat) error {
+	info, err := stat(projectRoot)
+	if err != nil {
+		return fmt.Errorf("stat watch project root %s: %w", projectRoot, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("watch project root %s is not a directory", projectRoot)
+	}
+	return nil
+}
+
 func requalifyRemovedFile(projectRoot string, event watcher.FileEvent, stat watchPathStat) (watcher.EventType, error) {
 	info, err := stat(filepath.Join(projectRoot, event.Path))
 	if err == nil && info.Mode().IsRegular() {
@@ -34,18 +50,42 @@ func requalifyRemovedFile(projectRoot string, event watcher.FileEvent, stat watc
 	if err == nil {
 		return event.Type, errWatchPathReplaced
 	}
-	if !os.IsNotExist(err) {
+	if !watchPathAbsent(err) {
 		return event.Type, err
 	}
 	return event.Type, nil
 }
 
 func reconcileDeletedDirectory(ctx context.Context, projectRoot, directory string, vectorStore store.VectorStore, symbolStore trace.SymbolStore, dispatch func(watcher.FileEvent)) error {
-	paths, err := indexedPathsUnderDirectory(ctx, directory, vectorStore, symbolStore)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	events, err := planDeletedDirectory(ctx, projectRoot, paths, os.Lstat)
+	directory = filepath.Clean(directory)
+	if directory == "." {
+		return nil
+	}
+	if err := validateWatchProjectRoot(projectRoot, os.Lstat); err != nil {
+		return err
+	}
+
+	rootInfo, rootErr := os.Lstat(filepath.Join(projectRoot, directory))
+	if rootErr != nil && !watchPathAbsent(rootErr) {
+		return fmt.Errorf("stat directory event path %s: %w", directory, rootErr)
+	}
+	if rootErr == nil && !rootInfo.IsDir() && !rootInfo.Mode().IsRegular() {
+		return nil
+	}
+
+	paths, err := indexedPathsUnderDirectory(ctx, directory, vectorStore, symbolStore)
+	if err != nil {
+		// The indexed descendants are unknown, but a confirmed regular replacement
+		// is independent new state and must not wait for a watcher restart.
+		if rootErr == nil && rootInfo.Mode().IsRegular() && ctx.Err() == nil {
+			dispatch(watcher.FileEvent{Type: watcher.EventModify, Path: directory})
+		}
+		return err
+	}
+	events, err := planDeletedDirectory(ctx, projectRoot, directory, paths, os.Lstat)
 	if err != nil {
 		return err
 	}
@@ -96,7 +136,46 @@ func pathInDirectory(path, directory string) bool {
 	return path == directory || strings.HasPrefix(path, directory+"/")
 }
 
-func planDeletedDirectory(ctx context.Context, projectRoot string, paths []string, stat watchPathStat) ([]watcher.FileEvent, error) {
+func planDeletedDirectory(ctx context.Context, projectRoot, directory string, paths []string, stat watchPathStat) ([]watcher.FileEvent, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	directory = filepath.Clean(directory)
+	if directory == "." {
+		return nil, nil
+	}
+	if err := validateWatchProjectRoot(projectRoot, stat); err != nil {
+		return nil, err
+	}
+
+	info, err := stat(filepath.Join(projectRoot, directory))
+	switch {
+	case err == nil && info.Mode().IsRegular():
+		events := make([]watcher.FileEvent, 0, len(paths)+1)
+		for _, path := range paths {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			if filepath.Clean(path) != directory {
+				events = append(events, watcher.FileEvent{Type: watcher.EventDelete, Path: path})
+			}
+		}
+		return append(events, watcher.FileEvent{Type: watcher.EventModify, Path: directory}), nil
+	case err == nil && !info.IsDir():
+		return nil, nil
+	case err != nil && !watchPathAbsent(err):
+		return nil, fmt.Errorf("stat directory event path %s: %w", directory, err)
+	case watchPathAbsent(err):
+		events := make([]watcher.FileEvent, 0, len(paths))
+		for _, path := range paths {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			events = append(events, watcher.FileEvent{Type: watcher.EventDelete, Path: path})
+		}
+		return events, nil
+	}
+
 	events := make([]watcher.FileEvent, 0, len(paths))
 	for _, path := range paths {
 		if err := ctx.Err(); err != nil {
@@ -108,7 +187,7 @@ func planDeletedDirectory(ctx context.Context, projectRoot string, paths []strin
 			events = append(events, watcher.FileEvent{Type: watcher.EventModify, Path: path})
 		case err == nil:
 			// A replacement exists at this path. Leave its indexed state alone.
-		case os.IsNotExist(err):
+		case watchPathAbsent(err):
 			events = append(events, watcher.FileEvent{Type: watcher.EventDelete, Path: path})
 		default:
 			return nil, fmt.Errorf("stat indexed path %s: %w", path, err)

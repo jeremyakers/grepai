@@ -151,6 +151,11 @@ func (s *Scanner) isSupported(ext string) bool {
 	return s.extraExts[ext]
 }
 
+// SupportsPath reports whether path has an extension configured for scanning.
+func (s *Scanner) SupportsPath(path string) bool {
+	return s.isSupported(strings.ToLower(filepath.Ext(path)))
+}
+
 // ScanMetadata scans indexable files and returns only file metadata.
 // It avoids reading file contents and hash computation for a faster first pass.
 func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {

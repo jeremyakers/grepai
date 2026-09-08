@@ -47,19 +47,27 @@ func TestPlanDeletedDirectoryPreservesAllPathsOnStatFailure(t *testing.T) {
 	for _, cause := range []error{syscall.EACCES, syscall.EIO} {
 		t.Run(cause.Error(), func(t *testing.T) {
 			calls := 0
-			events, err := planDeletedDirectory(context.Background(), "/project", []string{"src/absent.go", "src/unreadable.go"}, func(path string) (fs.FileInfo, error) {
+			events, err := planDeletedDirectory(context.Background(), "/project", "src", []string{"src/absent.go", "src/unreadable.go"}, func(path string) (fs.FileInfo, error) {
 				calls++
+				if filepath.Clean(path) == "/project" || filepath.Base(path) == "src" {
+					return testDirectoryInfo{}, nil
+				}
 				if filepath.Base(path) == "absent.go" {
 					return nil, fs.ErrNotExist
 				}
 				return nil, cause
 			})
-			if !errors.Is(err, cause) || events != nil || calls != 2 {
+			if !errors.Is(err, cause) || events != nil || calls != 4 {
 				t.Fatalf("events=%#v err=%v calls=%d", events, err, calls)
 			}
 		})
 	}
 }
+
+type testDirectoryInfo struct{ fs.FileInfo }
+
+func (testDirectoryInfo) IsDir() bool       { return true }
+func (testDirectoryInfo) Mode() fs.FileMode { return fs.ModeDir }
 
 func TestRequalifyRemovedFilePreservesOnStatFailure(t *testing.T) {
 	for _, cause := range []error{syscall.EACCES, syscall.EIO} {
@@ -72,6 +80,56 @@ func TestRequalifyRemovedFilePreservesOnStatFailure(t *testing.T) {
 				t.Fatalf("type=%v err=%v", eventType, err)
 			}
 		})
+	}
+}
+
+func TestPlanDeletedDirectoryNeverPurgesRoot(t *testing.T) {
+	events, err := planDeletedDirectory(context.Background(), "/project", ".", []string{"main.go"}, func(string) (fs.FileInfo, error) {
+		t.Fatal("root reconciliation must not inspect the filesystem")
+		return nil, nil
+	})
+	if err != nil || events != nil {
+		t.Fatalf("events=%#v err=%v", events, err)
+	}
+}
+
+func TestPlanDeletedDirectoryHonorsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	events, err := planDeletedDirectory(ctx, "/project", "src", []string{"src/main.go"}, func(string) (fs.FileInfo, error) {
+		t.Fatal("canceled reconciliation must not inspect the filesystem")
+		return nil, nil
+	})
+	if !errors.Is(err, context.Canceled) || events != nil {
+		t.Fatalf("events=%#v err=%v", events, err)
+	}
+}
+
+type failingListVectorStore struct {
+	*mockVectorStore
+	err error
+}
+
+func (s *failingListVectorStore) ListDocuments(context.Context) ([]string, error) {
+	return nil, s.err
+}
+
+func TestReconcileDeletedDirectoryIndexesKnownReplacementOnListFailure(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "target.go"), []byte("package target"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cause := syscall.EIO
+	var got []watcher.FileEvent
+	err := reconcileDeletedDirectory(context.Background(), root, "target.go", &failingListVectorStore{mockVectorStore: &mockVectorStore{}, err: cause}, nil, func(event watcher.FileEvent) {
+		got = append(got, event)
+	})
+	if !errors.Is(err, cause) {
+		t.Fatalf("err = %v, want %v", err, cause)
+	}
+	want := watcher.FileEvent{Type: watcher.EventModify, Path: "target.go"}
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("events = %#v, want %#v", got, []watcher.FileEvent{want})
 	}
 }
 

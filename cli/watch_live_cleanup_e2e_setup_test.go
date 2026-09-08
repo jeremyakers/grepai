@@ -48,7 +48,7 @@ func buildLiveCleanupCandidate(t *testing.T) string {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "go", "build", "-p", "1", "-o", bin, "./cmd/grepai")
 	cmd.Dir = repo
-	cmd.Env = append(os.Environ(), "GOMAXPROCS=2", "GOCACHE="+filepath.Join(top, "go-build"), "GOMODCACHE="+moduleCache, "GOPROXY=off")
+	cmd.Env = append(os.Environ(), "GOMAXPROCS=2", "GOMODCACHE="+moduleCache, "GOPROXY=off")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("build candidate: %v\n%s", err, output)

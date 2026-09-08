@@ -1116,7 +1116,8 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 	}
 
 	// Initialize watcher
-	w, err := watcher.NewWatcher(projectRoot, ignoreMatcher, cfg.Watch.DebounceMs)
+	w, err := watcher.NewWatcher(projectRoot, ignoreMatcher, cfg.Watch.DebounceMs,
+		watcher.WithFileFilter(scanner.SupportsPath))
 	if err != nil {
 		return fmt.Errorf("failed to initialize watcher for %s: %w", projectRoot, err)
 	}
@@ -2079,7 +2080,7 @@ func extractSymbolsWithFramework(ctx context.Context, extractor trace.SymbolExtr
 }
 
 func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore *trace.GOBSymbolStore, rpgEncoder *rpg.RPGEncoder, vectorStore store.VectorStore, enabledLanguages []string, projectRoot string, cfg *config.Config, lastConfigWrite *time.Time, rpgManager *rpgRealtimeManager, event watcher.FileEvent, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) {
-	if event.IsDir && (event.Type == watcher.EventDelete || event.Type == watcher.EventRename) {
+	if event.IsDir {
 		dispatch := func(fileEvent watcher.FileEvent) {
 			handleFileEvent(ctx, idx, scanner, extractor, symbolStore, rpgEncoder, vectorStore, enabledLanguages, projectRoot, cfg, lastConfigWrite, rpgManager, fileEvent, onActivity, onStats, processors...)
 		}
@@ -2897,7 +2898,8 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		startRPGRealtimeWorkers(ctx, fmt.Sprintf("workspace:%s/%s", ws.Name, project.Name), symbolStore, rpgEncoder, rpgStore, projectCfg.Watch, manager)
 	}
 
-	w, err := watcher.NewWatcher(project.Path, ignoreMatcher, projectCfg.Watch.DebounceMs)
+	w, err := watcher.NewWatcher(project.Path, ignoreMatcher, projectCfg.Watch.DebounceMs,
+		watcher.WithFileFilter(scanner.SupportsPath))
 	if err != nil {
 		if rpgStore != nil {
 			_ = rpgStore.Close()

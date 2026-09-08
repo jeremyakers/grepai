@@ -15,10 +15,12 @@ import (
 )
 
 type liveCleanupExpectation struct {
-	presentFiles  []string
-	absentFiles   []string
-	presentTraces map[string]string
-	absentTraces  []string
+	presentFiles      []string
+	absentFiles       []string
+	presentSymbols    map[string][]string
+	absentSymbolFiles []string
+	presentTraces     map[string]string
+	absentTraces      []string
 }
 
 type liveCleanupState struct {
@@ -27,9 +29,10 @@ type liveCleanupState struct {
 	definitions map[string][]trace.Symbol
 	references  map[string][]trace.Reference
 	traces      map[string]trace.TraceResult
+	fileSymbols map[string][]trace.Symbol
 }
 
-func (h *liveCleanupHarness) readState(symbols ...string) (liveCleanupState, error) {
+func (h *liveCleanupHarness) readState(want liveCleanupExpectation) (liveCleanupState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	vector := store.NewGOBStore(config.GetIndexPath(h.root))
@@ -47,7 +50,7 @@ func (h *liveCleanupHarness) readState(symbols ...string) (liveCleanupState, err
 	state := liveCleanupState{
 		documents: documents, chunks: make(map[string]int),
 		definitions: make(map[string][]trace.Symbol), references: make(map[string][]trace.Reference),
-		traces: make(map[string]trace.TraceResult),
+		traces: make(map[string]trace.TraceResult), fileSymbols: make(map[string][]trace.Symbol),
 	}
 	for _, chunk := range chunks {
 		state.chunks[filepath.ToSlash(chunk.FilePath)]++
@@ -56,6 +59,25 @@ func (h *liveCleanupHarness) readState(symbols ...string) (liveCleanupState, err
 	if err := symbolStore.Load(ctx); err != nil {
 		return liveCleanupState{}, err
 	}
+	for path := range want.presentSymbols {
+		symbols, err := symbolStore.GetSymbolsForFile(ctx, path)
+		if err != nil {
+			return liveCleanupState{}, err
+		}
+		state.fileSymbols[path] = symbols
+	}
+	for _, path := range want.absentSymbolFiles {
+		symbols, err := symbolStore.GetSymbolsForFile(ctx, path)
+		if err != nil {
+			return liveCleanupState{}, err
+		}
+		state.fileSymbols[path] = symbols
+	}
+	symbols := make([]string, 0, len(want.presentTraces)+len(want.absentTraces))
+	for symbol := range want.presentTraces {
+		symbols = append(symbols, symbol)
+	}
+	symbols = append(symbols, want.absentTraces...)
 	for _, symbol := range symbols {
 		definitions, err := symbolStore.LookupSymbol(ctx, symbol)
 		if err != nil {
@@ -91,6 +113,26 @@ func liveCleanupMatches(state liveCleanupState, want liveCleanupExpectation) (bo
 			return false, fmt.Sprintf("file %q remains: documents=%v chunks=%v", path, state.documents, state.chunks)
 		}
 	}
+	for path, names := range want.presentSymbols {
+		actual := state.fileSymbols[path]
+		for _, name := range names {
+			found := false
+			for _, symbol := range actual {
+				if symbol.Name == name && filepath.ToSlash(symbol.File) == path {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return false, fmt.Sprintf("symbol %q missing from %q: %#v", name, path, actual)
+			}
+		}
+	}
+	for _, path := range want.absentSymbolFiles {
+		if len(state.fileSymbols[path]) != 0 {
+			return false, fmt.Sprintf("symbols remain for %q: %#v", path, state.fileSymbols[path])
+		}
+	}
 	for symbol, path := range want.presentTraces {
 		definitions := state.definitions[symbol]
 		result := state.traces[symbol]
@@ -112,7 +154,7 @@ func (h *liveCleanupHarness) awaitState(watch *liveWatchProcess, pid int, want l
 	defer deadline.Stop()
 	for {
 		watch.assertRunning(pid)
-		state, err := h.readState("LiveDeleteTarget", "LiveKeepTarget")
+		state, err := h.readState(want)
 		if err == nil {
 			if matched, _ := liveCleanupMatches(state, want); matched {
 				watch.assertRunning(pid)

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	ignore "github.com/sabhiram/go-gitignore"
 )
@@ -38,23 +39,41 @@ type nestedMatcher struct {
 // "full" uses original patterns (with negations) for the actual decision.
 // "any" uses all patterns converted to positive for detecting if the file has an opinion.
 type grepaiMatcher struct {
-	full    *ignore.GitIgnore // Matcher with original patterns (including negations)
-	any     *ignore.GitIgnore // Matcher with all patterns as positive (for detection)
-	baseDir string            // relative path from project root
+	full         *ignore.GitIgnore // Matcher with original patterns (including negations)
+	any          *ignore.GitIgnore // Matcher with all patterns as positive (for detection)
+	baseDir      string            // relative path from project root
+	hasNegations bool
 }
 
 type IgnoreMatcher struct {
+	mu                 sync.RWMutex
 	projectRoot        string
+	externalGitignore  string
 	nestedMatchers     []nestedMatcher // .gitignore matchers
 	extraDirs          []string        // patterns from config
 	grepaiMatchers     []grepaiMatcher // .grepaiignore matchers
 	hasGrepaiNegations bool            // true if any .grepaiignore has ! patterns
+	walkIgnoreFiles    func(string, filepath.WalkFunc) error
+	readIgnoreFile     func(string) ([]byte, error)
+	hardExcludeGit     bool
+	hardExcludeGrepai  bool
 }
 
 func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignore string) (*IgnoreMatcher, error) {
 	m := &IgnoreMatcher{
-		projectRoot: projectRoot,
-		extraDirs:   extraIgnore,
+		projectRoot:       projectRoot,
+		externalGitignore: externalGitignore,
+		extraDirs:         extraIgnore,
+		walkIgnoreFiles:   filepath.Walk,
+		readIgnoreFile:    os.ReadFile,
+	}
+	for _, pattern := range extraIgnore {
+		switch strings.TrimSuffix(filepath.ToSlash(filepath.Clean(pattern)), "/") {
+		case ".git":
+			m.hardExcludeGit = true
+		case ".grepai":
+			m.hardExcludeGrepai = true
+		}
 	}
 
 	// Load external gitignore file if specified
@@ -157,11 +176,20 @@ func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignor
 }
 
 func (m *IgnoreMatcher) ShouldIgnore(path string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.shouldIgnore(path)
+}
+
+func (m *IgnoreMatcher) shouldIgnore(path string) bool {
 	// The root directory itself ("." from filepath.Rel) must never be ignored.
 	// Patterns like ".*/" would otherwise match "." and cause the entire
 	// directory tree to be skipped.
 	if path == "." {
 		return false
+	}
+	if m.isHardExcludedPath(path) {
+		return true
 	}
 
 	normalizedPath := filepath.ToSlash(path)
@@ -189,7 +217,12 @@ func (m *IgnoreMatcher) ShouldIgnore(path string) bool {
 // If .grepaiignore has negation patterns, we must descend into ignored directories
 // because individual files inside may be re-included.
 func (m *IgnoreMatcher) ShouldSkipDir(path string) bool {
-	if !m.ShouldIgnore(path) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.isHardExcludedPath(path) {
+		return true
+	}
+	if !m.shouldIgnore(path) {
 		return false // Not ignored, don't skip
 	}
 
@@ -197,7 +230,9 @@ func (m *IgnoreMatcher) ShouldSkipDir(path string) bool {
 
 	// If .grepaiignore explicitly says to ignore this dir → safe to skip
 	if result, hasOpinion, _ := m.evalGrepaiIgnore(normalizedPath); hasOpinion {
-		return result
+		// A positive directory rule in a .grepaiignore can be followed by a
+		// negation in that same file. Descend so the allowed child is reachable.
+		return result && !m.hasGrepaiNegations
 	}
 
 	// Ignored by gitignore/extra patterns. If no negations in any .grepaiignore → safe to skip
@@ -313,7 +348,10 @@ func compileGrepaiIgnoreFile(path string) (grepaiMatcher, bool, error) {
 	if err != nil {
 		return grepaiMatcher{}, false, err
 	}
+	return compileGrepaiIgnoreContent(content)
+}
 
+func compileGrepaiIgnoreContent(content []byte) (grepaiMatcher, bool, error) {
 	lines := strings.Split(string(content), "\n")
 	fullLines := make([]string, 0, len(lines))
 	anyLines := make([]string, 0, len(lines))
@@ -339,9 +377,19 @@ func compileGrepaiIgnoreFile(path string) (grepaiMatcher, bool, error) {
 	anyMatcher := ignore.CompileIgnoreLines(anyLines...)
 
 	return grepaiMatcher{
-		full: fullMatcher,
-		any:  anyMatcher,
+		full:         fullMatcher,
+		any:          anyMatcher,
+		hasNegations: hasNegations,
 	}, hasNegations, nil
+}
+
+func (m *IgnoreMatcher) isHardExcludedPath(path string) bool {
+	for _, component := range strings.Split(filepath.ToSlash(filepath.Clean(path)), "/") {
+		if (component == ".git" && m.hardExcludeGit) || (component == ".grepai" && m.hardExcludeGrepai) {
+			return true
+		}
+	}
+	return false
 }
 
 // AddToGitignore appends a pattern to .gitignore if not already present

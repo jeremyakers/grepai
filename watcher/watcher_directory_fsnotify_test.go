@@ -79,6 +79,28 @@ func TestRealFSNotifyDirectoryDeletionAndRecreation(t *testing.T) {
 	})
 }
 
+func TestRealFSNotifyWatchesIgnoredDirectoryWithIncludedChild(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".grepaiignore"), []byte("vendor/\n!vendor/important/keep.go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	important := filepath.Join(root, "vendor", "important")
+	if err := os.MkdirAll(important, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := newDirectoryTestWatcher(t, root)
+	w.debounceMs = 20
+	if err := w.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(important, "keep.go"), []byte("package keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	awaitFileEvent(t, w, func(event FileEvent) bool {
+		return event.Path == filepath.Join("vendor", "important", "keep.go")
+	})
+}
+
 func awaitFileEvent(t *testing.T, w *Watcher, matches func(FileEvent) bool) FileEvent {
 	t.Helper()
 	timer := time.NewTimer(5 * time.Second)
