@@ -7,12 +7,28 @@ description: Analyze function relationships with grepai trace
 
 `grepai trace` provides call graph analysis for your codebase, allowing you to understand how functions relate to each other by tracking callers and callees.
 
+### Trace vs Refs
+
+Use `trace` for call relationships, and `refs` for property/state usage.
+
+```bash
+# Call graph (functions/methods)
+grepai trace callers "isAdmin"
+
+# Property/state usage (reads/writes)
+grepai refs readers "uid"
+grepai refs writers "uid"
+grepai refs graph "uid"
+```
+
+`grepai refs` is especially useful in Vue/Pinia code where state keys (for example `store.uid`) are read and written without direct function calls.
+
 ### Features
 
 - **Find callers**: Discover which functions call a specific symbol
 - **Find callees**: See what functions a symbol calls
 - **Build call graphs**: Visualize call relationships with configurable depth
-- **Multi-language support**: Go, TypeScript/JavaScript, Python, PHP, Java, C/C++, Rust, Zig
+- **Multi-language support**: Go, TypeScript/JavaScript, Python, PHP, Java, C/C++, Rust, Zig, C#, F#
 - **Two extraction modes**: Fast (regex) and Precise (tree-sitter AST)
 - **JSON output**: Perfect for AI agents and automation
 
@@ -89,20 +105,24 @@ grepai trace callers "MyFunction" --mode precise
 | JavaScript | `.js`, `.jsx` | Excellent |
 | Python | `.py` | Good |
 | PHP | `.php` | Good |
+| Lua | `.lua` | Good |
 | Java | `.java` | Good |
 | C | `.c`, `.h` | Good |
 | C++ | `.cpp`, `.hpp`, `.cc`, `.cxx`, `.hxx` | Good |
 | Zig | `.zig` | Good |
 | Rust | `.rs` | Good |
 | C# | `.cs` | Good |
+| F# | `.fs`, `.fsx`, `.fsi` | Good |
 | Pascal/Delphi | `.pas`, `.dpr` | Good |
 
 ### JSON Output
 
-For AI agents and scripts, use `--json` flag:
+For AI agents and scripts, use `--json` or `--toon`. Add `--compact` to omit verbose context fields while keeping symbol, file, and line data:
 
 ```bash
 grepai trace callers "Login" --json
+grepai trace callers "Login" --json --compact
+grepai refs readers "uid" --toon --compact
 ```
 
 Output format:
@@ -138,6 +158,7 @@ trace:
     - .tsx
     - .py
     - .php
+    - .lua
     - .java
     - .c
     - .h
@@ -145,6 +166,7 @@ trace:
     - .hpp
     - .cc
     - .cxx
+    - .hxx
     - .rs
     - .zig
     - .cs
@@ -195,3 +217,6 @@ grepai trace graph "AuthMiddleware" --depth 2 --json
 - [`grepai trace callers`](/grepai/commands/grepai_trace_callers/) - Find functions that call a symbol
 - [`grepai trace callees`](/grepai/commands/grepai_trace_callees/) - Find functions called by a symbol
 - [`grepai trace graph`](/grepai/commands/grepai_trace_graph/) - Build complete call graph
+- [`grepai refs readers`](/grepai/commands/grepai_refs_readers/) - Find property/state readers
+- [`grepai refs writers`](/grepai/commands/grepai_refs_writers/) - Find property/state writers
+- [`grepai refs graph`](/grepai/commands/grepai_refs_graph/) - Build property usage graph

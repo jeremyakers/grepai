@@ -22,6 +22,9 @@ The server communicates via stdio and exposes the following tools:
   - grepai_trace_callers: Find all functions that call a symbol
   - grepai_trace_callees: Find all functions called by a symbol
   - grepai_trace_graph: Build a call graph around a symbol
+  - grepai_refs_readers: Find property/state readers for a symbol name
+  - grepai_refs_writers: Find property/state writers for a symbol name
+  - grepai_refs_graph: Build a property usage graph (readers + writers)
   - grepai_index_status: Check index health and statistics (includes RPG stats when enabled)
   - grepai_rpg_search: Search RPG graph nodes by feature semantics
   - grepai_rpg_fetch: Fetch hierarchy and edge context for a specific RPG node
@@ -122,10 +125,23 @@ func resolveMCPTarget(explicitPath, workspaceName string) (string, string, error
 
 	wsName, ws, wsErr := config.FindWorkspaceForPath(cwd)
 	if wsErr != nil {
+		// If workspace config exists with at least one workspace, allow starting
+		// unscoped MCP server and let tools accept workspace at runtime.
+		cfg, cfgErr := config.LoadWorkspaceConfig()
+		if cfgErr == nil && cfg != nil && len(cfg.Workspaces) > 0 {
+			return "", "", nil
+		}
 		return "", "", fmt.Errorf("no grepai project or workspace found (run 'grepai init' or use --workspace)")
 	}
 	if ws != nil {
 		return "", wsName, nil
+	}
+
+	// No containing workspace for cwd, but still allow startup if global
+	// workspace config has entries (runtime workspace argument can be used).
+	cfg, cfgErr := config.LoadWorkspaceConfig()
+	if cfgErr == nil && cfg != nil && len(cfg.Workspaces) > 0 {
+		return "", "", nil
 	}
 
 	return "", "", fmt.Errorf("no grepai project or workspace found (run 'grepai init' or use --workspace)")

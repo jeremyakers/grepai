@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -79,8 +80,15 @@ func (w *Watcher) Close() error {
 	return w.watcher.Close()
 }
 
+// addRecursive walks the tree rooted at root and registers an fsnotify watch
+// on every directory that isn't ignored. It uses filepath.WalkDir (not
+// filepath.Walk) so that directory entries are read directly from the
+// readdir results instead of an extra Lstat syscall per file -- on repos with
+// 100k+ files this roughly halves the syscall count of the initial/restart
+// tree walk, which matters because watch startup blocks on this before it
+// starts serving fsnotify events.
 func (w *Watcher) addRecursive(root string) error {
-	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // Skip inaccessible paths
 		}
@@ -90,18 +98,23 @@ func (w *Watcher) addRecursive(root string) error {
 			return nil
 		}
 
-		// Check if path should be ignored
-		if w.ignore.ShouldIgnore(relPath) {
-			if info.IsDir() {
+		// Handle directories: use ShouldSkipDir to respect .grepaiignore negations
+		if d.IsDir() {
+			if w.ignore.ShouldSkipDir(relPath) {
 				return filepath.SkipDir
+			}
+			// Directory is not skipped; watch it if not individually ignored
+			if !w.ignore.ShouldIgnore(relPath) {
+				if err := w.watcher.Add(path); err != nil {
+					log.Printf("Failed to watch %s: %v", path, err)
+				}
 			}
 			return nil
 		}
 
-		if info.IsDir() {
-			if err := w.watcher.Add(path); err != nil {
-				log.Printf("Failed to watch %s: %v", path, err)
-			}
+		// Skip ignored files
+		if w.ignore.ShouldIgnore(relPath) {
+			return nil
 		}
 
 		return nil

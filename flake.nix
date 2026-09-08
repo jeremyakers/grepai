@@ -10,14 +10,20 @@
       supportedSystems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
 
-      version = "0.32.1";
+      version = "0.36.1";
 
       mkGrepai = pkgs: pkgs.buildGoModule {
         pname = "grepai";
         inherit version;
         src = ./.;
 
-        vendorHash = "sha256-OWlCduKOaJaaPYFXq/LDd91VaDY1Xrd8pytTtbodpJE=";
+        vendorHash = "sha256-9vBnEpAoBrWTQJphQv+vAv9iCOyaI/RzClxTFB8Hc20=";
+
+        # Tests shell out to external tools during checkPhase: git (worktree
+        # discovery, status hints) and node (Vue SFC framework processor).
+        # Without them the build fails with
+        # `exec: "git": executable file not found in $PATH` (see #244).
+        nativeCheckInputs = [ pkgs.git pkgs.nodejs ];
 
         ldflags = [
           "-s"

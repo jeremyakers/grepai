@@ -8,35 +8,50 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
 )
 
 // GOBSymbolStore implements SymbolStore using GOB encoding.
 type GOBSymbolStore struct {
-	indexPath         string
-	index             *SymbolIndex
-	fileIndex         map[string]bool
-	fileContentHashes map[string]string
-	mu                sync.RWMutex
+	indexPath             string
+	lockPath              string
+	index                 *SymbolIndex
+	fileIndex             map[string]bool
+	fileContentHashes     map[string]string
+	fileExtractorVersions map[string]string
+	mu                    sync.RWMutex
 }
 
 type gobSymbolData struct {
 	Index             SymbolIndex
 	FileIndex         map[string]bool
 	FileContentHashes map[string]string
+	// FileExtractorVersions records the extractor.Version() value used
+	// when each file's symbols were extracted. Pairing this with the
+	// content hash lets dedup invalidate cached extractions when a new
+	// release ships better symbol coverage even though the source files
+	// themselves haven't changed. Older gob files without this field
+	// decode with a nil map; the dedup check then treats every file as
+	// "extractor version unknown" and re-extracts once, which is the
+	// correct behavior for a one-time upgrade.
+	FileExtractorVersions map[string]string
 }
 
 // NewGOBSymbolStore creates a new GOB-based symbol store.
 func NewGOBSymbolStore(indexPath string) *GOBSymbolStore {
 	return &GOBSymbolStore{
 		indexPath: indexPath,
+		lockPath:  indexPath + ".lock",
 		index: &SymbolIndex{
 			Symbols:    make(map[string][]Symbol),
 			References: make(map[string][]Reference),
 			CallGraph:  []CallEdge{},
 			Version:    1,
 		},
-		fileIndex:         make(map[string]bool),
-		fileContentHashes: make(map[string]string),
+		fileIndex:             make(map[string]bool),
+		fileContentHashes:     make(map[string]string),
+		fileExtractorVersions: make(map[string]string),
 	}
 }
 
@@ -45,6 +60,22 @@ func (s *GOBSymbolStore) Load(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	lockFile, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return s.loadUnlocked()
+	}
+	defer lockFile.Close()
+	if err := fileutil.FlockShared(lockFile, false); err != nil {
+		return s.loadUnlocked()
+	}
+	defer func() {
+		_ = fileutil.Funlock(lockFile)
+	}()
+
+	return s.loadUnlocked()
+}
+
+func (s *GOBSymbolStore) loadUnlocked() error {
 	file, err := os.Open(s.indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -62,6 +93,7 @@ func (s *GOBSymbolStore) Load(ctx context.Context) error {
 	s.index = &data.Index
 	s.fileIndex = data.FileIndex
 	s.fileContentHashes = data.FileContentHashes
+	s.fileExtractorVersions = data.FileExtractorVersions
 
 	if s.index.Symbols == nil {
 		s.index.Symbols = make(map[string][]Symbol)
@@ -78,42 +110,76 @@ func (s *GOBSymbolStore) Load(ctx context.Context) error {
 	if s.fileContentHashes == nil {
 		s.fileContentHashes = make(map[string]string)
 	}
+	if s.fileExtractorVersions == nil {
+		s.fileExtractorVersions = make(map[string]string)
+	}
 
 	return nil
 }
 
 // Persist writes the index to storage.
 func (s *GOBSymbolStore) Persist(ctx context.Context) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	if err := ensureParentDir(s.indexPath); err != nil {
+	if err := fileutil.EnsureParentDir(s.indexPath); err != nil {
 		return fmt.Errorf("failed to prepare symbol index directory: %w", err)
 	}
 
-	file, err := os.Create(s.indexPath)
+	lockFile, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to create symbol index file: %w", err)
+		return s.persistUnlocked()
 	}
-	defer file.Close()
-
-	s.index.UpdatedAt = time.Now()
-	data := gobSymbolData{
-		Index:             *s.index,
-		FileIndex:         s.fileIndex,
-		FileContentHashes: s.fileContentHashes,
+	defer lockFile.Close()
+	if err := fileutil.FlockExclusive(lockFile, false); err != nil {
+		return s.persistUnlocked()
 	}
+	defer func() {
+		_ = fileutil.Funlock(lockFile)
+	}()
 
-	if err := gob.NewEncoder(file).Encode(data); err != nil {
-		return fmt.Errorf("failed to encode symbol index: %w", err)
-	}
-
-	return nil
+	return s.persistUnlocked()
 }
 
-func ensureParentDir(filePath string) error {
-	dir := filepath.Dir(filePath)
-	return os.MkdirAll(dir, 0755)
+func (s *GOBSymbolStore) persistUnlocked() error {
+	s.index.UpdatedAt = time.Now()
+	data := gobSymbolData{
+		Index:                 *s.index,
+		FileIndex:             s.fileIndex,
+		FileContentHashes:     s.fileContentHashes,
+		FileExtractorVersions: s.fileExtractorVersions,
+	}
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(s.indexPath), filepath.Base(s.indexPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create symbol index temp file: %w", err)
+	}
+
+	tmpPath := tmpFile.Name()
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := gob.NewEncoder(tmpFile).Encode(data); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to encode symbol index: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to sync symbol index temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close symbol index temp file: %w", err)
+	}
+	if err := fileutil.ReplaceFileAtomically(tmpPath, s.indexPath); err != nil {
+		return fmt.Errorf("failed to replace symbol index file: %w", err)
+	}
+	cleanupTemp = false
+
+	return nil
 }
 
 // SaveFile persists symbols and references for a file.
@@ -122,7 +188,9 @@ func (s *GOBSymbolStore) SaveFile(ctx context.Context, filePath string, symbols 
 }
 
 // SaveFileWithContentHash persists symbols/references for a file and tracks
-// the current file content hash for future cache checks.
+// the current file content hash for future cache checks. The extractor
+// version stays whatever was already stored (or empty) — call
+// SaveFileWithSignature to update both fingerprints at once.
 func (s *GOBSymbolStore) SaveFileWithContentHash(ctx context.Context, filePath string, contentHash string, symbols []Symbol, refs []Reference) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -158,6 +226,24 @@ func (s *GOBSymbolStore) SaveFileWithContentHash(ctx context.Context, filePath s
 		s.fileContentHashes[filePath] = contentHash
 	} else {
 		delete(s.fileContentHashes, filePath)
+	}
+	return nil
+}
+
+// SaveFileWithSignature persists symbols/references for a file and
+// records BOTH the content hash and the extractor version that produced
+// them. Dedup callers can then ask GetFileExtractorVersion alongside
+// GetFileContentHash and re-extract whenever either has drifted.
+func (s *GOBSymbolStore) SaveFileWithSignature(ctx context.Context, filePath string, contentHash, extractorVersion string, symbols []Symbol, refs []Reference) error {
+	if err := s.SaveFileWithContentHash(ctx, filePath, contentHash, symbols, refs); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if extractorVersion != "" {
+		s.fileExtractorVersions[filePath] = extractorVersion
+	} else {
+		delete(s.fileExtractorVersions, filePath)
 	}
 	return nil
 }
@@ -235,7 +321,7 @@ func (s *GOBSymbolStore) LookupCallers(ctx context.Context, symbolName string) (
 	if refs == nil {
 		return []Reference{}, nil
 	}
-	return refs, nil
+	return filterByReferenceKinds(refs, RefKindCall, ""), nil
 }
 
 // LookupCallees finds all symbols called by a function.
@@ -257,6 +343,9 @@ func (s *GOBSymbolStore) LookupCallees(ctx context.Context, symbolName string, f
 			// Find reference details
 			if refs, ok := s.index.References[edge.Callee]; ok {
 				for _, ref := range refs {
+					if !isCallReference(ref) {
+						continue
+					}
 					if ref.CallerName == symbolName && ref.File == edge.File && ref.Line == edge.Line {
 						callees = append(callees, ref)
 						break
@@ -276,6 +365,59 @@ func (s *GOBSymbolStore) LookupCallees(ctx context.Context, symbolName string, f
 		}
 	}
 	return callees, nil
+}
+
+// LookupReaders finds property/data readers for a symbol name.
+func (s *GOBSymbolStore) LookupReaders(ctx context.Context, symbolName string) ([]Reference, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	refs := s.index.References[symbolName]
+	if refs == nil {
+		return []Reference{}, nil
+	}
+	return filterByReferenceKinds(refs, RefKindRead), nil
+}
+
+// LookupWriters finds property/data writers for a symbol name.
+func (s *GOBSymbolStore) LookupWriters(ctx context.Context, symbolName string) ([]Reference, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	refs := s.index.References[symbolName]
+	if refs == nil {
+		return []Reference{}, nil
+	}
+	return filterByReferenceKinds(refs, RefKindWrite), nil
+}
+
+func filterByReferenceKinds(refs []Reference, kinds ...string) []Reference {
+	if len(refs) == 0 {
+		return []Reference{}
+	}
+
+	allowed := make(map[string]bool, len(kinds))
+	for _, kind := range kinds {
+		allowed[kind] = true
+	}
+
+	filtered := make([]Reference, 0, len(refs))
+	for _, ref := range refs {
+		if allowed[ref.Kind] {
+			filtered = append(filtered, ref)
+			continue
+		}
+		// Backward compatibility with older indices where kind wasn't persisted.
+		if ref.Kind == "" && allowed[RefKindCall] {
+			filtered = append(filtered, ref)
+		}
+	}
+
+	return filtered
+}
+
+func isCallReference(ref Reference) bool {
+	return ref.Kind == "" || ref.Kind == RefKindCall
 }
 
 // GetCallGraph builds a call graph from a starting symbol.
@@ -447,4 +589,16 @@ func (s *GOBSymbolStore) GetFileContentHash(filePath string) (string, bool) {
 	defer s.mu.RUnlock()
 	hash, ok := s.fileContentHashes[filePath]
 	return hash, ok
+}
+
+// GetFileExtractorVersion returns the SymbolExtractor.Version() that was
+// recorded when this file's symbols were last persisted, if known.
+// Symbol stores produced by older grepai releases lack this metadata; in
+// that case the second return is false and callers should treat the
+// cache as stale.
+func (s *GOBSymbolStore) GetFileExtractorVersion(filePath string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	version, ok := s.fileExtractorVersions[filePath]
+	return version, ok
 }

@@ -3,38 +3,48 @@ package rpg
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
 
 // NodeKind represents the type of node in the RPG graph.
+// NodeKind distinguishes between implementation nodes and hierarchy nodes.
+// In paper terms:
+// - V_L (Low-level): File, Symbol, Chunk
+// - V_H (High-level): Area, Category, Subcategory
 type NodeKind string
 
 const (
-	KindArea        NodeKind = "area"        // functional area (top level)
-	KindCategory    NodeKind = "category"    // category within an area
-	KindSubcategory NodeKind = "subcategory" // subcategory within a category
-	KindFile        NodeKind = "file"        // source file
-	KindSymbol      NodeKind = "symbol"      // function/method/class/type
-	KindChunk       NodeKind = "chunk"       // vector chunk reference
+	KindArea        NodeKind = "area"        // functional area (top level) [V_H]
+	KindCategory    NodeKind = "category"    // category within an area [V_H]
+	KindSubcategory NodeKind = "subcategory" // subcategory within a category [V_H]
+	KindFile        NodeKind = "file"        // source file [V_L]
+	KindSymbol      NodeKind = "symbol"      // function/method/class/type [V_L]
+	KindChunk       NodeKind = "chunk"       // vector chunk reference [V_L]
 )
 
 // EdgeType represents the type of relationship between nodes.
+// EdgeType defines the relationship between nodes.
+// In paper terms:
+// - E_feature (Functional): EdgeFeatureParent, EdgeContains
+// - E_dep (Dependency): EdgeInvokes, EdgeImports, EdgeSemanticSim
 type EdgeType string
 
 const (
-	EdgeFeatureParent EdgeType = "feature_parent" // child -> parent in hierarchy
-	EdgeContains      EdgeType = "contains"       // file contains symbol
-	EdgeInvokes       EdgeType = "invokes"        // symbol calls symbol
-	EdgeImports       EdgeType = "imports"        // file imports file/package
-	EdgeMapsToChunk   EdgeType = "maps_to_chunk"  // symbol maps to vector chunk
-	EdgeSemanticSim   EdgeType = "semantic_sim"   // symbols with similar features/co-call patterns
+	EdgeFeatureParent EdgeType = "feature_parent" // parent -> child in feature hierarchy [E_feature]
+	EdgeContains      EdgeType = "contains"       // container -> contained implementation (file -> symbol) [E_feature]
+	EdgeInvokes       EdgeType = "invokes"        // symbol calls symbol [E_dep]
+	EdgeImports       EdgeType = "imports"        // file imports file/package [E_dep]
+	EdgeMapsToChunk   EdgeType = "maps_to_chunk"  // symbol maps to vector chunk [Implementation]
+	EdgeSemanticSim   EdgeType = "semantic_sim"   // symbols with similar features/co-call patterns [Implementation]
 )
 
 // Node represents a node in the RPG graph.
 type Node struct {
 	ID            string    `json:"id"`
 	Kind          NodeKind  `json:"kind"`
-	Feature       string    `json:"feature"`               // semantic feature label (verb-object)
+	Feature       string    `json:"feature"`               // primary semantic feature label (kebab-case)
+	Features      []string  `json:"features,omitempty"`    // atomic semantic features (verb-object phrases)
 	Path          string    `json:"path,omitempty"`        // file path (for file/symbol/chunk nodes)
 	SymbolName    string    `json:"symbol_name,omitempty"` // symbol name (for symbol nodes)
 	Receiver      string    `json:"receiver,omitempty"`    // Go receiver type
@@ -44,6 +54,7 @@ type Node struct {
 	Signature     string    `json:"signature,omitempty"`      // function signature
 	ChunkID       string    `json:"chunk_id,omitempty"`       // linked vector chunk ID
 	SemanticLabel string    `json:"semantic_label,omitempty"` // enriched label with semantic context
+	Summary       string    `json:"summary,omitempty"`        // high-level semantic summary (LLM generated)
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
@@ -57,9 +68,15 @@ type Edge struct {
 }
 
 // Graph is the in-memory RPG graph with fast lookup indexes.
+// All public methods are safe for concurrent use.
 type Graph struct {
 	Nodes map[string]*Node `json:"nodes"`
 	Edges []*Edge          `json:"edges"`
+
+	// mu protects all fields from concurrent access.
+	// Callers that need to read Nodes/Edges directly (e.g. for serialization)
+	// must acquire mu.RLock() for the duration of the read.
+	mu sync.RWMutex
 
 	// Indexes for fast lookup (not serialized)
 	byKind        map[NodeKind][]*Node
@@ -94,7 +111,11 @@ func NewGraph() *Graph {
 // AddNode adds or updates a node and maintains indexes.
 // If a node with the same ID already exists, old index entries are removed first
 // to prevent stale reference accumulation.
+//
+// TODO: consider map[string]int index for O(1) stale-entry removal during bulk operations
 func (g *Graph) AddNode(n *Node) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	// If node already exists, remove old index entries first
 	if old, exists := g.Nodes[n.ID]; exists {
 		if nodes, ok := g.byKind[old.Kind]; ok {
@@ -138,6 +159,8 @@ func (g *Graph) AddNode(n *Node) {
 
 // RemoveNode removes a node and all its edges, updating indexes.
 func (g *Graph) RemoveNode(id string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	n, ok := g.Nodes[id]
 	if !ok {
 		return
@@ -227,6 +250,8 @@ func (g *Graph) RemoveNode(id string) {
 
 // AddEdge adds an edge and updates adjacency indexes.
 func (g *Graph) AddEdge(e *Edge) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	g.Edges = append(g.Edges, e)
 	g.adjForward[e.From] = append(g.adjForward[e.From], e)
 	g.adjReverse[e.To] = append(g.adjReverse[e.To], e)
@@ -234,6 +259,8 @@ func (g *Graph) AddEdge(e *Edge) {
 
 // RemoveEdgesBetween removes all edges between two nodes.
 func (g *Graph) RemoveEdgesBetween(from, to string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
 	// Remove from main edge list
 	filtered := make([]*Edge, 0, len(g.Edges))
 	for _, e := range g.Edges {
@@ -274,33 +301,95 @@ func (g *Graph) RemoveEdgesBetween(from, to string) {
 	}
 }
 
+// RemoveEdgesBetweenOfType removes edges of a specific type between two nodes.
+func (g *Graph) RemoveEdgesBetweenOfType(from, to string, edgeType EdgeType) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	// Remove from main edge list
+	filtered := make([]*Edge, 0, len(g.Edges))
+	for _, e := range g.Edges {
+		if !(e.From == from && e.To == to && e.Type == edgeType) {
+			filtered = append(filtered, e)
+		}
+	}
+	g.Edges = filtered
+
+	// Remove from forward adjacency
+	if edges, ok := g.adjForward[from]; ok {
+		cleaned := make([]*Edge, 0, len(edges))
+		for _, e := range edges {
+			if !(e.To == to && e.Type == edgeType) {
+				cleaned = append(cleaned, e)
+			}
+		}
+		if len(cleaned) == 0 {
+			delete(g.adjForward, from)
+		} else {
+			g.adjForward[from] = cleaned
+		}
+	}
+
+	// Remove from reverse adjacency
+	if edges, ok := g.adjReverse[to]; ok {
+		cleaned := make([]*Edge, 0, len(edges))
+		for _, e := range edges {
+			if !(e.From == from && e.Type == edgeType) {
+				cleaned = append(cleaned, e)
+			}
+		}
+		if len(cleaned) == 0 {
+			delete(g.adjReverse, to)
+		} else {
+			g.adjReverse[to] = cleaned
+		}
+	}
+}
+
 // RemoveEdgesIf removes edges that match the predicate and rebuilds edge indexes.
+// The predicate is evaluated without holding the graph lock so it may safely call
+// other Graph methods. Edges added or removed concurrently during predicate
+// evaluation are handled conservatively: only edges present at snapshot time that
+// match the predicate are removed.
 func (g *Graph) RemoveEdgesIf(predicate func(*Edge) bool) {
 	if predicate == nil {
 		return
 	}
 
-	filtered := make([]*Edge, 0, len(g.Edges))
-	removed := false
-	for _, e := range g.Edges {
-		if predicate(e) {
-			removed = true
-			continue
-		}
-		filtered = append(filtered, e)
-	}
+	// Snapshot edge list under read lock so the predicate can call graph methods.
+	g.mu.RLock()
+	snapshot := make([]*Edge, len(g.Edges))
+	copy(snapshot, g.Edges)
+	g.mu.RUnlock()
 
-	if !removed {
+	// Evaluate predicate without holding the lock.
+	toRemove := make(map[*Edge]bool)
+	for _, e := range snapshot {
+		if predicate(e) {
+			toRemove[e] = true
+		}
+	}
+	if len(toRemove) == 0 {
 		return
 	}
 
+	// Apply the filter and rebuild indexes under write lock.
+	g.mu.Lock()
+	filtered := make([]*Edge, 0, len(g.Edges))
+	for _, e := range g.Edges {
+		if !toRemove[e] {
+			filtered = append(filtered, e)
+		}
+	}
 	g.Edges = filtered
-	g.RebuildIndexes()
+	g.rebuildIndexesLocked()
+	g.mu.Unlock()
 }
 
 // NodePath returns the file path for a node ID when present.
 func (g *Graph) NodePath(id string) (string, bool) {
-	n := g.GetNode(id)
+	g.mu.RLock()
+	n := g.Nodes[id]
+	g.mu.RUnlock()
 	if n == nil || n.Path == "" {
 		return "", false
 	}
@@ -309,31 +398,44 @@ func (g *Graph) NodePath(id string) (string, bool) {
 
 // GetNode returns a node by ID.
 func (g *Graph) GetNode(id string) *Node {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.Nodes[id]
 }
 
 // GetNodesByKind returns all nodes of a given kind.
 func (g *Graph) GetNodesByKind(kind NodeKind) []*Node {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.byKind[kind]
 }
 
 // GetNodesByFile returns all nodes for a given file path.
 func (g *Graph) GetNodesByFile(path string) []*Node {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.byFile[path]
 }
 
 // GetOutgoing returns all outgoing edges from a node.
 func (g *Graph) GetOutgoing(nodeID string) []*Edge {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.adjForward[nodeID]
 }
 
 // GetIncoming returns all incoming edges to a node.
 func (g *Graph) GetIncoming(nodeID string) []*Edge {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
 	return g.adjReverse[nodeID]
 }
 
 // GetNeighbors returns neighbor node IDs in a given direction ("forward", "reverse", "both").
 func (g *Graph) GetNeighbors(nodeID string, direction string) []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
 	seen := make(map[string]bool)
 	var result []string
 
@@ -358,9 +460,25 @@ func (g *Graph) GetNeighbors(nodeID string, direction string) []string {
 	return result
 }
 
+// Reset clears all graph data and rebuilds empty indexes atomically.
+func (g *Graph) Reset() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.Nodes = make(map[string]*Node)
+	g.Edges = make([]*Edge, 0)
+	g.rebuildIndexesLocked()
+}
+
 // RebuildIndexes rebuilds all in-memory indexes from Nodes and Edges.
 // Called after deserialization.
 func (g *Graph) RebuildIndexes() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.rebuildIndexesLocked()
+}
+
+// rebuildIndexesLocked rebuilds indexes assuming the caller already holds g.mu.
+func (g *Graph) rebuildIndexesLocked() {
 	g.byKind = make(map[NodeKind][]*Node)
 	g.byFile = make(map[string][]*Node)
 	g.byFeaturePath = make(map[string]*Node)
@@ -387,6 +505,9 @@ func (g *Graph) RebuildIndexes() {
 
 // Stats returns basic graph statistics.
 func (g *Graph) Stats() GraphStats {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
 	nodesByKind := make(map[NodeKind]int)
 	for _, n := range g.Nodes {
 		nodesByKind[n.Kind]++
@@ -423,6 +544,8 @@ func (g *Graph) Stats() GraphStats {
 // For files: "file:<path>"
 // For hierarchy: "area:<name>", "cat:<parent>/<name>", "subcat:<parent>/<name>"
 // For chunks: "chunk:<chunkID>"
+//
+// TODO: consider adding ParseNodeID to avoid prefix-stripping in callers
 func MakeNodeID(kind NodeKind, parts ...string) string {
 	switch kind {
 	case KindSymbol:

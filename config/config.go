@@ -18,6 +18,34 @@ const (
 	SymbolIndexFileName = "symbols.gob"
 	RPGIndexFileName    = "rpg.gob"
 
+	DefaultEmbedderProvider         = "ollama"
+	DefaultOllamaEmbeddingModel     = "nomic-embed-text"
+	DefaultLMStudioEmbeddingModel   = "text-embedding-nomic-embed-text-v1.5"
+	DefaultOpenAIEmbeddingModel     = "text-embedding-3-small"
+	DefaultSyntheticEmbeddingModel  = "hf:nomic-ai/nomic-embed-text-v1.5"
+	DefaultOpenRouterEmbeddingModel = "openai/text-embedding-3-small"
+	DefaultRequestyEmbeddingModel   = "openai/text-embedding-3-small"
+	OpenAIEmbeddingModelLarge       = "text-embedding-3-large"
+	OpenRouterEmbeddingModelLarge   = "openai/text-embedding-3-large"
+	OpenRouterEmbeddingModelQwen8B  = "qwen/qwen3-embedding-8b"
+
+	DefaultOllamaEndpoint     = "http://localhost:11434"
+	DefaultLMStudioEndpoint   = "http://127.0.0.1:1234"
+	DefaultOpenAIEndpoint     = "https://api.openai.com/v1"
+	DefaultSyntheticEndpoint  = "https://api.synthetic.new/openai/v1"
+	DefaultOpenRouterEndpoint = "https://openrouter.ai/api/v1"
+	DefaultRequestyEndpoint   = "https://router.requesty.ai/v1"
+
+	DefaultLocalEmbeddingDimensions = 768
+	DefaultOpenAIDimensions         = 1536
+	DefaultOpenAILargeDimensions    = 3072
+	DefaultQwen8BDimensions         = 4096
+	DefaultOpenAIParallelism        = 4
+
+	DefaultPostgresDSN    = "postgres://localhost:5432/grepai"
+	DefaultQdrantEndpoint = "localhost"
+	DefaultQdrantPort     = 6334
+
 	// RPG default configuration values.
 	DefaultRPGDriftThreshold       = 0.35
 	DefaultRPGMaxTraversalDepth    = 3
@@ -33,17 +61,18 @@ const (
 )
 
 type Config struct {
-	Version           int            `yaml:"version"`
-	Embedder          EmbedderConfig `yaml:"embedder"`
-	Store             StoreConfig    `yaml:"store"`
-	Chunking          ChunkingConfig `yaml:"chunking"`
-	Watch             WatchConfig    `yaml:"watch"`
-	Search            SearchConfig   `yaml:"search"`
-	Trace             TraceConfig    `yaml:"trace"`
-	RPG               RPGConfig      `yaml:"rpg"`
-	Update            UpdateConfig   `yaml:"update"`
-	Ignore            []string       `yaml:"ignore"`
-	ExternalGitignore string         `yaml:"external_gitignore,omitempty"`
+	Version           int             `yaml:"version"`
+	Embedder          EmbedderConfig  `yaml:"embedder"`
+	Store             StoreConfig     `yaml:"store"`
+	Chunking          ChunkingConfig  `yaml:"chunking"`
+	Framework         FrameworkConfig `yaml:"framework_processing"`
+	Watch             WatchConfig     `yaml:"watch"`
+	Search            SearchConfig    `yaml:"search"`
+	Trace             TraceConfig     `yaml:"trace"`
+	RPG               RPGConfig       `yaml:"rpg"`
+	Update            UpdateConfig    `yaml:"update"`
+	Ignore            []string        `yaml:"ignore"`
+	ExternalGitignore string          `yaml:"external_gitignore,omitempty"`
 }
 
 // UpdateConfig holds auto-update settings
@@ -54,6 +83,12 @@ type UpdateConfig struct {
 type SearchConfig struct {
 	Boost  BoostConfig  `yaml:"boost"`
 	Hybrid HybridConfig `yaml:"hybrid"`
+	Dedup  DedupConfig  `yaml:"dedup"`
+}
+
+// DedupConfig controls file-level deduplication of search results.
+type DedupConfig struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 type HybridConfig struct {
@@ -73,12 +108,23 @@ type BoostRule struct {
 }
 
 type EmbedderConfig struct {
-	Provider    string `yaml:"provider"` // ollama | lmstudio | openai | synthetic | openrouter
+	Provider    string `yaml:"provider"` // ollama | lmstudio | openai | synthetic | openrouter | requesty
 	Model       string `yaml:"model"`
 	Endpoint    string `yaml:"endpoint,omitempty"`
 	APIKey      string `yaml:"api_key,omitempty"`
 	Dimensions  *int   `yaml:"dimensions,omitempty"`
 	Parallelism int    `yaml:"parallelism"` // Number of parallel workers for batch embedding (default: 4)
+	// RequestTimeoutSeconds is the HTTP client timeout for a single embedding
+	// request. 0 (the default) preserves the historical 60-second value.
+	// Raise this when running against slow self-hosted endpoints
+	// (e.g., ollama-cuda on a shared GPU) where embedding a full batch can
+	// take longer than a minute.
+	RequestTimeoutSeconds int `yaml:"request_timeout_seconds,omitempty"`
+	// MaxRetries caps the number of retry attempts for transient embedding
+	// failures (HTTP 429 / 5xx). 0 (the default) preserves the historical
+	// value of 5. Only consumed by providers that implement retry today
+	// (openai); other providers ignore it.
+	MaxRetries int `yaml:"max_retries,omitempty"`
 }
 
 // GetDimensions returns the configured dimensions or a default value.
@@ -89,10 +135,82 @@ func (e *EmbedderConfig) GetDimensions() int {
 		return *e.Dimensions
 	}
 	switch e.Provider {
-	case "openai", "openrouter":
-		return 1536
+	case "openai", "openrouter", "requesty":
+		switch strings.TrimSpace(e.Model) {
+		case OpenAIEmbeddingModelLarge, OpenRouterEmbeddingModelLarge:
+			return DefaultOpenAILargeDimensions
+		case OpenRouterEmbeddingModelQwen8B, "qwen3-embedding-8b":
+			return DefaultQwen8BDimensions
+		default:
+			return DefaultOpenAIDimensions
+		}
 	default:
-		return 768
+		return DefaultLocalEmbeddingDimensions
+	}
+}
+
+// CacheNamespace returns the semantic namespace used for embedding-cache reuse.
+// It intentionally excludes secrets such as API keys.
+func (e *EmbedderConfig) CacheNamespace() string {
+	return fmt.Sprintf(
+		"embedding-cache-v2:provider=%s:model=%s:dimensions=%d:endpoint=%s",
+		strings.TrimSpace(e.Provider),
+		strings.TrimSpace(e.Model),
+		e.GetDimensions(),
+		strings.TrimSpace(e.Endpoint),
+	)
+}
+
+func DefaultEmbedderForProvider(provider string) EmbedderConfig {
+	switch provider {
+	case "synthetic":
+		dim := DefaultLocalEmbeddingDimensions
+		return EmbedderConfig{
+			Provider:   "synthetic",
+			Model:      DefaultSyntheticEmbeddingModel,
+			Endpoint:   DefaultSyntheticEndpoint,
+			Dimensions: &dim,
+		}
+	case "openrouter":
+		return EmbedderConfig{
+			Provider:   "openrouter",
+			Model:      DefaultOpenRouterEmbeddingModel,
+			Endpoint:   DefaultOpenRouterEndpoint,
+			Dimensions: nil,
+		}
+	case "requesty":
+		return EmbedderConfig{
+			Provider:   "requesty",
+			Model:      DefaultRequestyEmbeddingModel,
+			Endpoint:   DefaultRequestyEndpoint,
+			Dimensions: nil,
+		}
+	case "lmstudio":
+		dim := DefaultLocalEmbeddingDimensions
+		return EmbedderConfig{
+			Provider:   "lmstudio",
+			Model:      DefaultLMStudioEmbeddingModel,
+			Endpoint:   DefaultLMStudioEndpoint,
+			Dimensions: &dim,
+		}
+	case "openai":
+		return EmbedderConfig{
+			Provider:    "openai",
+			Model:       DefaultOpenAIEmbeddingModel,
+			Endpoint:    DefaultOpenAIEndpoint,
+			Dimensions:  nil,
+			Parallelism: DefaultOpenAIParallelism,
+		}
+	case "ollama":
+		fallthrough
+	default:
+		dim := DefaultLocalEmbeddingDimensions
+		return EmbedderConfig{
+			Provider:   providerOrDefault(provider),
+			Model:      DefaultOllamaEmbeddingModel,
+			Endpoint:   DefaultOllamaEndpoint,
+			Dimensions: &dim,
+		}
 	}
 }
 
@@ -117,6 +235,84 @@ type QdrantConfig struct {
 type ChunkingConfig struct {
 	Size    int `yaml:"size"`
 	Overlap int `yaml:"overlap"`
+	// CustomExtensions extends the built-in SupportedExtensions list with
+	// additional file extensions to index (e.g. [".tengo", ".el"]). Each
+	// entry must include the leading dot and is matched case-insensitively.
+	// Binary detection (UTF-8 + null-byte check) still applies, so adding
+	// a binary extension here is safe.
+	CustomExtensions []string `yaml:"custom_extensions,omitempty"`
+}
+
+func DefaultStoreForBackend(backend string) StoreConfig {
+	cfg := StoreConfig{Backend: backendOrDefault(backend)}
+	switch cfg.Backend {
+	case "postgres":
+		cfg.Postgres = PostgresConfig{
+			DSN: DefaultPostgresDSN,
+		}
+	case "qdrant":
+		cfg.Qdrant = QdrantConfig{
+			Endpoint: DefaultQdrantEndpoint,
+			Port:     DefaultQdrantPort,
+		}
+	}
+	return cfg
+}
+
+type FrameworkConfig struct {
+	Enabled    bool                  `yaml:"enabled"`
+	Mode       string                `yaml:"mode"` // auto | require | off
+	NodePath   string                `yaml:"node_path,omitempty"`
+	Frameworks FrameworkFeatureFlags `yaml:"frameworks"`
+	isSet      bool                  `yaml:"-"`
+	enabledSet bool                  `yaml:"-"`
+}
+
+type FrameworkFeatureFlags struct {
+	Vue    FrameworkFeatureConfig `yaml:"vue"`
+	Svelte FrameworkFeatureConfig `yaml:"svelte"`
+	Astro  FrameworkFeatureConfig `yaml:"astro"`
+	Solid  FrameworkFeatureConfig `yaml:"solid"`
+}
+
+type FrameworkFeatureConfig struct {
+	Enabled    bool `yaml:"enabled"`
+	isSet      bool `yaml:"-"`
+	enabledSet bool `yaml:"-"`
+}
+
+func (c *FrameworkConfig) UnmarshalYAML(value *yaml.Node) error {
+	type raw FrameworkConfig
+	var aux raw
+	if err := value.Decode(&aux); err != nil {
+		return err
+	}
+	*c = FrameworkConfig(aux)
+	c.isSet = true
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		if value.Content[i].Value == "enabled" {
+			c.enabledSet = true
+			break
+		}
+	}
+	return nil
+}
+
+func (c *FrameworkFeatureConfig) UnmarshalYAML(value *yaml.Node) error {
+	type raw FrameworkFeatureConfig
+	var aux raw
+	if err := value.Decode(&aux); err != nil {
+		return err
+	}
+	*c = FrameworkFeatureConfig(aux)
+	c.isSet = true
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		if value.Content[i].Value == "enabled" {
+			c.enabledSet = true
+			break
+		}
+	}
+	return nil
 }
 
 type WatchConfig struct {
@@ -126,6 +322,17 @@ type WatchConfig struct {
 	RPGDerivedDebounceMs        int       `yaml:"rpg_derived_debounce_ms,omitempty"`
 	RPGFullReconcileIntervalSec int       `yaml:"rpg_full_reconcile_interval_sec,omitempty"`
 	RPGMaxDirtyFilesPerBatch    int       `yaml:"rpg_max_dirty_files_per_batch,omitempty"`
+	// DiscoverWorktrees controls automatic discovery (and watching) of linked
+	// git worktrees. A pointer is used so that configs without the key keep
+	// the historical default (enabled). Only the main worktree's config is
+	// consulted — the key is ignored in linked-worktree config copies.
+	DiscoverWorktrees *bool `yaml:"discover_worktrees,omitempty"`
+}
+
+// WorktreeDiscoveryEnabled reports whether linked git worktrees should be
+// auto-discovered and watched. Defaults to true when the option is not set.
+func (w WatchConfig) WorktreeDiscoveryEnabled() bool {
+	return w.DiscoverWorktrees == nil || *w.DiscoverWorktrees
 }
 
 type TraceConfig struct {
@@ -189,22 +396,24 @@ func ValidateWatchConfig(cfg WatchConfig) error {
 }
 
 func DefaultConfig() *Config {
-	defaultDim := 768
 	return &Config{
-		Version: 1,
-		Embedder: EmbedderConfig{
-			Provider:   "ollama",
-			Model:      "nomic-embed-text",
-			Endpoint:   "http://localhost:11434",
-			Dimensions: &defaultDim,
-			// Parallelism intentionally omitted - only applies to OpenAI
-		},
-		Store: StoreConfig{
-			Backend: "gob",
-		},
+		Version:  1,
+		Embedder: DefaultEmbedderForProvider(DefaultEmbedderProvider),
+		Store:    DefaultStoreForBackend("gob"),
 		Chunking: ChunkingConfig{
 			Size:    512,
 			Overlap: 50,
+		},
+		Framework: FrameworkConfig{
+			Enabled:  true,
+			Mode:     "auto",
+			NodePath: "node",
+			Frameworks: FrameworkFeatureFlags{
+				Vue:    FrameworkFeatureConfig{Enabled: true},
+				Svelte: FrameworkFeatureConfig{Enabled: false},
+				Astro:  FrameworkFeatureConfig{Enabled: false},
+				Solid:  FrameworkFeatureConfig{Enabled: false},
+			},
 		},
 		Watch: WatchConfig{
 			DebounceMs:                  500,
@@ -214,6 +423,9 @@ func DefaultConfig() *Config {
 			RPGMaxDirtyFilesPerBatch:    DefaultWatchRPGMaxDirtyFilesPerBatch,
 		},
 		Search: SearchConfig{
+			Dedup: DedupConfig{
+				Enabled: true,
+			},
 			Hybrid: HybridConfig{
 				Enabled: false,
 				K:       60,
@@ -255,9 +467,11 @@ func DefaultConfig() *Config {
 		Trace: TraceConfig{
 			Mode: "fast",
 			EnabledLanguages: []string{
-				".go", ".js", ".ts", ".jsx", ".tsx", ".py", ".php",
-				".c", ".h", ".cpp", ".hpp", ".cc", ".cxx",
+				".go", ".js", ".ts", ".jsx", ".tsx", ".vue", ".py", ".php",
+				".lua",
+				".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hxx",
 				".rs", ".zig", ".cs", ".java",
+				".fs", ".fsx", ".fsi", // F#
 				".pas", ".dpr", // Pascal/Delphi
 			},
 			ExcludePatterns: []string{
@@ -362,34 +576,15 @@ func (c *Config) applyDefaults() {
 
 	// Embedder defaults
 	if c.Embedder.Endpoint == "" {
-		switch c.Embedder.Provider {
-		case "ollama":
-			c.Embedder.Endpoint = "http://localhost:11434"
-		case "lmstudio":
-			c.Embedder.Endpoint = "http://127.0.0.1:1234"
-		case "openai":
-			c.Embedder.Endpoint = "https://api.openai.com/v1"
-		case "synthetic":
-			c.Embedder.Endpoint = "https://api.synthetic.new/openai/v1"
-		case "openrouter":
-			c.Embedder.Endpoint = "https://openrouter.ai/api/v1"
-		default:
-			c.Embedder.Endpoint = defaults.Embedder.Endpoint
-		}
+		c.Embedder.Endpoint = DefaultEmbedderForProvider(c.Embedder.Provider).Endpoint
 	}
 
-	// Only set default dimensions for specific embedders (Ollama, LMStudio, Synthetic).
-	// For OpenAI, leave nil to let the API use the model's native dimensions.
+	// Only set default dimensions for local embedders.
+	// For OpenAI/OpenRouter, leave nil to let the API use the model's native dimensions.
 	if c.Embedder.Dimensions == nil {
-		switch c.Embedder.Provider {
-		case "ollama":
-			dim := 768 // nomic-embed-text default
-			c.Embedder.Dimensions = &dim
-		case "lmstudio":
-			dim := 768 // nomic default
-			c.Embedder.Dimensions = &dim
-		case "synthetic":
-			dim := 768 // nomic-embed-text-v1.5 default
+		switch cfg := DefaultEmbedderForProvider(c.Embedder.Provider); {
+		case cfg.Dimensions != nil:
+			dim := *cfg.Dimensions
 			c.Embedder.Dimensions = &dim
 		}
 	}
@@ -405,6 +600,34 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Chunking.Overlap == 0 {
 		c.Chunking.Overlap = defaults.Chunking.Overlap
+	}
+
+	// Framework processing defaults
+	hasFrameworkConfig := c.Framework.isSet
+	if !hasFrameworkConfig {
+		c.Framework = defaults.Framework
+	} else {
+		if !c.Framework.enabledSet {
+			c.Framework.Enabled = defaults.Framework.Enabled
+		}
+		if c.Framework.Mode == "" {
+			c.Framework.Mode = defaults.Framework.Mode
+		}
+		if c.Framework.NodePath == "" {
+			c.Framework.NodePath = defaults.Framework.NodePath
+		}
+		if !c.Framework.Frameworks.Vue.enabledSet {
+			c.Framework.Frameworks.Vue.Enabled = defaults.Framework.Frameworks.Vue.Enabled
+		}
+		if !c.Framework.Frameworks.Svelte.enabledSet {
+			c.Framework.Frameworks.Svelte.Enabled = defaults.Framework.Frameworks.Svelte.Enabled
+		}
+		if !c.Framework.Frameworks.Astro.enabledSet {
+			c.Framework.Frameworks.Astro.Enabled = defaults.Framework.Frameworks.Astro.Enabled
+		}
+		if !c.Framework.Frameworks.Solid.enabledSet {
+			c.Framework.Frameworks.Solid.Enabled = defaults.Framework.Frameworks.Solid.Enabled
+		}
 	}
 
 	// Watch defaults
@@ -426,7 +649,7 @@ func (c *Config) applyDefaults() {
 
 	// Qdrant defaults
 	if c.Store.Backend == "qdrant" && c.Store.Qdrant.Port <= 0 {
-		c.Store.Qdrant.Port = 6334
+		c.Store.Qdrant.Port = DefaultStoreForBackend("qdrant").Qdrant.Port
 	}
 
 	// RPG defaults
@@ -454,6 +677,20 @@ func (c *Config) applyDefaults() {
 	if c.RPG.FeatureGroupStrategy == "" {
 		c.RPG.FeatureGroupStrategy = DefaultRPGFeatureGroupStrategy
 	}
+}
+
+func providerOrDefault(provider string) string {
+	if provider == "" {
+		return DefaultEmbedderProvider
+	}
+	return provider
+}
+
+func backendOrDefault(backend string) string {
+	if backend == "" {
+		return "gob"
+	}
+	return backend
 }
 
 func (c *Config) Save(projectRoot string) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
 )
 
 type GOBStore struct {
@@ -144,12 +147,12 @@ func (s *GOBStore) Load(ctx context.Context) error {
 	}
 	defer lockFile.Close()
 
-	if err := flockShared(lockFile); err != nil {
+	if err := fileutil.FlockShared(lockFile, false); err != nil {
 		// If locking fails, proceed without locking (backward compat)
 		return s.loadUnlocked()
 	}
 	defer func() {
-		_ = funlock(lockFile)
+		_ = fileutil.Funlock(lockFile)
 	}()
 
 	return s.loadUnlocked()
@@ -169,7 +172,39 @@ func (s *GOBStore) loadUnlocked() error {
 	var data gobData
 	decoder := gob.NewDecoder(file)
 	if err := decoder.Decode(&data); err != nil {
-		return fmt.Errorf("failed to decode index: %w", err)
+		// A truncated/corrupted index (e.g. after an unclean shutdown) must not
+		// wedge grepai in a permanent error loop: the index is a rebuildable
+		// cache. Quarantine the bad file and start from an empty index so the
+		// next scan re-creates it.
+		// Close before renaming: Windows cannot rename a file that is open.
+		_ = file.Close()
+		corruptPath := s.indexPath + ".corrupt"
+		// Plain os.Rename, NOT ReplaceFileAtomically: its remove-then-rename
+		// fallback would delete a .corrupt file freshly quarantined by a
+		// concurrent process (Load holds only a shared lock).
+		renameErr := os.Rename(s.indexPath, corruptPath)
+		if renameErr != nil && !os.IsNotExist(renameErr) {
+			// os.Rename does not overwrite an existing file on Windows; drop a
+			// stale quarantine from a previous recovery and retry once.
+			_ = os.Remove(corruptPath)
+			renameErr = os.Rename(s.indexPath, corruptPath)
+		}
+		switch {
+		case renameErr == nil:
+			log.Printf("Warning: index file %s is corrupted (%v); moved it to %s and starting with an empty index — it will be rebuilt on the next scan", s.indexPath, err, corruptPath)
+		case os.IsNotExist(renameErr):
+			// A concurrent process hit the same corruption and already
+			// quarantined the file; adopt its recovery instead of resurfacing
+			// the decode error.
+			log.Printf("Warning: index file %s is corrupted (%v); already quarantined by a concurrent process — starting with an empty index", s.indexPath, err)
+		default:
+			// Self-heal failed (e.g. read-only directory): keep the fatal
+			// behavior but surface the failed quarantine so it is diagnosable.
+			return fmt.Errorf("failed to decode index: %w (quarantine to %s failed: %v)", err, corruptPath, renameErr)
+		}
+		s.chunks = make(map[string]Chunk)
+		s.documents = make(map[string]Document)
+		return nil
 	}
 
 	s.chunks = data.Chunks
@@ -189,7 +224,7 @@ func (s *GOBStore) Persist(ctx context.Context) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if err := ensureParentDir(s.indexPath); err != nil {
+	if err := fileutil.EnsureParentDir(s.indexPath); err != nil {
 		return fmt.Errorf("failed to prepare index directory: %w", err)
 	}
 
@@ -201,41 +236,56 @@ func (s *GOBStore) Persist(ctx context.Context) error {
 	}
 	defer lockFile.Close()
 
-	if err := flockExclusive(lockFile); err != nil {
+	if err := fileutil.FlockExclusive(lockFile, false); err != nil {
 		// If locking fails, proceed without locking (backward compat)
 		return s.persistUnlocked()
 	}
 	defer func() {
-		_ = funlock(lockFile)
+		_ = fileutil.Funlock(lockFile)
 	}()
 
 	return s.persistUnlocked()
 }
 
 // persistUnlocked performs the actual persist without any locking.
+// It writes to a temp file and atomically replaces the index so that an
+// unclean shutdown mid-write can never leave a truncated index behind.
 func (s *GOBStore) persistUnlocked() error {
-	file, err := os.Create(s.indexPath)
-	if err != nil {
-		return fmt.Errorf("failed to create index file: %w", err)
-	}
-	defer file.Close()
-
 	data := gobData{
 		Chunks:    s.chunks,
 		Documents: s.documents,
 	}
 
-	encoder := gob.NewEncoder(file)
-	if err := encoder.Encode(data); err != nil {
-		return fmt.Errorf("failed to encode index: %w", err)
+	tmpFile, err := os.CreateTemp(filepath.Dir(s.indexPath), filepath.Base(s.indexPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create index temp file: %w", err)
 	}
 
-	return nil
-}
+	tmpPath := tmpFile.Name()
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
 
-func ensureParentDir(filePath string) error {
-	dir := filepath.Dir(filePath)
-	return os.MkdirAll(dir, 0755)
+	if err := gob.NewEncoder(tmpFile).Encode(data); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to encode index: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to sync index temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close index temp file: %w", err)
+	}
+	if err := fileutil.ReplaceFileAtomically(tmpPath, s.indexPath); err != nil {
+		return fmt.Errorf("failed to replace index file: %w", err)
+	}
+	cleanupTemp = false
+
+	return nil
 }
 
 func (s *GOBStore) Close() error {

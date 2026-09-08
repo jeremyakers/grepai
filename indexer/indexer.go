@@ -4,9 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime"
+	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/yoanbernabeu/grepai/embedder"
+	"github.com/yoanbernabeu/grepai/framework"
 	"github.com/yoanbernabeu/grepai/store"
 )
 
@@ -16,6 +21,7 @@ type Indexer struct {
 	embedder      embedder.Embedder
 	chunker       *Chunker
 	scanner       *Scanner
+	processor     *framework.ProcessorRegistry
 	lastIndexTime time.Time
 }
 
@@ -25,6 +31,7 @@ type IndexStats struct {
 	ChunksCreated int
 	FilesRemoved  int
 	Duration      time.Duration
+	ScannedFiles  []FileMeta // All files found during scan (for reuse by callers)
 }
 
 // ProgressInfo contains progress information for indexing
@@ -58,13 +65,20 @@ func NewIndexer(
 	chunker *Chunker,
 	scanner *Scanner,
 	lastIndexTime time.Time,
+	processors ...*framework.ProcessorRegistry,
 ) *Indexer {
+	var processor *framework.ProcessorRegistry
+	if len(processors) > 0 {
+		processor = processors[0]
+	}
+
 	return &Indexer{
 		root:          root,
 		store:         st,
 		embedder:      emb,
 		chunker:       chunker,
 		scanner:       scanner,
+		processor:     processor,
 		lastIndexTime: lastIndexTime,
 	}
 }
@@ -91,6 +105,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		return nil, fmt.Errorf("failed to scan files: %w", err)
 	}
 	stats.FilesSkipped = len(skipped)
+	stats.ScannedFiles = fileMetas
 
 	// Get existing documents
 	existingDocs, err := idx.store.ListDocuments(ctx)
@@ -103,55 +118,59 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		existingMap[doc] = true
 	}
 
-	// Filter files that need indexing
-	filesToIndex := make([]FileInfo, 0, len(fileMetas))
-	for i, fileMeta := range fileMetas {
-		// Report progress for scanning phase
-		if onProgress != nil {
-			onProgress(ProgressInfo{
-				Current:     i + 1,
-				Total:       len(fileMetas),
-				CurrentFile: fileMeta.Path,
-			})
-		}
-
-		// Skip files modified before lastIndexTime
-		if !idx.lastIndexTime.IsZero() {
-			fileModTime := time.Unix(fileMeta.ModTime, 0)
-			if fileModTime.Before(idx.lastIndexTime) || fileModTime.Equal(idx.lastIndexTime) {
-				stats.FilesSkipped++
-				delete(existingMap, fileMeta.Path)
-				continue
-			}
-		}
-
-		// Check if file needs reindexing
-		doc, err := idx.store.GetDocument(ctx, fileMeta.Path)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get document %s: %w", fileMeta.Path, err)
-		}
-
-		// Load file content and hash only after metadata filtering.
-		file, err := idx.scanner.ScanFile(fileMeta.Path)
-		if err != nil {
-			log.Printf("Failed to scan %s: %v", fileMeta.Path, err)
-			stats.FilesSkipped++
-			delete(existingMap, fileMeta.Path)
-			continue
-		}
-		if file == nil {
-			stats.FilesSkipped++
-			delete(existingMap, fileMeta.Path)
-			continue
-		}
-
-		if doc != nil && doc.Hash == file.Hash {
-			delete(existingMap, fileMeta.Path)
-			continue // File unchanged
-		}
-
-		filesToIndex = append(filesToIndex, *file)
+	// Every scanned file is accounted for exactly once: it either still exists
+	// (and is removed from existingMap below) or it was deleted from disk and
+	// stays in existingMap so it gets removed from the index further down.
+	for _, fileMeta := range fileMetas {
 		delete(existingMap, fileMeta.Path)
+	}
+
+	// Decide which files need (re)indexing. Each file's decision only depends
+	// on that file's own document lookup + optional content hash, so this is
+	// done concurrently across a bounded worker pool. On large repositories
+	// (100k+ files) this phase — not embedding — is often the bottleneck,
+	// especially right after a watcher restart or branch switch where every
+	// file's mtime looks "new" and must be hashed to check for real changes.
+	decisions := make([]fileScanDecision, len(fileMetas))
+	var completed atomic.Int64
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(scanWorkerLimit())
+
+	for i := range fileMetas {
+		fileMeta := fileMetas[i]
+		g.Go(func() error {
+			decision, err := idx.decideFileScan(gctx, fileMeta)
+			if err != nil {
+				return fmt.Errorf("failed to get document %s: %w", fileMeta.Path, err)
+			}
+			decisions[i] = decision
+
+			if onProgress != nil {
+				n := completed.Add(1)
+				onProgress(ProgressInfo{
+					Current:     int(n),
+					Total:       len(fileMetas),
+					CurrentFile: fileMeta.Path,
+				})
+			}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Collect results in original scan order for deterministic output.
+	filesToIndex := make([]FileInfo, 0, len(fileMetas))
+	for _, decision := range decisions {
+		if decision.countAsSkipped {
+			stats.FilesSkipped++
+		}
+		if decision.file != nil {
+			filesToIndex = append(filesToIndex, *decision.file)
+		}
 	}
 
 	// Index files using batch processing if available, otherwise sequentially
@@ -205,47 +224,158 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	return stats, nil
 }
 
+// fileScanDecision is the outcome of deciding whether a single scanned file
+// needs (re)indexing.
+type fileScanDecision struct {
+	// file is non-nil when the file needs (re)indexing.
+	file *FileInfo
+	// countAsSkipped mirrors the original sequential bookkeeping: mtime-gated
+	// skips and unreadable/binary/oversized files count toward
+	// stats.FilesSkipped, but files that are unchanged (same content hash)
+	// do not -- matching the pre-existing (sequential) behavior exactly.
+	countAsSkipped bool
+}
+
+// decideFileScan fetches a file's existing document (if any) and determines
+// whether it needs (re)indexing, following the same rules as the original
+// sequential loop: an mtime fast-path gate, then a content-hash comparison
+// for files that need a closer look. It is safe to call concurrently for
+// different files -- it only reads from the store and the filesystem.
+func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta) (fileScanDecision, error) {
+	// Fetch the document once -- used by both the mod-time gate and hash check.
+	doc, err := idx.store.GetDocument(ctx, fileMeta.Path)
+	if err != nil {
+		return fileScanDecision{}, err
+	}
+
+	// Skip files modified before lastIndexTime -- but only if they have chunks.
+	// Files with no chunks need re-indexing even if their mod_time is old
+	// (e.g., a prior indexing run created the document but failed to embed).
+	if !idx.lastIndexTime.IsZero() && doc != nil && len(doc.ChunkIDs) > 0 {
+		fileModTime := time.Unix(fileMeta.ModTime, 0)
+		if fileModTime.Before(idx.lastIndexTime) || fileModTime.Equal(idx.lastIndexTime) {
+			return fileScanDecision{countAsSkipped: true}, nil
+		}
+	}
+
+	// Load file content and hash only after metadata filtering.
+	file, err := idx.scanner.ScanFile(fileMeta.Path)
+	if err != nil {
+		log.Printf("Failed to scan %s: %v", fileMeta.Path, err)
+		return fileScanDecision{countAsSkipped: true}, nil
+	}
+	if file == nil {
+		return fileScanDecision{countAsSkipped: true}, nil
+	}
+
+	if doc != nil && doc.Hash == file.Hash && len(doc.ChunkIDs) > 0 {
+		return fileScanDecision{}, nil // File unchanged and has chunks
+	}
+
+	return fileScanDecision{file: file}, nil
+}
+
+// scanWorkerLimit returns the number of concurrent workers to use when
+// deciding which files need (re)indexing (store lookups + optional hashing).
+// This phase mixes store I/O (which may be a network round trip for remote
+// backends like Postgres/Qdrant) with local file hashing, so it benefits from
+// more concurrency than pure CPU-bound work would need.
+func scanWorkerLimit() int {
+	n := runtime.GOMAXPROCS(0) * 4
+	if n < 8 {
+		return 8
+	}
+	if n > 64 {
+		return 64
+	}
+	return n
+}
+
 // fileChunkData holds chunking information for a single file during batch processing.
 type fileChunkData struct {
 	fileIndex  int // Index in the files slice (for result mapping)
 	file       FileInfo
 	chunkInfos []ChunkInfo
+	lineMap    []int
+	source     string
 }
 
 // prepareFileChunks processes files by deleting existing chunks and creating new chunks.
 // Returns the file data for storage and the file chunks for embedding.
+// preparedFileChunks holds the chunking outcome for a single file, produced
+// concurrently by prepareFileChunks.
+type preparedFileChunks struct {
+	fd fileChunkData
+	fc embedder.FileChunks
+	ok bool // false if the file produced no chunks and should be dropped
+}
+
+// prepareFileChunks processes files by deleting existing chunks and creating new chunks.
+// Returns the file data for storage and the file chunks for embedding.
+//
+// Each file is independent (its own store delete + chunk generation), so this
+// runs concurrently across a bounded worker pool. On large repositories this
+// overlaps per-file store round trips (relevant for remote backends like
+// Postgres/Qdrant) with the CPU cost of chunking instead of paying both costs
+// strictly one file at a time.
 func (idx *Indexer) prepareFileChunks(
 	ctx context.Context,
 	files []FileInfo,
 ) ([]fileChunkData, []embedder.FileChunks, error) {
+	results := make([]preparedFileChunks, len(files))
+
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(scanWorkerLimit())
+
+	for i := range files {
+		file := files[i]
+		g.Go(func() error {
+			if err := idx.store.DeleteByFile(gctx, file.Path); err != nil {
+				return fmt.Errorf("failed to delete existing chunks for %s: %w", file.Path, err)
+			}
+
+			embedContent, lineMap := idx.embeddingContent(gctx, file)
+			chunkInfos := idx.chunker.ChunkWithContext(file.Path, embedContent)
+			if len(chunkInfos) == 0 {
+				return nil
+			}
+
+			contents := make([]string, len(chunkInfos))
+			for j, c := range chunkInfos {
+				contents[j] = c.EmbedContent
+			}
+
+			results[i] = preparedFileChunks{
+				fd: fileChunkData{
+					fileIndex:  i,
+					file:       file,
+					chunkInfos: chunkInfos,
+					lineMap:    lineMap,
+					source:     file.Content,
+				},
+				fc: embedder.FileChunks{
+					FileIndex: i,
+					Chunks:    contents,
+				},
+				ok: true,
+			}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, nil, err
+	}
+
+	// Collect results in original file order for deterministic output.
 	fileData := make([]fileChunkData, 0, len(files))
 	fileChunks := make([]embedder.FileChunks, 0, len(files))
-
-	for i, file := range files {
-		if err := idx.store.DeleteByFile(ctx, file.Path); err != nil {
-			return nil, nil, fmt.Errorf("failed to delete existing chunks for %s: %w", file.Path, err)
-		}
-
-		chunkInfos := idx.chunker.ChunkWithContext(file.Path, file.Content)
-		if len(chunkInfos) == 0 {
+	for _, r := range results {
+		if !r.ok {
 			continue
 		}
-
-		contents := make([]string, len(chunkInfos))
-		for j, c := range chunkInfos {
-			contents[j] = c.Content
-		}
-
-		fileData = append(fileData, fileChunkData{
-			fileIndex:  i,
-			file:       file,
-			chunkInfos: chunkInfos,
-		})
-
-		fileChunks = append(fileChunks, embedder.FileChunks{
-			FileIndex: i,
-			Chunks:    contents,
-		})
+		fileData = append(fileData, r.fd)
+		fileChunks = append(fileChunks, r.fc)
 	}
 
 	return fileData, fileChunks, nil
@@ -389,6 +519,7 @@ func (idx *Indexer) indexFilesBatched(
 	now := time.Now()
 	for _, pf := range preFilledFiles {
 		fd := fileData[pf.fdIndex]
+		idx.remapChunksToSource(fd.chunkInfos, fd.file.Path, fd.source, fd.lineMap)
 		chunks, chunkIDs := createStoreChunks(fd.chunkInfos, pf.vectors, now)
 		if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
 			return filesIndexed, chunksCreated, err
@@ -414,6 +545,7 @@ func (idx *Indexer) indexFilesBatched(
 					fd.file.Path, len(embeddings), len(fd.chunkInfos))
 				continue
 			}
+			idx.remapChunksToSource(fd.chunkInfos, fd.file.Path, fd.source, fd.lineMap)
 			chunks, chunkIDs := createStoreChunks(fd.chunkInfos, embeddings, now)
 			if err := idx.saveFileData(ctx, fd, chunks, chunkIDs); err != nil {
 				return filesIndexed, chunksCreated, err
@@ -437,8 +569,10 @@ func (idx *Indexer) IndexFile(ctx context.Context, file FileInfo) (int, error) {
 		return 0, fmt.Errorf("failed to delete existing chunks: %w", err)
 	}
 
+	embedContent, lineMap := idx.embeddingContent(ctx, file)
+
 	// Chunk the file
-	chunkInfos := idx.chunker.ChunkWithContext(file.Path, file.Content)
+	chunkInfos := idx.chunker.ChunkWithContext(file.Path, embedContent)
 	if len(chunkInfos) == 0 {
 		return 0, nil
 	}
@@ -513,6 +647,8 @@ func (idx *Indexer) IndexFile(ctx context.Context, file FileInfo) (int, error) {
 		}
 	}
 
+	idx.remapChunksToSource(finalChunks, file.Path, file.Content, lineMap)
+
 	// Create store chunks
 	now := time.Now()
 	chunks := make([]store.Chunk, len(finalChunks))
@@ -563,7 +699,11 @@ func (idx *Indexer) embedWithReChunking(ctx context.Context, chunks []ChunkInfo)
 	for attempt := 0; attempt < maxReChunkAttempts; attempt++ {
 		contents := make([]string, len(currentChunks))
 		for i, c := range currentChunks {
-			contents[i] = c.Content
+			if c.EmbedContent != "" {
+				contents[i] = c.EmbedContent
+			} else {
+				contents[i] = c.Content
+			}
 		}
 
 		vectors, err := idx.embedder.EmbedBatch(ctx, contents)
@@ -595,7 +735,11 @@ func (idx *Indexer) embedWithReChunking(ctx context.Context, chunks []ChunkInfo)
 		if failedIndex > 0 {
 			beforeContents := make([]string, failedIndex)
 			for i := 0; i < failedIndex; i++ {
-				beforeContents[i] = currentChunks[i].Content
+				if currentChunks[i].EmbedContent != "" {
+					beforeContents[i] = currentChunks[i].EmbedContent
+				} else {
+					beforeContents[i] = currentChunks[i].Content
+				}
 			}
 			beforeVectors, err := idx.embedder.EmbedBatch(ctx, beforeContents)
 			if err != nil {
@@ -618,6 +762,36 @@ func (idx *Indexer) embedWithReChunking(ctx context.Context, chunks []ChunkInfo)
 	}
 
 	return nil, nil, fmt.Errorf("exceeded maximum re-chunk attempts (%d) for file", maxReChunkAttempts)
+}
+
+func (idx *Indexer) embeddingContent(ctx context.Context, file FileInfo) (string, []int) {
+	if idx.processor == nil {
+		return file.Content, nil
+	}
+
+	res, err := idx.processor.TransformForEmbedding(ctx, file.Path, file.Content)
+	if err != nil {
+		log.Printf("Warning: framework embedding transform failed for %s: %v", file.Path, err)
+		return file.Content, nil
+	}
+	framework.LogWarningsOnce(res.Warnings)
+	if res.Text == "" {
+		return file.Content, nil
+	}
+	return res.Text, res.GeneratedToSourceLine
+}
+
+func (idx *Indexer) remapChunksToSource(chunks []ChunkInfo, filePath, source string, lineMap []int) {
+	for i := range chunks {
+		startLine, endLine := framework.RemapLineRange(lineMap, chunks[i].StartLine, chunks[i].EndLine)
+		snippet := framework.SourceSnippet(source, startLine, endLine)
+		if snippet == "" {
+			continue
+		}
+		chunks[i].StartLine = startLine
+		chunks[i].EndLine = endLine
+		chunks[i].Content = fmt.Sprintf("File: %s\n\n%s", filePath, snippet)
+	}
 }
 
 // lookupCachedEmbeddings checks if the store implements EmbeddingCache and returns
@@ -671,5 +845,10 @@ func (idx *Indexer) NeedsReindex(ctx context.Context, path string, hash string) 
 		return true, nil
 	}
 
-	return doc.Hash != hash, nil
+	// Reindex if hash changed OR if document has no chunks (prior indexing failed)
+	if doc.Hash != hash || len(doc.ChunkIDs) == 0 {
+		return true, nil
+	}
+
+	return false, nil
 }

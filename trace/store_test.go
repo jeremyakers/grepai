@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -574,5 +575,74 @@ func TestGOBSymbolStore_PersistCreatesMissingParentDir(t *testing.T) {
 
 	if _, err := os.Stat(indexPath); err != nil {
 		t.Fatalf("expected persisted symbol index file at %s: %v", indexPath, err)
+	}
+}
+
+func TestGOBSymbolStore_PersistCreatesLockFileAndNoTempFiles(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	indexPath := filepath.Join(tmpDir, "symbols.gob")
+
+	store := NewGOBSymbolStore(indexPath)
+	if err := store.Persist(ctx); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+
+	lockPath := indexPath + ".lock"
+	if _, err := os.Stat(lockPath); err != nil {
+		t.Fatalf("expected lock file at %s: %v", lockPath, err)
+	}
+
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		t.Fatalf("ReadDir failed: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "symbols.gob.tmp-") {
+			t.Fatalf("unexpected temporary file left behind: %s", entry.Name())
+		}
+	}
+}
+
+func TestGOBSymbolStore_ReferenceKindFilters(t *testing.T) {
+	ctx := context.Background()
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	store := NewGOBSymbolStore(indexPath)
+
+	symbols := []Symbol{
+		{Name: "uidConsumer", Kind: KindFunction, File: "store.ts", Line: 1, Language: "typescript"},
+	}
+	refs := []Reference{
+		{SymbolName: "uid", Kind: RefKindRead, File: "store.ts", Line: 2, CallerName: "uidConsumer", CallerFile: "store.ts"},
+		{SymbolName: "uid", Kind: RefKindWrite, File: "store.ts", Line: 3, CallerName: "uidConsumer", CallerFile: "store.ts"},
+		{SymbolName: "uid", Kind: RefKindCall, File: "store.ts", Line: 4, CallerName: "uidConsumer", CallerFile: "store.ts"},
+	}
+
+	if err := store.SaveFile(ctx, "store.ts", symbols, refs); err != nil {
+		t.Fatalf("SaveFile failed: %v", err)
+	}
+
+	callers, err := store.LookupCallers(ctx, "uid")
+	if err != nil {
+		t.Fatalf("LookupCallers failed: %v", err)
+	}
+	if len(callers) != 1 || callers[0].Kind != RefKindCall {
+		t.Fatalf("expected only call refs, got %+v", callers)
+	}
+
+	readers, err := store.LookupReaders(ctx, "uid")
+	if err != nil {
+		t.Fatalf("LookupReaders failed: %v", err)
+	}
+	if len(readers) != 1 || readers[0].Kind != RefKindRead {
+		t.Fatalf("expected only read refs, got %+v", readers)
+	}
+
+	writers, err := store.LookupWriters(ctx, "uid")
+	if err != nil {
+		t.Fatalf("LookupWriters failed: %v", err)
+	}
+	if len(writers) != 1 || writers[0].Kind != RefKindWrite {
+		t.Fatalf("expected only write refs, got %+v", writers)
 	}
 }

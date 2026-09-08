@@ -95,12 +95,18 @@ func TestRunInitialScan_SkipsSymbolExtractionWhenContentHashMatches(t *testing.T
 			Language: "go",
 		},
 	}
-	if err := symbolStore.SaveFileWithContentHash(ctx, fileInfo.Path, fileInfo.Hash, sentinel, nil); err != nil {
+	// Seed using the new SaveFileWithSignature so the persisted
+	// extractor version matches what RegexExtractor.Version() returns;
+	// otherwise runInitialScan correctly re-extracts (invalidating the
+	// seeded "sentinel") because the cache predates the current
+	// extractor version. Plain SaveFileWithContentHash would simulate
+	// an old gob file that the dedup deliberately treats as stale.
+	extractor := trace.NewRegexExtractor()
+	if err := symbolStore.SaveFileWithSignature(ctx, fileInfo.Path, fileInfo.Hash, extractor.Version(), sentinel, nil); err != nil {
 		t.Fatalf("failed to seed symbol store: %v", err)
 	}
 
-	extractor := trace.NewRegexExtractor()
-	if _, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, []string{".go"}, time.Time{}, true); err != nil {
+	if _, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, []string{".go"}, time.Time{}, true, nil, nil); err != nil {
 		t.Fatalf("runInitialScan failed: %v", err)
 	}
 
@@ -142,10 +148,25 @@ func TestRunInitialScan_SkipsIndexedFileByLastIndexTime(t *testing.T) {
 	vecStore := store.NewGOBStore(filepath.Join(projectRoot, "index.gob"))
 	idx := indexer.NewIndexer(projectRoot, vecStore, emb, chunker, scanner, time.Now().Add(1*time.Hour))
 
+	// Seed a document with ChunkIDs so the lastIndexTime gate can skip it.
+	// The new logic requires doc != nil && len(doc.ChunkIDs) > 0 to skip.
+	if err := vecStore.SaveDocument(ctx, store.Document{
+		Path:     "main.go",
+		Hash:     "seeded",
+		ChunkIDs: []string{"c1"},
+	}); err != nil {
+		t.Fatalf("failed to seed document: %v", err)
+	}
+
 	symbolStore := trace.NewGOBSymbolStore(filepath.Join(projectRoot, "symbols.gob"))
 	defer symbolStore.Close()
 
-	if err := symbolStore.SaveFile(ctx, "main.go", []trace.Symbol{
+	// Seed with the current extractor signature: the mtime fast-path only
+	// applies when the persisted extractor version still matches. A
+	// version-less seed models a pre-upgrade cache and is covered by
+	// TestRunInitialScan_ReExtractsWhenMtimeFastPathHitsStaleVersion.
+	extractor := trace.NewRegexExtractor()
+	if err := symbolStore.SaveFileWithSignature(ctx, "main.go", "seeded", extractor.Version(), []trace.Symbol{
 		{
 			Name:     "sentinel",
 			Kind:     trace.KindFunction,
@@ -158,8 +179,7 @@ func TestRunInitialScan_SkipsIndexedFileByLastIndexTime(t *testing.T) {
 	}
 
 	lastIndexTime := time.Now().Add(1 * time.Hour)
-	extractor := trace.NewRegexExtractor()
-	if _, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, []string{".go"}, lastIndexTime, true); err != nil {
+	if _, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, []string{".go"}, lastIndexTime, true, nil, nil); err != nil {
 		t.Fatalf("runInitialScan failed: %v", err)
 	}
 
@@ -210,9 +230,10 @@ func TestHandleFileEvent_SkipsUnchangedFile(t *testing.T) {
 		t.Fatalf("failed to scan source file: %v", err)
 	}
 	if err := vecStore.SaveDocument(ctx, store.Document{
-		Path:    "main.go",
-		Hash:    fileInfo.Hash,
-		ModTime: time.Unix(fileInfo.ModTime, 0),
+		Path:     "main.go",
+		Hash:     fileInfo.Hash,
+		ModTime:  time.Unix(fileInfo.ModTime, 0),
+		ChunkIDs: []string{"c1"},
 	}); err != nil {
 		t.Fatalf("failed to seed document: %v", err)
 	}
@@ -247,6 +268,8 @@ func TestHandleFileEvent_SkipsUnchangedFile(t *testing.T) {
 		&lastWrite,
 		nil,
 		watcher.FileEvent{Type: watcher.EventModify, Path: "main.go"},
+		nil,
+		nil,
 	)
 
 	if emb.embedCalls != 0 || emb.embedBatchCalls != 0 {
@@ -307,9 +330,10 @@ func TestHandleWorkspaceFileEvent_SkipsUnchangedFile(t *testing.T) {
 	projectName := "proj"
 	prefixedPath := workspaceName + "/" + projectName + "/proj/main.go"
 	if err := st.SaveDocument(ctx, store.Document{
-		Path:    prefixedPath,
-		Hash:    fileInfo.Hash,
-		ModTime: time.Unix(fileInfo.ModTime, 0),
+		Path:     prefixedPath,
+		Hash:     fileInfo.Hash,
+		ModTime:  time.Unix(fileInfo.ModTime, 0),
+		ChunkIDs: []string{"c1"},
 	}); err != nil {
 		t.Fatalf("failed to seed workspace document: %v", err)
 	}
@@ -330,7 +354,7 @@ func TestHandleWorkspaceFileEvent_SkipsUnchangedFile(t *testing.T) {
 	handleFileEvent(ctx, idx, scanner, extractor, nil, nil, wrappedStore, nil, projectPath, cfg, &lastConfigWrite, nil, watcher.FileEvent{
 		Type: watcher.EventModify,
 		Path: "proj/main.go",
-	})
+	}, nil, nil)
 
 	if emb.embedCalls != 0 || emb.embedBatchCalls != 0 {
 		t.Fatalf("expected unchanged workspace file to skip embedding, got embed=%d embedBatch=%d", emb.embedCalls, emb.embedBatchCalls)
@@ -398,6 +422,8 @@ func TestHandleFileEvent_IndexesChangedFileAndUpdatesSymbols(t *testing.T) {
 		&lastWrite,
 		nil,
 		watcher.FileEvent{Type: watcher.EventModify, Path: "main.go"},
+		nil,
+		nil,
 	)
 
 	if emb.embedCalls == 0 && emb.embedBatchCalls == 0 {
@@ -471,6 +497,8 @@ func TestHandleFileEvent_DeleteRemovesIndexAndSymbols(t *testing.T) {
 		&lastWrite,
 		nil,
 		watcher.FileEvent{Type: watcher.EventDelete, Path: "main.go"},
+		nil,
+		nil,
 	)
 
 	doc, err := vecStore.GetDocument(ctx, "main.go")
@@ -482,5 +510,286 @@ func TestHandleFileEvent_DeleteRemovesIndexAndSymbols(t *testing.T) {
 	}
 	if symbolStore.IsFileIndexed("main.go") {
 		t.Fatal("expected symbols to be deleted on delete event")
+	}
+}
+
+func TestEmitInitialStatsSnapshot_ReportsExistingTotals(t *testing.T) {
+	ctx := context.Background()
+	projectRoot := t.TempDir()
+
+	vecStore := store.NewGOBStore(filepath.Join(projectRoot, "index.gob"))
+	if err := vecStore.SaveChunks(ctx, []store.Chunk{
+		{ID: "chunk-1", FilePath: "main.go"},
+		{ID: "chunk-2", FilePath: "main.go"},
+	}); err != nil {
+		t.Fatalf("failed to seed chunks: %v", err)
+	}
+	if err := vecStore.SaveDocument(ctx, store.Document{
+		Path:     "main.go",
+		Hash:     "hash",
+		ChunkIDs: []string{"chunk-1", "chunk-2"},
+	}); err != nil {
+		t.Fatalf("failed to seed document: %v", err)
+	}
+
+	symbolStore := trace.NewGOBSymbolStore(filepath.Join(projectRoot, "symbols.gob"))
+	defer symbolStore.Close()
+	if err := symbolStore.SaveFile(ctx, "main.go", []trace.Symbol{
+		{
+			Name:     "Foo",
+			Kind:     trace.KindFunction,
+			File:     "main.go",
+			Line:     1,
+			Language: "go",
+		},
+		{
+			Name:     "Bar",
+			Kind:     trace.KindFunction,
+			File:     "main.go",
+			Line:     5,
+			Language: "go",
+		},
+	}, nil); err != nil {
+		t.Fatalf("failed to seed symbol store: %v", err)
+	}
+
+	var got watchStatsDelta
+	calls := 0
+	emitInitialStatsSnapshot(ctx, vecStore, symbolStore, projectRoot, func(_ string, delta watchStatsDelta) {
+		calls++
+		got = delta
+	})
+
+	if calls != 1 {
+		t.Fatalf("stats callback calls = %d, want 1", calls)
+	}
+	if got.ChunksCreated != 2 {
+		t.Fatalf("chunks created = %d, want 2", got.ChunksCreated)
+	}
+	if got.FilesIndexed != 1 {
+		t.Fatalf("files indexed = %d, want 1", got.FilesIndexed)
+	}
+	if got.SymbolsFound != 2 {
+		t.Fatalf("symbols found = %d, want 2", got.SymbolsFound)
+	}
+	if !got.Snapshot {
+		t.Fatal("expected snapshot delta to be marked as Snapshot")
+	}
+}
+
+// TestRunInitialScan_ReExtractsWhenExtractorVersionDiffers confirms the
+// dedup invalidates a cached symbol set when the persisted extractor
+// version no longer matches the running extractor — the scenario a
+// user hits after upgrading to a release that ships better symbol
+// extraction without touching their source files.
+func TestRunInitialScan_ReExtractsWhenExtractorVersionDiffers(t *testing.T) {
+	ctx := context.Background()
+	projectRoot := t.TempDir()
+
+	srcPath := filepath.Join(projectRoot, "main.go")
+	srcContent := "package main\n\nfunc real() {}\n"
+	if err := os.WriteFile(srcPath, []byte(srcContent), 0644); err != nil {
+		t.Fatalf("failed to create source file: %v", err)
+	}
+
+	ignoreMatcher, err := indexer.NewIgnoreMatcher(projectRoot, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+
+	scanner := indexer.NewScanner(projectRoot, ignoreMatcher)
+	chunker := indexer.NewChunker(512, 50)
+	vecStore := store.NewGOBStore(filepath.Join(projectRoot, "index.gob"))
+	idx := indexer.NewIndexer(projectRoot, vecStore, &noOpEmbedder{}, chunker, scanner, time.Now().Add(1*time.Hour))
+
+	symbolStore := trace.NewGOBSymbolStore(filepath.Join(projectRoot, "symbols.gob"))
+	if err := symbolStore.Load(ctx); err != nil {
+		t.Fatalf("failed to load symbol store: %v", err)
+	}
+	defer symbolStore.Close()
+
+	fileInfo, err := scanner.ScanFile("main.go")
+	if err != nil {
+		t.Fatalf("failed to scan file: %v", err)
+	}
+
+	// Seed with a STALE extractor version. The content hash matches the
+	// current file, but the version recorded is a prior release. The
+	// dedup must invalidate and re-extract.
+	staleSentinel := []trace.Symbol{
+		{Name: "stale_sentinel", Kind: trace.KindFunction, File: "main.go", Line: 1, Language: "go"},
+	}
+	if err := symbolStore.SaveFileWithSignature(ctx, fileInfo.Path, fileInfo.Hash, "regex-vOLD", staleSentinel, nil); err != nil {
+		t.Fatalf("failed to seed symbol store: %v", err)
+	}
+
+	extractor := trace.NewRegexExtractor()
+	if _, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, []string{".go"}, time.Time{}, true, nil, nil); err != nil {
+		t.Fatalf("runInitialScan failed: %v", err)
+	}
+
+	// After re-extraction, the stale sentinel must be gone and the real
+	// "real" function from the source must be in the store.
+	stale, err := symbolStore.LookupSymbol(ctx, "stale_sentinel")
+	if err != nil {
+		t.Fatalf("LookupSymbol(stale_sentinel) failed: %v", err)
+	}
+	if len(stale) != 0 {
+		t.Errorf("expected stale sentinel to be invalidated, found %d entries", len(stale))
+	}
+
+	real, err := symbolStore.LookupSymbol(ctx, "real")
+	if err != nil {
+		t.Fatalf("LookupSymbol(real) failed: %v", err)
+	}
+	if len(real) == 0 {
+		t.Error("expected real to be re-extracted after version mismatch, got none")
+	}
+}
+
+// TestRunInitialScan_ReExtractsWhenExtractorVersionIsMissing confirms the
+// upgrade path from gob files written by older grepai releases that lack
+// the FileExtractorVersions field altogether — the dedup must treat the
+// cache as stale and re-extract once.
+func TestRunInitialScan_ReExtractsWhenExtractorVersionIsMissing(t *testing.T) {
+	ctx := context.Background()
+	projectRoot := t.TempDir()
+
+	srcPath := filepath.Join(projectRoot, "main.go")
+	srcContent := "package main\n\nfunc real() {}\n"
+	if err := os.WriteFile(srcPath, []byte(srcContent), 0644); err != nil {
+		t.Fatalf("failed to create source file: %v", err)
+	}
+
+	ignoreMatcher, err := indexer.NewIgnoreMatcher(projectRoot, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+
+	scanner := indexer.NewScanner(projectRoot, ignoreMatcher)
+	chunker := indexer.NewChunker(512, 50)
+	vecStore := store.NewGOBStore(filepath.Join(projectRoot, "index.gob"))
+	idx := indexer.NewIndexer(projectRoot, vecStore, &noOpEmbedder{}, chunker, scanner, time.Now().Add(1*time.Hour))
+
+	symbolStore := trace.NewGOBSymbolStore(filepath.Join(projectRoot, "symbols.gob"))
+	if err := symbolStore.Load(ctx); err != nil {
+		t.Fatalf("failed to load symbol store: %v", err)
+	}
+	defer symbolStore.Close()
+
+	fileInfo, err := scanner.ScanFile("main.go")
+	if err != nil {
+		t.Fatalf("failed to scan file: %v", err)
+	}
+
+	// Use the legacy SaveFileWithContentHash, which leaves the
+	// extractor-version map empty for this file — exactly the shape of
+	// gob files produced by older grepai releases.
+	if err := symbolStore.SaveFileWithContentHash(ctx, fileInfo.Path, fileInfo.Hash, []trace.Symbol{
+		{Name: "stale_sentinel", Kind: trace.KindFunction, File: "main.go", Line: 1, Language: "go"},
+	}, nil); err != nil {
+		t.Fatalf("failed to seed symbol store: %v", err)
+	}
+
+	extractor := trace.NewRegexExtractor()
+	if _, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, []string{".go"}, time.Time{}, true, nil, nil); err != nil {
+		t.Fatalf("runInitialScan failed: %v", err)
+	}
+
+	stale, err := symbolStore.LookupSymbol(ctx, "stale_sentinel")
+	if err != nil {
+		t.Fatalf("LookupSymbol(stale_sentinel) failed: %v", err)
+	}
+	if len(stale) != 0 {
+		t.Errorf("expected stale sentinel from version-less cache to be invalidated, found %d entries", len(stale))
+	}
+}
+
+// TestRunInitialScan_ReExtractsWhenMtimeFastPathHitsStaleVersion is the
+// end-to-end upgrade scenario: sources untouched (mtime older than
+// lastIndexTime), already tracked in symbols.gob, but the persisted store
+// predates the extractor-version metadata. The mtime fast-path must not
+// short-circuit — the file has to be re-extracted so the improved symbol
+// output becomes visible.
+func TestRunInitialScan_ReExtractsWhenMtimeFastPathHitsStaleVersion(t *testing.T) {
+	ctx := context.Background()
+	projectRoot := t.TempDir()
+
+	srcPath := filepath.Join(projectRoot, "main.go")
+	srcContent := "package main\n\nfunc real() {}\n"
+	if err := os.WriteFile(srcPath, []byte(srcContent), 0644); err != nil {
+		t.Fatalf("failed to create source file: %v", err)
+	}
+
+	// A real upgrade sees files whose mtime predates the last index run.
+	lastIndexTime := time.Now().Add(-1 * time.Hour)
+	oldMtime := lastIndexTime.Add(-1 * time.Hour)
+	if err := os.Chtimes(srcPath, oldMtime, oldMtime); err != nil {
+		t.Fatalf("failed to backdate source mtime: %v", err)
+	}
+
+	ignoreMatcher, err := indexer.NewIgnoreMatcher(projectRoot, []string{}, "")
+	if err != nil {
+		t.Fatalf("failed to create ignore matcher: %v", err)
+	}
+
+	scanner := indexer.NewScanner(projectRoot, ignoreMatcher)
+	chunker := indexer.NewChunker(512, 50)
+	vecStore := store.NewGOBStore(filepath.Join(projectRoot, "index.gob"))
+	idx := indexer.NewIndexer(projectRoot, vecStore, &noOpEmbedder{}, chunker, scanner, lastIndexTime)
+
+	fileInfo, err := scanner.ScanFile("main.go")
+	if err != nil || fileInfo == nil {
+		t.Fatalf("failed to scan source file: %v", err)
+	}
+
+	// Already embedded, so the vector-index side is a no-op too.
+	if err := vecStore.SaveDocument(ctx, store.Document{
+		Path:     "main.go",
+		Hash:     fileInfo.Hash,
+		ChunkIDs: []string{"c1"},
+	}); err != nil {
+		t.Fatalf("failed to seed document: %v", err)
+	}
+
+	symbolStore := trace.NewGOBSymbolStore(filepath.Join(projectRoot, "symbols.gob"))
+	if err := symbolStore.Load(ctx); err != nil {
+		t.Fatalf("failed to load symbol store: %v", err)
+	}
+	defer symbolStore.Close()
+
+	// Legacy seed: content hash present, extractor version absent — the
+	// shape of a symbols.gob written before this feature existed.
+	if err := symbolStore.SaveFileWithContentHash(ctx, fileInfo.Path, fileInfo.Hash, []trace.Symbol{
+		{Name: "stale_sentinel", Kind: trace.KindFunction, File: "main.go", Line: 1, Language: "go"},
+	}, nil); err != nil {
+		t.Fatalf("failed to seed symbol store: %v", err)
+	}
+
+	extractor := trace.NewRegexExtractor()
+	if _, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, []string{".go"}, lastIndexTime, true, nil, nil); err != nil {
+		t.Fatalf("runInitialScan failed: %v", err)
+	}
+
+	stale, err := symbolStore.LookupSymbol(ctx, "stale_sentinel")
+	if err != nil {
+		t.Fatalf("LookupSymbol(stale_sentinel) failed: %v", err)
+	}
+	if len(stale) != 0 {
+		t.Errorf("expected the version-less cache entry to be invalidated, found %d entries", len(stale))
+	}
+
+	real, err := symbolStore.LookupSymbol(ctx, "real")
+	if err != nil {
+		t.Fatalf("LookupSymbol(real) failed: %v", err)
+	}
+	if len(real) == 0 {
+		t.Error("expected real to be re-extracted despite the mtime fast-path, got none")
+	}
+
+	// And the cache must now carry the current signature, so a second
+	// scan skips cleanly instead of re-extracting forever.
+	if v, ok := symbolStore.GetFileExtractorVersion(fileInfo.Path); !ok || v != extractor.Version() {
+		t.Errorf("expected extractor version %q to be persisted, got %q (ok=%v)", extractor.Version(), v, ok)
 	}
 }

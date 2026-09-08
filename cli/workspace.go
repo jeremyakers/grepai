@@ -13,6 +13,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+var (
+	workspaceCreateUI bool
+	workspaceStatusUI bool
+)
+
+var (
+	workspaceStatusUISelector = shouldUseStatusUI
+	workspaceStatusUIRunner   = runWorkspaceStatusUI
+)
+
+const workspaceCreateOpenAIParallelism = 4
+
 var workspaceCmd = &cobra.Command{
 	Use:   "workspace",
 	Short: "Manage multi-project workspaces",
@@ -96,6 +108,8 @@ func init() {
 	workspaceCreateCmd.Flags().String("collection", "", "Qdrant collection name (empty = auto)")
 	workspaceCreateCmd.Flags().String("from", "", "Path to JSON/YAML file with workspace config")
 	workspaceCreateCmd.Flags().Bool("yes", false, "Use defaults for unspecified values, skip prompts")
+	workspaceCreateCmd.Flags().BoolVar(&workspaceCreateUI, "ui", false, "Run interactive Bubble Tea UI wizard")
+	workspaceStatusCmd.Flags().BoolVar(&workspaceStatusUI, "ui", false, "Show workspace status in interactive UI")
 }
 
 func runWorkspaceList(cmd *cobra.Command, args []string) error {
@@ -188,7 +202,14 @@ func runWorkspaceStatus(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
+		if workspaceStatusUI && workspaceStatusUISelector(isInteractiveTerminal(), false) {
+			return workspaceStatusUIRunner(cfg, args)
+		}
 		return showWorkspaceStatus(ws)
+	}
+
+	if workspaceStatusUI && workspaceStatusUISelector(isInteractiveTerminal(), false) {
+		return workspaceStatusUIRunner(cfg, args)
 	}
 
 	// Otherwise show status for all workspaces
@@ -236,9 +257,9 @@ func buildWorkspaceFromFlags(name, backend, provider, model, dsn, endpoint, qdra
 	if model == "" {
 		switch provider {
 		case "openai":
-			model = "text-embedding-3-small"
+			model = config.DefaultOpenAIEmbeddingModel
 		default:
-			model = "nomic-embed-text"
+			model = config.DefaultOllamaEmbeddingModel
 		}
 	}
 
@@ -272,23 +293,24 @@ func buildWorkspaceFromFlags(name, backend, provider, model, dsn, endpoint, qdra
 	switch provider {
 	case "ollama":
 		if endpoint == "" {
-			endpoint = "http://localhost:11434"
+			endpoint = config.DefaultOllamaEndpoint
 		}
 		embedderConfig.Endpoint = endpoint
-		dim := 768
+		dim := config.DefaultLocalEmbeddingDimensions
 		embedderConfig.Dimensions = &dim
 	case "lmstudio":
 		if endpoint == "" {
-			endpoint = "http://127.0.0.1:1234"
+			endpoint = config.DefaultLMStudioEndpoint
 		}
 		embedderConfig.Endpoint = endpoint
-		dim := 768
+		dim := config.DefaultLocalEmbeddingDimensions
 		embedderConfig.Dimensions = &dim
 	case "openai":
 		if endpoint == "" {
-			endpoint = "https://api.openai.com/v1"
+			endpoint = config.DefaultOpenAIEndpoint
 		}
 		embedderConfig.Endpoint = endpoint
+		embedderConfig.Parallelism = workspaceCreateOpenAIParallelism
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s (use ollama, openai, or lmstudio)", provider)
 	}
@@ -396,9 +418,16 @@ func runWorkspaceCreate(cmd *cobra.Command, args []string) error {
 			return err
 		}
 	} else {
-		ws, err = createWorkspaceInteractive(workspaceName)
-		if err != nil {
-			return err
+		if workspaceCreateUI {
+			ws, err = createWorkspaceTUI(workspaceName)
+			if err != nil {
+				return err
+			}
+		} else {
+			ws, err = createWorkspaceInteractive(workspaceName)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -509,14 +538,15 @@ func createWorkspaceInteractive(workspaceName string) (*config.Workspace, error)
 		fmt.Print("OpenAI API Key: ")
 		apiKey, _ := reader.ReadString('\n')
 		embedderConfig.APIKey = strings.TrimSpace(apiKey)
-		fmt.Print("Model [text-embedding-3-small]: ")
+		fmt.Printf("Model [%s]: ", config.DefaultOpenAIEmbeddingModel)
 		model, _ := reader.ReadString('\n')
 		model = strings.TrimSpace(model)
 		if model == "" {
-			model = "text-embedding-3-small"
+			model = config.DefaultOpenAIEmbeddingModel
 		}
 		embedderConfig.Model = model
-		embedderConfig.Endpoint = "https://api.openai.com/v1"
+		embedderConfig.Endpoint = config.DefaultOpenAIEndpoint
+		embedderConfig.Parallelism = workspaceCreateOpenAIParallelism
 	case "3":
 		embedderConfig.Provider = "lmstudio"
 		fmt.Print("LM Studio endpoint [http://127.0.0.1:1234]: ")

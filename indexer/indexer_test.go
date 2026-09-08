@@ -11,11 +11,19 @@ import (
 	"time"
 
 	"github.com/yoanbernabeu/grepai/embedder"
+	"github.com/yoanbernabeu/grepai/framework"
 	"github.com/yoanbernabeu/grepai/store"
 )
 
-// mockStore implements store.VectorStore for testing
+// mockStore implements store.VectorStore for testing.
+//
+// Real VectorStore implementations (GOBStore, PostgresStore, QdrantStore) are
+// all safe for concurrent use -- GOBStore guards its maps with a mutex, and
+// the Postgres/Qdrant clients are backed by connection pools. The indexer now
+// calls GetDocument/DeleteByFile concurrently across files, so this mock must
+// honor the same contract; it is guarded by a mutex accordingly.
 type mockStore struct {
+	mu               sync.Mutex
 	documents        map[string]store.Document
 	chunks           map[string]store.Chunk
 	listFilesStats   []store.FileStats
@@ -35,6 +43,8 @@ func newMockStore() *mockStore {
 }
 
 func (m *mockStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.saveChunksCalled = true
 	for _, chunk := range chunks {
 		m.chunks[chunk.ID] = chunk
@@ -43,6 +53,8 @@ func (m *mockStore) SaveChunks(ctx context.Context, chunks []store.Chunk) error 
 }
 
 func (m *mockStore) DeleteByFile(ctx context.Context, filePath string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.delByFileCalled = true
 	doc, ok := m.documents[filePath]
 	if !ok {
@@ -55,6 +67,8 @@ func (m *mockStore) DeleteByFile(ctx context.Context, filePath string) error {
 }
 
 func (m *mockStore) Search(ctx context.Context, queryVector []float32, limit int, opts store.SearchOptions) ([]store.SearchResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	results := make([]store.SearchResult, 0, len(m.chunks))
 	for _, chunk := range m.chunks {
 		// Filter by path prefix if provided
@@ -77,6 +91,8 @@ func (m *mockStore) Search(ctx context.Context, queryVector []float32, limit int
 }
 
 func (m *mockStore) GetDocument(ctx context.Context, filePath string) (*store.Document, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.getDocCalled = true
 	doc, ok := m.documents[filePath]
 	if !ok {
@@ -86,18 +102,24 @@ func (m *mockStore) GetDocument(ctx context.Context, filePath string) (*store.Do
 }
 
 func (m *mockStore) SaveDocument(ctx context.Context, doc store.Document) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.saveDocCalled = true
 	m.documents[doc.Path] = doc
 	return nil
 }
 
 func (m *mockStore) DeleteDocument(ctx context.Context, filePath string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.delDocCalled = true
 	delete(m.documents, filePath)
 	return nil
 }
 
 func (m *mockStore) ListDocuments(ctx context.Context) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.listDocsCalled = true
 	paths := make([]string, 0, len(m.documents))
 	for path := range m.documents {
@@ -119,6 +141,8 @@ func (m *mockStore) Close() error {
 }
 
 func (m *mockStore) GetStats(ctx context.Context) (*store.IndexStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return &store.IndexStats{
 		TotalFiles:  len(m.documents),
 		TotalChunks: len(m.chunks),
@@ -126,6 +150,8 @@ func (m *mockStore) GetStats(ctx context.Context) (*store.IndexStats, error) {
 }
 
 func (m *mockStore) ListFilesWithStats(ctx context.Context) ([]store.FileStats, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	stats := make([]store.FileStats, 0, len(m.documents))
 	for _, doc := range m.documents {
 		stats = append(stats, store.FileStats{
@@ -142,6 +168,8 @@ func (m *mockStore) ListFilesWithStats(ctx context.Context) ([]store.FileStats, 
 }
 
 func (m *mockStore) GetChunksForFile(ctx context.Context, filePath string) ([]store.Chunk, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	doc, ok := m.documents[filePath]
 	if !ok {
 		return nil, nil
@@ -156,6 +184,8 @@ func (m *mockStore) GetChunksForFile(ctx context.Context, filePath string) ([]st
 }
 
 func (m *mockStore) GetAllChunks(ctx context.Context) ([]store.Chunk, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	chunks := make([]store.Chunk, 0, len(m.chunks))
 	for _, chunk := range m.chunks {
 		chunks = append(chunks, chunk)
@@ -166,6 +196,7 @@ func (m *mockStore) GetAllChunks(ctx context.Context) ([]store.Chunk, error) {
 // mockEmbedder implements embedder.Embedder for testing
 type mockEmbedder struct {
 	embedCalled bool
+	lastBatch   []string
 }
 
 func newMockEmbedder() *mockEmbedder {
@@ -179,6 +210,7 @@ func (m *mockEmbedder) Embed(ctx context.Context, text string) ([]float32, error
 
 func (m *mockEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]float32, error) {
 	m.embedCalled = true
+	m.lastBatch = append([]string(nil), texts...)
 	vectors := make([][]float32, len(texts))
 	for i := range texts {
 		vectors[i] = []float32{0.1, 0.2, 0.3}
@@ -246,11 +278,6 @@ func TestIndexAllWithProgress_UnchangedFilesSkipped(t *testing.T) {
 	// Assert: No chunks should be created
 	if stats.ChunksCreated != 0 {
 		t.Errorf("expected 0 chunks created, got %d", stats.ChunksCreated)
-	}
-
-	// Assert: No documents should be retrieved (skipped before GetDocument call)
-	if mockStore.getDocCalled {
-		t.Error("GetDocument should not be called for files with matching ModTime")
 	}
 
 	// Assert: No documents should be saved
@@ -1116,8 +1143,8 @@ func TestEmbedWithReChunking_Success(t *testing.T) {
 	}
 
 	chunks := []ChunkInfo{
-		{ID: "chunk1", FilePath: "test.go", Content: "small content", StartLine: 1, EndLine: 5},
-		{ID: "chunk2", FilePath: "test.go", Content: "more content", StartLine: 6, EndLine: 10},
+		{ID: "chunk1", FilePath: "test.go", Content: "small content", EmbedContent: "small content", StartLine: 1, EndLine: 5},
+		{ID: "chunk2", FilePath: "test.go", Content: "more content", EmbedContent: "more content", StartLine: 6, EndLine: 10},
 	}
 
 	vectors, finalChunks, err := indexer.embedWithReChunking(context.Background(), chunks)
@@ -1152,7 +1179,7 @@ func TestEmbedWithReChunking_ReChunksOnError(t *testing.T) {
 	// Create one large chunk that will exceed the limit
 	largeContent := strings.Repeat("x", 1000)
 	chunks := []ChunkInfo{
-		{ID: "test.go_0", FilePath: "test.go", Content: largeContent, StartLine: 1, EndLine: 50},
+		{ID: "test.go_0", FilePath: "test.go", Content: largeContent, EmbedContent: largeContent, StartLine: 1, EndLine: 50},
 	}
 
 	vectors, finalChunks, err := indexer.embedWithReChunking(context.Background(), chunks)
@@ -1168,5 +1195,67 @@ func TestEmbedWithReChunking_ReChunksOnError(t *testing.T) {
 	// Should have same number of vectors as chunks
 	if len(vectors) != len(finalChunks) {
 		t.Errorf("vectors count %d != chunks count %d", len(vectors), len(finalChunks))
+	}
+}
+
+type testTransformProcessor struct{}
+
+func (p *testTransformProcessor) Name() string { return "vue" }
+func (p *testTransformProcessor) Supports(filePath string) bool {
+	return strings.HasSuffix(filePath, ".vue")
+}
+func (p *testTransformProcessor) Capabilities() framework.ProcessorCapabilities {
+	return framework.ProcessorCapabilities{Embedding: true, Trace: true}
+}
+func (p *testTransformProcessor) TransformForEmbedding(ctx context.Context, filePath, source string) (framework.TransformResult, error) {
+	return framework.TransformResult{
+		Processor:             "vue",
+		FilePath:              filePath,
+		VirtualPath:           filePath,
+		Text:                  "const transformed = true\nconsole.log(transformed)",
+		GeneratedToSourceLine: []int{2, 3},
+		Transformed:           true,
+	}, nil
+}
+func (p *testTransformProcessor) TransformForTrace(ctx context.Context, filePath, source string) (framework.TransformResult, error) {
+	return p.TransformForEmbedding(ctx, filePath, source)
+}
+
+func TestIndexFile_UsesTransformedContentAndStoresSourceSnippet(t *testing.T) {
+	mockEmb := newMockEmbedder()
+	mockStore := newMockStore()
+	chunker := NewChunker(512, 50)
+	reg := framework.NewProcessorRegistry(
+		framework.RegistryConfig{Enabled: true, Mode: framework.ModeAuto, EnableVue: true},
+		&testTransformProcessor{},
+	)
+
+	idx := NewIndexer("/tmp", mockStore, mockEmb, chunker, nil, time.Time{}, reg)
+	file := FileInfo{
+		Path:    "Component.vue",
+		Hash:    "h1",
+		ModTime: time.Now().Unix(),
+		Content: "<template><div/></template>\nconst fromSource = 1\nexport default {}",
+	}
+
+	_, err := idx.IndexFile(context.Background(), file)
+	if err != nil {
+		t.Fatalf("IndexFile failed: %v", err)
+	}
+	chunks, err := mockStore.GetChunksForFile(context.Background(), "Component.vue")
+	if err != nil {
+		t.Fatalf("GetChunksForFile failed: %v", err)
+	}
+	if len(chunks) == 0 {
+		t.Fatal("expected at least one chunk")
+	}
+	if len(mockEmb.lastBatch) == 0 || !strings.Contains(mockEmb.lastBatch[0], "transformed") {
+		t.Fatalf("expected transformed embedding content, got batch: %#v", mockEmb.lastBatch)
+	}
+	if !strings.Contains(chunks[0].Content, "fromSource") {
+		t.Fatalf("expected stored source snippet, got: %q", chunks[0].Content)
+	}
+	if chunks[0].StartLine != 2 {
+		t.Fatalf("expected remapped start line 2, got %d", chunks[0].StartLine)
 	}
 }

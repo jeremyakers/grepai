@@ -1,27 +1,89 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
+	"log"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/alpkeskin/gotoon"
 	"github.com/spf13/cobra"
 	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/embedder"
 	"github.com/yoanbernabeu/grepai/rpg"
+	gstats "github.com/yoanbernabeu/grepai/stats"
 	"github.com/yoanbernabeu/grepai/trace"
 )
+
+func pickBestTargetSymbol(candidates []trace.Symbol, refs []trace.Reference) *trace.Symbol {
+	if len(candidates) == 0 {
+		return nil
+	}
+	if len(candidates) == 1 {
+		return &candidates[0]
+	}
+
+	bestIdx := 0
+	bestScore := -1
+	for i, sym := range candidates {
+		score := 0
+		for _, ref := range refs {
+			// Prefer symbols referenced from their own file first (component-local/private usage).
+			if ref.File == sym.File || ref.CallerFile == sym.File {
+				score++
+			}
+		}
+		if score > bestScore {
+			bestScore = score
+			bestIdx = i
+		}
+	}
+
+	// Deterministic fallback when all scores are equal.
+	if bestScore <= 0 {
+		sorted := append([]trace.Symbol(nil), candidates...)
+		sort.SliceStable(sorted, func(i, j int) bool {
+			if sorted[i].File == sorted[j].File {
+				return sorted[i].Line < sorted[j].Line
+			}
+			return sorted[i].File < sorted[j].File
+		})
+		return &sorted[0]
+	}
+
+	return &candidates[bestIdx]
+}
+
+func pickBestSymbolForFile(candidates []trace.Symbol, preferredFile string) *trace.Symbol {
+	if len(candidates) == 0 {
+		return nil
+	}
+	if preferredFile != "" {
+		for i := range candidates {
+			if candidates[i].File == preferredFile {
+				return &candidates[i]
+			}
+		}
+	}
+	return &candidates[0]
+}
 
 var (
 	traceMode      string
 	traceDepth     int
 	traceJSON      bool
 	traceTOON      bool
+	traceCompact   bool
+	traceUI        bool
 	traceWorkspace string
 	traceProject   string
 )
+
+var runTraceActionCardUIRunner = runTraceActionCardUI
 
 var traceCmd = &cobra.Command{
 	Use:   "trace <subcommand> <symbol>",
@@ -80,7 +142,11 @@ func init() {
 		cmd.Flags().StringVarP(&traceMode, "mode", "m", "fast", "Extraction mode: fast (regex) or precise (tree-sitter)")
 		cmd.Flags().BoolVar(&traceJSON, "json", false, "Output results in JSON format")
 		cmd.Flags().BoolVarP(&traceTOON, "toon", "t", false, "Output results in TOON format (token-efficient for AI agents)")
+		cmd.Flags().BoolVarP(&traceCompact, "compact", "c", false, "Output minimal format without call-site context (requires --json or --toon)")
+		cmd.Flags().BoolVar(&traceUI, "ui", false, "Show interactive UI output")
 		cmd.MarkFlagsMutuallyExclusive("json", "toon")
+		cmd.MarkFlagsMutuallyExclusive("json", "ui")
+		cmd.MarkFlagsMutuallyExclusive("toon", "ui")
 		cmd.Flags().StringVar(&traceWorkspace, "workspace", "", "Workspace name for cross-project trace")
 		cmd.Flags().StringVar(&traceProject, "project", "", "Project name within workspace (requires --workspace)")
 	}
@@ -93,9 +159,20 @@ func init() {
 	rootCmd.AddCommand(traceCmd)
 }
 
+func validateTraceOutputFlags() error {
+	if traceCompact && !traceJSON && !traceTOON {
+		return fmt.Errorf("--compact flag requires --json or --toon flag")
+	}
+	return nil
+}
+
 func runTraceCallers(cmd *cobra.Command, args []string) error {
 	symbolName := args[0]
 	ctx := context.Background()
+
+	if err := validateTraceOutputFlags(); err != nil {
+		return err
+	}
 
 	if traceProject != "" && traceWorkspace == "" {
 		return fmt.Errorf("--project requires --workspace")
@@ -103,24 +180,37 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 
 	// Workspace mode: aggregate across projects
 	if traceWorkspace != "" {
-		stores, err := loadWorkspaceSymbolStores(ctx, traceWorkspace, traceProject)
+		stores, err := trace.LoadWorkspaceSymbolStores(ctx, traceWorkspace, traceProject)
 		if err != nil {
 			return err
 		}
-		defer closeSymbolStores(stores)
+		defer trace.CloseSymbolStores(stores)
 
 		result := trace.TraceResult{Query: symbolName, Mode: traceMode}
 		for _, ss := range stores {
-			symbols, _ := ss.LookupSymbol(ctx, symbolName)
-			if len(symbols) > 0 && result.Symbol == nil {
-				result.Symbol = &symbols[0]
+			refs, err := ss.LookupCallers(ctx, symbolName)
+			if err != nil {
+				log.Printf("Warning: failed to lookup callers of %q: %v", symbolName, err)
 			}
-			refs, _ := ss.LookupCallers(ctx, symbolName)
+			symbols, err := ss.LookupSymbol(ctx, symbolName)
+			if err != nil {
+				log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
+			}
+			if len(symbols) > 0 && result.Symbol == nil {
+				result.Symbol = pickBestTargetSymbol(symbols, refs)
+			}
 			for _, ref := range refs {
-				callerSyms, _ := ss.LookupSymbol(ctx, ref.CallerName)
+				callerSyms, err := ss.LookupSymbol(ctx, ref.CallerName)
+				if err != nil {
+					log.Printf("Warning: failed to lookup caller symbol %q: %v", ref.CallerName, err)
+				}
 				var callerSym trace.Symbol
 				if len(callerSyms) > 0 {
-					callerSym = callerSyms[0]
+					if picked := pickBestSymbolForFile(callerSyms, ref.CallerFile); picked != nil {
+						callerSym = *picked
+					} else {
+						callerSym = callerSyms[0]
+					}
 				} else {
 					callerSym = trace.Symbol{Name: ref.CallerName, File: ref.CallerFile, Line: ref.CallerLine}
 				}
@@ -136,23 +226,10 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 		}
 
 		if result.Symbol == nil {
-			if traceJSON {
-				return outputJSON(result)
-			}
-			if traceTOON {
-				return outputTOON(result)
-			}
-			fmt.Printf("No symbol found: %s\n", symbolName)
-			return nil
+			return outputTraceResult(result, traceViewCallers)
 		}
 
-		if traceJSON {
-			return outputJSON(result)
-		}
-		if traceTOON {
-			return outputTOON(result)
-		}
-		return displayCallersResult(result)
+		return outputTraceResult(result, traceViewCallers)
 	}
 
 	projectRoot, err := config.FindProjectRoot()
@@ -163,6 +240,14 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 	// Initialize symbol store
 	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
 	if err := symbolStore.Load(ctx); err != nil {
+		if traceUI {
+			return showTraceActionCardUIError(
+				fmt.Errorf("failed to load symbol index: %w", err),
+				"Trace unavailable",
+				fmt.Sprintf("Failed to load symbol index: %v", err),
+				"Run `grepai watch` first to build the index",
+			)
+		}
 		return fmt.Errorf("failed to load symbol index: %w", err)
 	}
 	defer symbolStore.Close()
@@ -170,6 +255,14 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 	// Check if index exists
 	stats, err := symbolStore.GetStats(ctx)
 	if err != nil || stats.TotalSymbols == 0 {
+		if traceUI {
+			return showTraceActionCardUIError(
+				fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index"),
+				"Symbol index is empty",
+				"Trace requires symbols extracted by the watcher.",
+				"Run `grepai watch`",
+			)
+		}
 		return fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index")
 	}
 
@@ -181,14 +274,7 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 
 	if len(symbols) == 0 {
 		emptyResult := trace.TraceResult{Query: symbolName, Mode: traceMode}
-		if traceJSON {
-			return outputJSON(emptyResult)
-		}
-		if traceTOON {
-			return outputTOON(emptyResult)
-		}
-		fmt.Printf("No symbol found: %s\n", symbolName)
-		return nil
+		return outputTraceResult(emptyResult, traceViewCallers)
 	}
 
 	// Find callers
@@ -197,18 +283,30 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to lookup callers: %w", err)
 	}
 
+	target := pickBestTargetSymbol(symbols, refs)
+	if target == nil {
+		target = &symbols[0]
+	}
+
 	result := trace.TraceResult{
 		Query:  symbolName,
 		Mode:   traceMode,
-		Symbol: &symbols[0],
+		Symbol: target,
 	}
 
 	// Convert refs to CallerInfo
 	for _, ref := range refs {
-		callerSyms, _ := symbolStore.LookupSymbol(ctx, ref.CallerName)
+		callerSyms, err := symbolStore.LookupSymbol(ctx, ref.CallerName)
+		if err != nil {
+			log.Printf("Warning: failed to lookup caller symbol %q: %v", ref.CallerName, err)
+		}
 		var callerSym trace.Symbol
 		if len(callerSyms) > 0 {
-			callerSym = callerSyms[0]
+			if picked := pickBestSymbolForFile(callerSyms, ref.CallerFile); picked != nil {
+				callerSym = *picked
+			} else {
+				callerSym = callerSyms[0]
+			}
 		} else {
 			callerSym = trace.Symbol{Name: ref.CallerName, File: ref.CallerFile, Line: ref.CallerLine}
 		}
@@ -223,24 +321,24 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 	}
 
 	// Enrich with RPG feature paths
-	cfg, _ := config.Load(projectRoot)
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		log.Printf("Warning: failed to load config for RPG enrichment: %v", err)
+	}
 	if cfg != nil {
 		enrichTraceWithRPG(projectRoot, cfg, &result)
 	}
 
-	if traceJSON {
-		return outputJSON(result)
-	}
-	if traceTOON {
-		return outputTOON(result)
-	}
-
-	return displayCallersResult(result)
+	return outputAndRecord(result, traceViewCallers, projectRoot, gstats.TraceCallers, len(result.Callers))
 }
 
 func runTraceCallees(cmd *cobra.Command, args []string) error {
 	symbolName := args[0]
 	ctx := context.Background()
+
+	if err := validateTraceOutputFlags(); err != nil {
+		return err
+	}
 
 	if traceProject != "" && traceWorkspace == "" {
 		return fmt.Errorf("--project requires --workspace")
@@ -248,22 +346,31 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 
 	// Workspace mode: aggregate across projects
 	if traceWorkspace != "" {
-		stores, err := loadWorkspaceSymbolStores(ctx, traceWorkspace, traceProject)
+		stores, err := trace.LoadWorkspaceSymbolStores(ctx, traceWorkspace, traceProject)
 		if err != nil {
 			return err
 		}
-		defer closeSymbolStores(stores)
+		defer trace.CloseSymbolStores(stores)
 
 		result := trace.TraceResult{Query: symbolName, Mode: traceMode}
 		for _, ss := range stores {
-			symbols, _ := ss.LookupSymbol(ctx, symbolName)
+			symbols, err := ss.LookupSymbol(ctx, symbolName)
+			if err != nil {
+				log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
+			}
 			if len(symbols) > 0 && result.Symbol == nil {
 				result.Symbol = &symbols[0]
 			}
 			if len(symbols) > 0 {
-				refs, _ := ss.LookupCallees(ctx, symbolName, symbols[0].File)
+				refs, err := ss.LookupCallees(ctx, symbolName, symbols[0].File)
+				if err != nil {
+					log.Printf("Warning: failed to lookup callees of %q: %v", symbolName, err)
+				}
 				for _, ref := range refs {
-					calleeSyms, _ := ss.LookupSymbol(ctx, ref.SymbolName)
+					calleeSyms, err := ss.LookupSymbol(ctx, ref.SymbolName)
+					if err != nil {
+						log.Printf("Warning: failed to lookup callee symbol %q: %v", ref.SymbolName, err)
+					}
 					var calleeSym trace.Symbol
 					if len(calleeSyms) > 0 {
 						calleeSym = calleeSyms[0]
@@ -283,23 +390,10 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 		}
 
 		if result.Symbol == nil {
-			if traceJSON {
-				return outputJSON(result)
-			}
-			if traceTOON {
-				return outputTOON(result)
-			}
-			fmt.Printf("No symbol found: %s\n", symbolName)
-			return nil
+			return outputTraceResult(result, traceViewCallees)
 		}
 
-		if traceJSON {
-			return outputJSON(result)
-		}
-		if traceTOON {
-			return outputTOON(result)
-		}
-		return displayCalleesResult(result)
+		return outputTraceResult(result, traceViewCallees)
 	}
 
 	projectRoot, err := config.FindProjectRoot()
@@ -309,6 +403,14 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 
 	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
 	if err := symbolStore.Load(ctx); err != nil {
+		if traceUI {
+			return showTraceActionCardUIError(
+				fmt.Errorf("failed to load symbol index: %w", err),
+				"Trace unavailable",
+				fmt.Sprintf("Failed to load symbol index: %v", err),
+				"Run `grepai watch` first to build the index",
+			)
+		}
 		return fmt.Errorf("failed to load symbol index: %w", err)
 	}
 	defer symbolStore.Close()
@@ -316,6 +418,14 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 	// Check if index exists
 	stats, err := symbolStore.GetStats(ctx)
 	if err != nil || stats.TotalSymbols == 0 {
+		if traceUI {
+			return showTraceActionCardUIError(
+				fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index"),
+				"Symbol index is empty",
+				"Trace requires symbols extracted by the watcher.",
+				"Run `grepai watch`",
+			)
+		}
 		return fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index")
 	}
 
@@ -327,14 +437,7 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 
 	if len(symbols) == 0 {
 		emptyResult := trace.TraceResult{Query: symbolName, Mode: traceMode}
-		if traceJSON {
-			return outputJSON(emptyResult)
-		}
-		if traceTOON {
-			return outputTOON(emptyResult)
-		}
-		fmt.Printf("No symbol found: %s\n", symbolName)
-		return nil
+		return outputTraceResult(emptyResult, traceViewCallees)
 	}
 
 	// Find callees
@@ -350,7 +453,10 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 	}
 
 	for _, ref := range refs {
-		calleeSyms, _ := symbolStore.LookupSymbol(ctx, ref.SymbolName)
+		calleeSyms, err := symbolStore.LookupSymbol(ctx, ref.SymbolName)
+		if err != nil {
+			log.Printf("Warning: failed to lookup callee symbol %q: %v", ref.SymbolName, err)
+		}
 		var calleeSym trace.Symbol
 		if len(calleeSyms) > 0 {
 			calleeSym = calleeSyms[0]
@@ -368,24 +474,24 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 	}
 
 	// Enrich with RPG feature paths
-	cfg, _ := config.Load(projectRoot)
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		log.Printf("Warning: failed to load config for RPG enrichment: %v", err)
+	}
 	if cfg != nil {
 		enrichTraceWithRPG(projectRoot, cfg, &result)
 	}
 
-	if traceJSON {
-		return outputJSON(result)
-	}
-	if traceTOON {
-		return outputTOON(result)
-	}
-
-	return displayCalleesResult(result)
+	return outputAndRecord(result, traceViewCallees, projectRoot, gstats.TraceCallees, len(result.Callees))
 }
 
 func runTraceGraph(cmd *cobra.Command, args []string) error {
 	symbolName := args[0]
 	ctx := context.Background()
+
+	if err := validateTraceOutputFlags(); err != nil {
+		return err
+	}
 
 	if traceProject != "" && traceWorkspace == "" {
 		return fmt.Errorf("--project requires --workspace")
@@ -393,11 +499,11 @@ func runTraceGraph(cmd *cobra.Command, args []string) error {
 
 	// Workspace mode: aggregate call graphs across projects
 	if traceWorkspace != "" {
-		stores, err := loadWorkspaceSymbolStores(ctx, traceWorkspace, traceProject)
+		stores, err := trace.LoadWorkspaceSymbolStores(ctx, traceWorkspace, traceProject)
 		if err != nil {
 			return err
 		}
-		defer closeSymbolStores(stores)
+		defer trace.CloseSymbolStores(stores)
 
 		// Merge graphs from all project stores
 		merged := &trace.CallGraph{
@@ -433,13 +539,7 @@ func runTraceGraph(cmd *cobra.Command, args []string) error {
 			Graph: merged,
 		}
 
-		if traceJSON {
-			return outputJSON(result)
-		}
-		if traceTOON {
-			return outputTOON(result)
-		}
-		return displayGraphResult(result)
+		return outputTraceResult(result, traceViewGraph)
 	}
 
 	projectRoot, err := config.FindProjectRoot()
@@ -449,6 +549,14 @@ func runTraceGraph(cmd *cobra.Command, args []string) error {
 
 	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
 	if err := symbolStore.Load(ctx); err != nil {
+		if traceUI {
+			return showTraceActionCardUIError(
+				fmt.Errorf("failed to load symbol index: %w", err),
+				"Trace unavailable",
+				fmt.Sprintf("Failed to load symbol index: %v", err),
+				"Run `grepai watch` first to build the index",
+			)
+		}
 		return fmt.Errorf("failed to load symbol index: %w", err)
 	}
 	defer symbolStore.Close()
@@ -456,6 +564,14 @@ func runTraceGraph(cmd *cobra.Command, args []string) error {
 	// Check if index exists
 	stats, err := symbolStore.GetStats(ctx)
 	if err != nil || stats.TotalSymbols == 0 {
+		if traceUI {
+			return showTraceActionCardUIError(
+				fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index"),
+				"Symbol index is empty",
+				"Call graph data is not available yet.",
+				"Run `grepai watch`",
+			)
+		}
 		return fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index")
 	}
 
@@ -471,19 +587,52 @@ func runTraceGraph(cmd *cobra.Command, args []string) error {
 	}
 
 	// Enrich with RPG feature paths
-	cfg, _ := config.Load(projectRoot)
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		log.Printf("Warning: failed to load config for RPG enrichment: %v", err)
+	}
 	if cfg != nil {
 		enrichTraceWithRPG(projectRoot, cfg, &result)
 	}
 
-	if traceJSON {
-		return outputJSON(result)
-	}
-	if traceTOON {
-		return outputTOON(result)
+	nodeCount := 0
+	if result.Graph != nil {
+		nodeCount = len(result.Graph.Nodes)
 	}
 
-	return displayGraphResult(result)
+	return outputAndRecord(result, traceViewGraph, projectRoot, gstats.TraceGraph, nodeCount)
+}
+
+func outputAndRecord(result trace.TraceResult, view traceViewKind, projectRoot, commandType string, resultCount int) error {
+	if traceJSON {
+		outputStr := captureJSON(result)
+		if traceCompact {
+			outputStr = captureTraceCompactJSON(result)
+		}
+		fmt.Print(outputStr)
+		recordTraceStats(projectRoot, commandType, resultCount, outputStr)
+		return nil
+	}
+	if traceTOON {
+		var outputStr string
+		var err error
+		if traceCompact {
+			outputStr, err = captureTraceCompactTOON(result)
+		} else {
+			outputStr, err = captureTOON(result)
+		}
+		if err != nil {
+			return err
+		}
+		fmt.Print(outputStr)
+		recordTraceStats(projectRoot, commandType, resultCount, outputStr)
+		return nil
+	}
+	if err := outputTraceResult(result, view); err != nil {
+		return err
+	}
+	recordTraceStats(projectRoot, commandType, resultCount, "")
+	return nil
 }
 
 // enrichTraceWithRPG enriches all symbols in a TraceResult with RPG feature paths.
@@ -542,19 +691,183 @@ func enrichTraceWithRPG(projectRoot string, cfg *config.Config, result *trace.Tr
 	}
 }
 
-func outputJSON(result trace.TraceResult) error {
-	enc := json.NewEncoder(os.Stdout)
+type traceViewKind int
+
+const (
+	traceViewCallers traceViewKind = iota
+	traceViewCallees
+	traceViewGraph
+)
+
+func outputTraceResult(result trace.TraceResult, view traceViewKind) error {
+	if traceJSON {
+		if traceCompact {
+			fmt.Print(captureTraceCompactJSON(result))
+			return nil
+		}
+		return outputJSON(result)
+	}
+	if traceTOON {
+		if traceCompact {
+			output, err := captureTraceCompactTOON(result)
+			if err != nil {
+				return err
+			}
+			fmt.Print(output)
+			return nil
+		}
+		return outputTOON(result)
+	}
+	if traceUI {
+		return runTraceResultUI(result, view)
+	}
+
+	if result.Symbol == nil && view != traceViewGraph {
+		fmt.Printf("No symbol found: %s\n", result.Query)
+		return nil
+	}
+
+	switch view {
+	case traceViewCallers:
+		return displayCallersResult(result)
+	case traceViewCallees:
+		return displayCalleesResult(result)
+	case traceViewGraph:
+		return displayGraphResult(result)
+	default:
+		return nil
+	}
+}
+
+func showTraceActionCardUIError(displayErr error, title, why, action string) error {
+	if uiErr := runTraceActionCardUIRunner(title, why, action); uiErr != nil {
+		return fmt.Errorf("%w (failed to render trace UI card: %v)", displayErr, uiErr)
+	}
+	return displayErr
+}
+
+type traceCallSiteCompact struct {
+	File string `json:"file"`
+	Line int    `json:"line"`
+}
+
+type traceCallerInfoCompact struct {
+	Symbol   trace.Symbol         `json:"symbol"`
+	CallSite traceCallSiteCompact `json:"call_site"`
+}
+
+type traceCalleeInfoCompact struct {
+	Symbol   trace.Symbol         `json:"symbol"`
+	CallSite traceCallSiteCompact `json:"call_site"`
+}
+
+type traceResultCompact struct {
+	Query   string                   `json:"query"`
+	Mode    string                   `json:"mode"`
+	Symbol  *trace.Symbol            `json:"symbol,omitempty"`
+	Callers []traceCallerInfoCompact `json:"callers,omitempty"`
+	Callees []traceCalleeInfoCompact `json:"callees,omitempty"`
+	Graph   *trace.CallGraph         `json:"graph,omitempty"`
+}
+
+func compactTraceResult(result trace.TraceResult) traceResultCompact {
+	compact := traceResultCompact{
+		Query:  result.Query,
+		Mode:   result.Mode,
+		Symbol: result.Symbol,
+		Graph:  result.Graph,
+	}
+	if len(result.Callers) > 0 {
+		compact.Callers = make([]traceCallerInfoCompact, 0, len(result.Callers))
+		for _, caller := range result.Callers {
+			compact.Callers = append(compact.Callers, traceCallerInfoCompact{
+				Symbol: caller.Symbol,
+				CallSite: traceCallSiteCompact{
+					File: caller.CallSite.File,
+					Line: caller.CallSite.Line,
+				},
+			})
+		}
+	}
+	if len(result.Callees) > 0 {
+		compact.Callees = make([]traceCalleeInfoCompact, 0, len(result.Callees))
+		for _, callee := range result.Callees {
+			compact.Callees = append(compact.Callees, traceCalleeInfoCompact{
+				Symbol: callee.Symbol,
+				CallSite: traceCallSiteCompact{
+					File: callee.CallSite.File,
+					Line: callee.CallSite.Line,
+				},
+			})
+		}
+	}
+	return compact
+}
+
+func captureTraceCompactJSON(result trace.TraceResult) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
 	enc.SetIndent("", "  ")
-	return enc.Encode(result)
+	_ = enc.Encode(compactTraceResult(result))
+	return buf.String()
+}
+
+func captureTraceCompactTOON(result trace.TraceResult) (string, error) {
+	output, err := gotoon.Encode(compactTraceResult(result))
+	if err != nil {
+		return "", fmt.Errorf("failed to encode TOON: %w", err)
+	}
+	return output + "\n", nil
+}
+
+// captureJSON serializes a TraceResult to a JSON string without writing to stdout.
+func captureJSON(result trace.TraceResult) string {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(result)
+	return buf.String()
+}
+
+func outputJSON(result trace.TraceResult) error {
+	fmt.Print(captureJSON(result))
+	return nil
 }
 
 func outputTOON(result trace.TraceResult) error {
+	s, err := captureTOON(result)
+	if err != nil {
+		return err
+	}
+	fmt.Print(s)
+	return nil
+}
+
+// captureTOON serializes a TraceResult to a TOON string without writing to stdout.
+func captureTOON(result trace.TraceResult) (string, error) {
 	output, err := gotoon.Encode(result)
 	if err != nil {
-		return fmt.Errorf("failed to encode TOON: %w", err)
+		return "", fmt.Errorf("failed to encode TOON: %w", err)
 	}
-	fmt.Println(output)
-	return nil
+	return output + "\n", nil
+}
+
+// recordTraceStats fires a goroutine to record a trace stats entry without blocking.
+func recordTraceStats(projectRoot, commandType string, resultCount int, outputStr string) {
+	rec := gstats.NewRecorder(projectRoot)
+	entry := gstats.Entry{
+		Timestamp:    time.Now().UTC().Format(time.RFC3339),
+		CommandType:  commandType,
+		OutputMode:   outputModeFromFlags(traceJSON, traceTOON, false),
+		ResultCount:  resultCount,
+		OutputTokens: embedder.EstimateTokens(outputStr),
+		GrepTokens:   gstats.GrepEquivalentTokens(resultCount),
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		_ = rec.Record(ctx, entry)
+	}()
 }
 
 func displayCallersResult(result trace.TraceResult) error {
@@ -643,60 +956,4 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
-}
-
-// loadWorkspaceSymbolStores loads GOBSymbolStores for workspace projects.
-// If projectName is non-empty, only that project's store is loaded.
-func loadWorkspaceSymbolStores(ctx context.Context, workspaceName, projectName string) ([]trace.SymbolStore, error) {
-	wsCfg, err := config.LoadWorkspaceConfig()
-	if err != nil {
-		return nil, fmt.Errorf("failed to load workspace config: %w", err)
-	}
-	if wsCfg == nil {
-		return nil, fmt.Errorf("no workspaces configured; create one with: grepai workspace create <name>")
-	}
-
-	ws, err := wsCfg.GetWorkspace(workspaceName)
-	if err != nil {
-		return nil, err
-	}
-
-	var projects []config.ProjectEntry
-	if projectName != "" {
-		found := false
-		for _, p := range ws.Projects {
-			if p.Name == projectName {
-				projects = []config.ProjectEntry{p}
-				found = true
-				break
-			}
-		}
-		if !found {
-			return nil, fmt.Errorf("project %q not found in workspace %q", projectName, workspaceName)
-		}
-	} else {
-		projects = ws.Projects
-	}
-
-	stores := make([]trace.SymbolStore, 0, len(projects))
-	for _, p := range projects {
-		ss := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(p.Path))
-		if err := ss.Load(ctx); err != nil {
-			ss.Close()
-			// Close already-loaded stores on error
-			for _, s := range stores {
-				s.Close()
-			}
-			return nil, fmt.Errorf("failed to load symbol index for project %s: %w", p.Name, err)
-		}
-		stores = append(stores, ss)
-	}
-	return stores, nil
-}
-
-// closeSymbolStores closes all symbol stores in the slice.
-func closeSymbolStores(stores []trace.SymbolStore) {
-	for _, s := range stores {
-		s.Close()
-	}
 }

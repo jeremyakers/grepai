@@ -3,6 +3,9 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
 	"testing"
 )
 
@@ -42,6 +45,19 @@ func TestDefaultConfig(t *testing.T) {
 		t.Errorf("expected chunk overlap 50, got %d", cfg.Chunking.Overlap)
 	}
 
+	if !cfg.Framework.Enabled {
+		t.Error("expected framework_processing.enabled=true by default")
+	}
+	if cfg.Framework.Mode != "auto" {
+		t.Errorf("expected framework_processing.mode=auto, got %s", cfg.Framework.Mode)
+	}
+	if !cfg.Framework.Frameworks.Vue.Enabled {
+		t.Error("expected framework_processing.frameworks.vue.enabled=true by default")
+	}
+	if cfg.Framework.Frameworks.Svelte.Enabled || cfg.Framework.Frameworks.Astro.Enabled || cfg.Framework.Frameworks.Solid.Enabled {
+		t.Error("expected non-vue framework scaffolds disabled by default")
+	}
+
 	if cfg.Watch.DebounceMs != 500 {
 		t.Errorf("expected debounce 500ms, got %d", cfg.Watch.DebounceMs)
 	}
@@ -56,6 +72,150 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.Watch.RPGMaxDirtyFilesPerBatch != DefaultWatchRPGMaxDirtyFilesPerBatch {
 		t.Errorf("expected watch.rpg_max_dirty_files_per_batch=%d, got %d", DefaultWatchRPGMaxDirtyFilesPerBatch, cfg.Watch.RPGMaxDirtyFilesPerBatch)
+	}
+	for _, ext := range []string{".cxx", ".hxx"} {
+		if !slices.Contains(cfg.Trace.EnabledLanguages, ext) {
+			t.Errorf("expected trace.enabled_languages to contain %s", ext)
+		}
+	}
+}
+
+func TestDefaultEmbedderForProvider(t *testing.T) {
+	ollama := DefaultEmbedderForProvider("ollama")
+	if ollama.Endpoint != DefaultOllamaEndpoint || ollama.Model != DefaultOllamaEmbeddingModel {
+		t.Fatalf("unexpected ollama defaults: %+v", ollama)
+	}
+	if ollama.Dimensions == nil || *ollama.Dimensions != DefaultLocalEmbeddingDimensions {
+		t.Fatalf("unexpected ollama dimensions: %v", ollama.Dimensions)
+	}
+
+	lmstudio := DefaultEmbedderForProvider("lmstudio")
+	if lmstudio.Endpoint != DefaultLMStudioEndpoint || lmstudio.Model != DefaultLMStudioEmbeddingModel {
+		t.Fatalf("unexpected lmstudio defaults: %+v", lmstudio)
+	}
+	if lmstudio.Dimensions == nil || *lmstudio.Dimensions != DefaultLocalEmbeddingDimensions {
+		t.Fatalf("unexpected lmstudio dimensions: %v", lmstudio.Dimensions)
+	}
+
+	openai := DefaultEmbedderForProvider("openai")
+	if openai.Endpoint != DefaultOpenAIEndpoint || openai.Model != DefaultOpenAIEmbeddingModel {
+		t.Fatalf("unexpected openai defaults: %+v", openai)
+	}
+	if openai.Dimensions != nil {
+		t.Fatalf("openai dimensions should be nil, got %v", openai.Dimensions)
+	}
+	if openai.Parallelism != DefaultOpenAIParallelism {
+		t.Fatalf("openai parallelism = %d, want %d", openai.Parallelism, DefaultOpenAIParallelism)
+	}
+}
+
+func TestEmbedderConfigCacheNamespace(t *testing.T) {
+	dim := 2048
+	cfg := EmbedderConfig{
+		Provider:   " openai ",
+		Model:      " text-embedding-3-small ",
+		Endpoint:   " https://api.openai.com/v1 ",
+		Dimensions: &dim,
+	}
+
+	got := cfg.CacheNamespace()
+	want := "embedding-cache-v2:provider=openai:model=text-embedding-3-small:dimensions=2048:endpoint=https://api.openai.com/v1"
+	if got != want {
+		t.Fatalf("CacheNamespace() = %q, want %q", got, want)
+	}
+}
+
+func TestEmbedderConfigCacheNamespaceUsesResolvedDimensions(t *testing.T) {
+	cfg := EmbedderConfig{
+		Provider: "openai",
+		Model:    OpenAIEmbeddingModelLarge,
+	}
+
+	if got, want := cfg.CacheNamespace(), "embedding-cache-v2:provider=openai:model=text-embedding-3-large:dimensions=3072:endpoint="; got != want {
+		t.Fatalf("CacheNamespace() = %q, want %q", got, want)
+	}
+}
+
+func TestEmbedderConfigCacheNamespaceChangesForModel(t *testing.T) {
+	small := EmbedderConfig{Provider: "openai", Model: DefaultOpenAIEmbeddingModel}
+	large := EmbedderConfig{Provider: "openai", Model: OpenAIEmbeddingModelLarge}
+
+	if small.CacheNamespace() == large.CacheNamespace() {
+		t.Fatalf("cache namespace must differ across models: %q", small.CacheNamespace())
+	}
+}
+
+func TestDefaultStoreForBackend(t *testing.T) {
+	postgres := DefaultStoreForBackend("postgres")
+	if postgres.Backend != "postgres" || postgres.Postgres.DSN != DefaultPostgresDSN {
+		t.Fatalf("unexpected postgres defaults: %+v", postgres)
+	}
+
+	qdrant := DefaultStoreForBackend("qdrant")
+	if qdrant.Backend != "qdrant" {
+		t.Fatalf("unexpected qdrant backend: %q", qdrant.Backend)
+	}
+	if qdrant.Qdrant.Endpoint != DefaultQdrantEndpoint || qdrant.Qdrant.Port != DefaultQdrantPort {
+		t.Fatalf("unexpected qdrant defaults: %+v", qdrant.Qdrant)
+	}
+}
+
+func TestConfigLoad_FrameworkProcessingDefaultsRespectExplicitFalseAndNestedDefaults(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(tmpDir, ConfigDir), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	cfgPath := GetConfigPath(tmpDir)
+
+	tests := []struct {
+		name              string
+		yaml              string
+		wantEnabled       bool
+		wantVueEnabled    bool
+		wantSvelteEnabled bool
+	}{
+		{
+			name:              "explicit framework disabled",
+			yaml:              "framework_processing:\n  enabled: false\n",
+			wantEnabled:       false,
+			wantVueEnabled:    true,
+			wantSvelteEnabled: false,
+		},
+		{
+			name:              "framework section present without nested flags keeps vue default",
+			yaml:              "framework_processing:\n  mode: auto\n",
+			wantEnabled:       true,
+			wantVueEnabled:    true,
+			wantSvelteEnabled: false,
+		},
+		{
+			name:              "explicit vue disabled preserved",
+			yaml:              "framework_processing:\n  frameworks:\n    vue:\n      enabled: false\n",
+			wantEnabled:       true,
+			wantVueEnabled:    false,
+			wantSvelteEnabled: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(cfgPath, []byte(strings.TrimSpace(tt.yaml)+"\n"), 0o644); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cfg, err := Load(tmpDir)
+			if err != nil {
+				t.Fatalf("Load failed: %v", err)
+			}
+			if cfg.Framework.Enabled != tt.wantEnabled {
+				t.Fatalf("framework enabled = %v, want %v", cfg.Framework.Enabled, tt.wantEnabled)
+			}
+			if cfg.Framework.Frameworks.Vue.Enabled != tt.wantVueEnabled {
+				t.Fatalf("framework vue enabled = %v, want %v", cfg.Framework.Frameworks.Vue.Enabled, tt.wantVueEnabled)
+			}
+			if cfg.Framework.Frameworks.Svelte.Enabled != tt.wantSvelteEnabled {
+				t.Fatalf("framework svelte enabled = %v, want %v", cfg.Framework.Frameworks.Svelte.Enabled, tt.wantSvelteEnabled)
+			}
+		})
 	}
 }
 
@@ -265,6 +425,9 @@ func TestFindProjectRootWithSymlink(t *testing.T) {
 	symlinkParent := t.TempDir()
 	symlinkPath := filepath.Join(symlinkParent, "symlink-project")
 	if err := os.Symlink(realDir, symlinkPath); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("skipping: symlink creation requires elevated privileges on Windows: %v", err)
+		}
 		t.Fatalf("failed to create symlink: %v", err)
 	}
 
@@ -431,6 +594,19 @@ store:
 `,
 			expectedNil:        true,
 			expectedDimensions: 1536, // GetDimensions() returns default
+		},
+		{
+			name: "openai large without dimensions infers large dimensions",
+			configYAML: `version: 1
+embedder:
+  provider: openai
+  model: text-embedding-3-large
+  api_key: sk-test
+store:
+  backend: gob
+`,
+			expectedNil:        true,
+			expectedDimensions: 3072,
 		},
 		{
 			name: "openai with explicit dimensions sets pointer",

@@ -4,36 +4,62 @@ import (
 	"context"
 	"encoding/gob"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
 )
 
 // GOBRPGStore implements RPGStore using GOB encoding.
 type GOBRPGStore struct {
 	indexPath string
+	lockPath  string
 	graph     *Graph
 	mu        sync.RWMutex
 }
 
 type gobRPGData struct {
-	Nodes map[string]*Node
-	Edges []*Edge
+	Version int
+	Nodes   map[string]*Node
+	Edges   []*Edge
 }
 
 // NewGOBRPGStore creates a new GOB-based RPG store.
 func NewGOBRPGStore(indexPath string) *GOBRPGStore {
 	return &GOBRPGStore{
 		indexPath: indexPath,
+		lockPath:  indexPath + ".lock",
 		graph:     NewGraph(),
 	}
 }
 
 // Load reads the graph from persistent storage.
 func (s *GOBRPGStore) Load(ctx context.Context) error {
+	lockFile, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		log.Printf("rpg: flock open failed, proceeding without lock: %v", err)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.loadUnlocked()
+	}
+	defer lockFile.Close()
+	if err := fileutil.FlockShared(lockFile, true); err != nil {
+		log.Printf("rpg: flock shared acquire failed, proceeding without lock: %v", err)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.loadUnlocked()
+	}
+	defer func() {
+		_ = fileutil.Funlock(lockFile)
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.loadUnlocked()
+}
 
+func (s *GOBRPGStore) loadUnlocked() error {
 	file, err := os.Open(s.indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -48,53 +74,107 @@ func (s *GOBRPGStore) Load(ctx context.Context) error {
 		return fmt.Errorf("failed to decode rpg index: %w", err)
 	}
 
+	if data.Version != CurrentRPGIndexVersion {
+		hasData := len(data.Nodes) > 0 || len(data.Edges) > 0
+		s.graph.Reset()
+		if hasData {
+			return ErrRPGIndexOutdated
+		}
+		return nil
+	}
+
+	if data.Nodes == nil {
+		data.Nodes = make(map[string]*Node)
+	}
+	if data.Edges == nil {
+		data.Edges = make([]*Edge, 0)
+	}
+
+	s.graph.mu.Lock()
 	s.graph.Nodes = data.Nodes
 	s.graph.Edges = data.Edges
-
-	if s.graph.Nodes == nil {
-		s.graph.Nodes = make(map[string]*Node)
-	}
-	if s.graph.Edges == nil {
-		s.graph.Edges = make([]*Edge, 0)
-	}
-
-	s.graph.RebuildIndexes()
+	s.graph.rebuildIndexesLocked()
+	s.graph.mu.Unlock()
 
 	return nil
 }
 
 // Persist writes the graph to persistent storage.
 func (s *GOBRPGStore) Persist(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if err := ensureParentDir(s.indexPath); err != nil {
+	if err := fileutil.EnsureParentDir(s.indexPath); err != nil {
 		return fmt.Errorf("failed to prepare rpg index directory: %w", err)
 	}
 
-	file, err := os.Create(s.indexPath)
+	lockFile, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to create rpg index file: %w", err)
+		log.Printf("rpg: flock open failed for persist, proceeding without lock: %v", err)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.persistUnlocked()
 	}
-	defer file.Close()
-
-	data := gobRPGData{
-		Nodes: s.graph.Nodes,
-		Edges: s.graph.Edges,
+	defer lockFile.Close()
+	if err := fileutil.FlockExclusive(lockFile, true); err != nil {
+		log.Printf("rpg: flock exclusive acquire failed, proceeding without lock: %v", err)
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.persistUnlocked()
 	}
-
-	if err := gob.NewEncoder(file).Encode(data); err != nil {
-		return fmt.Errorf("failed to encode rpg index: %w", err)
-	}
-
-	return nil
+	defer func() {
+		_ = fileutil.Funlock(lockFile)
+	}()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.persistUnlocked()
 }
 
-// ensureParentDir creates parent directories if missing.
-// Duplicated in store/ and trace/ to avoid cross-package dependency for a trivial helper.
-func ensureParentDir(filePath string) error {
-	dir := filepath.Dir(filePath)
-	return os.MkdirAll(dir, 0755)
+func (s *GOBRPGStore) persistUnlocked() error {
+	// Snapshot Nodes and Edges under the graph's read lock so no concurrent
+	// mutation can modify them while gob iterates the maps/slices.
+	s.graph.mu.RLock()
+	nodes := make(map[string]*Node, len(s.graph.Nodes))
+	for k, v := range s.graph.Nodes {
+		nodes[k] = v
+	}
+	edges := make([]*Edge, len(s.graph.Edges))
+	copy(edges, s.graph.Edges)
+	s.graph.mu.RUnlock()
+
+	data := gobRPGData{
+		Version: CurrentRPGIndexVersion,
+		Nodes:   nodes,
+		Edges:   edges,
+	}
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(s.indexPath), filepath.Base(s.indexPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("failed to create rpg index temp file: %w", err)
+	}
+
+	tmpPath := tmpFile.Name()
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err := gob.NewEncoder(tmpFile).Encode(data); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to encode rpg index: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("failed to sync rpg index temp file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close rpg index temp file: %w", err)
+	}
+	if err := fileutil.ReplaceFileAtomically(tmpPath, s.indexPath); err != nil {
+		return fmt.Errorf("failed to replace rpg index file: %w", err)
+	}
+	cleanupTemp = false
+
+	return nil
 }
 
 // Close cleanly shuts down the store by persisting data.

@@ -18,6 +18,7 @@ var (
 	initBackend        string
 	initNonInteractive bool
 	initInherit        bool
+	initUI             bool
 )
 
 const (
@@ -38,11 +39,12 @@ This command will:
 }
 
 func init() {
-	initCmd.Flags().StringVarP(&initProvider, "provider", "p", "", "Embedding provider (ollama, lmstudio, openai, synthetic, or openrouter)")
-	initCmd.Flags().StringVarP(&initModel, "model", "m", "", "Embedding model (for openrouter: text-embedding-3-small, text-embedding-3-large, qwen3-embedding-8b)")
+	initCmd.Flags().StringVarP(&initProvider, "provider", "p", "", "Embedding provider (ollama, lmstudio, openai, synthetic, openrouter, or requesty)")
+	initCmd.Flags().StringVarP(&initModel, "model", "m", "", "Embedding model (for openai/openrouter/requesty: text-embedding-3-small, text-embedding-3-large; openrouter also supports qwen3-embedding-8b)")
 	initCmd.Flags().StringVarP(&initBackend, "backend", "b", "", "Storage backend (gob, postgres, or qdrant)")
 	initCmd.Flags().BoolVar(&initNonInteractive, "yes", false, "Use defaults without prompting")
 	initCmd.Flags().BoolVar(&initInherit, "inherit", false, "Inherit configuration from main worktree (for git worktrees)")
+	initCmd.Flags().BoolVar(&initUI, "ui", false, "Run interactive Bubble Tea UI wizard")
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
@@ -60,19 +62,23 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 	cfg := config.DefaultConfig()
 	skipPrompts := false
+	var detectedGitInfo *git.DetectInfo
+	var detectedMainCfg *config.Config
 
 	// Detect git worktree and offer config inheritance
 	gitInfo, gitErr := git.Detect(cwd)
 	if gitErr == nil && gitInfo.IsWorktree && config.Exists(gitInfo.MainWorktree) {
 		mainCfg, loadErr := config.Load(gitInfo.MainWorktree)
 		if loadErr == nil {
+			detectedGitInfo = gitInfo
+			detectedMainCfg = mainCfg
 			fmt.Printf("\nGit worktree detected.\n")
 			fmt.Printf("  Main worktree: %s\n", gitInfo.MainWorktree)
 			fmt.Printf("  Worktree ID:   %s\n", gitInfo.WorktreeID)
 			fmt.Printf("  Backend:       %s\n", mainCfg.Store.Backend)
 
 			shouldInherit := initInherit
-			if !shouldInherit && !initNonInteractive {
+			if shouldPromptInheritChoice(shouldInherit, initNonInteractive, initUI) {
 				reader := bufio.NewReader(os.Stdin)
 				fmt.Print("\nInherit configuration from main worktree? [Y/n]: ")
 				input, _ := reader.ReadString('\n')
@@ -96,6 +102,15 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	if initUI && !initNonInteractive {
+		uiCfg, uiErr := runInitWizardUI(cwd, cfg, detectedGitInfo, detectedMainCfg, initInherit)
+		if uiErr != nil {
+			return uiErr
+		}
+		cfg = uiCfg
+		skipPrompts = true
+	}
+
 	// Interactive mode
 	if !skipPrompts && !initNonInteractive {
 		reader := bufio.NewReader(os.Stdin)
@@ -108,6 +123,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 			fmt.Println("  3) openai (cloud, requires API key)")
 			fmt.Println("  4) synthetic (cloud, free embedding API)")
 			fmt.Println("  5) openrouter (cloud, multi-provider gateway)")
+			fmt.Println("  6) requesty (cloud, multi-provider gateway)")
 			fmt.Print("Choice [1]: ")
 
 			input, _ := reader.ReadString('\n')
@@ -128,8 +144,9 @@ func runInit(cmd *cobra.Command, args []string) error {
 				cfg.Embedder.Dimensions = &dim
 			case "3", "openai":
 				cfg.Embedder.Provider = "openai"
-				cfg.Embedder.Model = "text-embedding-3-small"
+				cfg.Embedder.Model = config.DefaultOpenAIEmbeddingModel
 				cfg.Embedder.Endpoint = "https://api.openai.com/v1"
+				cfg.Embedder.Parallelism = config.DefaultOpenAIParallelism
 				// OpenAI: leave Dimensions nil to use model's native dimensions
 			case "4", "synthetic":
 				cfg.Embedder.Provider = "synthetic"
@@ -160,6 +177,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 				default:
 					cfg.Embedder.Model = "openai/text-embedding-3-small"
 				}
+			case "6", "requesty":
+				cfg.Embedder.Provider = "requesty"
+				cfg.Embedder.Endpoint = "https://router.requesty.ai/v1"
+				cfg.Embedder.Model = "openai/text-embedding-3-small"
+				// Requesty: leave Dimensions nil to use model's native dimensions
 			default:
 				cfg.Embedder.Provider = "ollama"
 				fmt.Print("Ollama endpoint [http://localhost:11434]: ")
@@ -179,8 +201,9 @@ func runInit(cmd *cobra.Command, args []string) error {
 				dim := lmStudioEmbeddingDimensions
 				cfg.Embedder.Dimensions = &dim
 			case "openai":
-				cfg.Embedder.Model = "text-embedding-3-small"
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
 				cfg.Embedder.Endpoint = "https://api.openai.com/v1"
+				cfg.Embedder.Parallelism = config.DefaultOpenAIParallelism
 				// OpenAI: leave Dimensions nil to use model's native dimensions
 			case "synthetic":
 				cfg.Embedder.Model = "hf:nomic-ai/nomic-embed-text-v1.5"
@@ -188,9 +211,13 @@ func runInit(cmd *cobra.Command, args []string) error {
 				dim := 768
 				cfg.Embedder.Dimensions = &dim
 			case "openrouter":
-				cfg.Embedder.Model = "openai/text-embedding-3-small"
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
 				cfg.Embedder.Endpoint = "https://openrouter.ai/api/v1"
 				// OpenRouter: leave Dimensions nil to use model's native dimensions
+			case "requesty":
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+				cfg.Embedder.Endpoint = "https://router.requesty.ai/v1"
+				// Requesty: leave Dimensions nil to use model's native dimensions
 			}
 		}
 
@@ -265,9 +292,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 				dim := lmStudioEmbeddingDimensions
 				cfg.Embedder.Dimensions = &dim
 			case "openai":
-				cfg.Embedder.Model = "text-embedding-3-small"
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
 				cfg.Embedder.Endpoint = "https://api.openai.com/v1"
 				cfg.Embedder.Dimensions = nil
+				cfg.Embedder.Parallelism = config.DefaultOpenAIParallelism
 			case "synthetic":
 				cfg.Embedder.Model = "hf:nomic-ai/nomic-embed-text-v1.5"
 				cfg.Embedder.Endpoint = "https://api.synthetic.new/openai/v1"
@@ -276,15 +304,11 @@ func runInit(cmd *cobra.Command, args []string) error {
 			case "openrouter":
 				cfg.Embedder.Endpoint = "https://openrouter.ai/api/v1"
 				cfg.Embedder.Dimensions = nil
-				// Use provided model flag or default
-				switch initModel {
-				case "text-embedding-3-large":
-					cfg.Embedder.Model = "openai/text-embedding-3-large"
-				case "qwen3-embedding-8b":
-					cfg.Embedder.Model = "qwen/qwen3-embedding-8b"
-				default:
-					cfg.Embedder.Model = "openai/text-embedding-3-small"
-				}
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
+			case "requesty":
+				cfg.Embedder.Endpoint = "https://router.requesty.ai/v1"
+				cfg.Embedder.Dimensions = nil
+				cfg.Embedder.Model = resolveInitModel(initProvider, initModel)
 			}
 		}
 		if initBackend != "" {
@@ -330,7 +354,43 @@ func runInit(cmd *cobra.Command, args []string) error {
 	case "openrouter":
 		fmt.Println("\nMake sure OPENROUTER_API_KEY or OPENAI_API_KEY is set in your environment.")
 		fmt.Println("  Get your API key at: https://openrouter.ai/keys")
+	case "requesty":
+		fmt.Println("\nMake sure REQUESTY_API_KEY or OPENAI_API_KEY is set in your environment.")
+		fmt.Println("  Get your API key at: https://app.requesty.ai/api-keys")
 	}
 
 	return nil
+}
+
+func shouldPromptInheritChoice(shouldInherit, nonInteractive, uiMode bool) bool {
+	return !shouldInherit && !nonInteractive && !uiMode
+}
+
+func resolveInitModel(provider, requestedModel string) string {
+	requestedModel = strings.TrimSpace(requestedModel)
+	switch provider {
+	case "openai":
+		if requestedModel != "" {
+			return requestedModel
+		}
+		return config.DefaultOpenAIEmbeddingModel
+	case "openrouter":
+		switch requestedModel {
+		case "text-embedding-3-large":
+			return config.OpenRouterEmbeddingModelLarge
+		case "qwen3-embedding-8b":
+			return config.OpenRouterEmbeddingModelQwen8B
+		case "text-embedding-3-small", "":
+			return config.DefaultOpenRouterEmbeddingModel
+		default:
+			return requestedModel
+		}
+	case "requesty":
+		if requestedModel != "" {
+			return requestedModel
+		}
+		return config.DefaultRequestyEmbeddingModel
+	default:
+		return requestedModel
+	}
 }

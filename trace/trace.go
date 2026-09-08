@@ -31,12 +31,14 @@ type Symbol struct {
 	Package     string     `json:"package,omitempty"`
 	Exported    bool       `json:"exported,omitempty"`
 	Language    string     `json:"language"`
+	Docstring   string     `json:"docstring,omitempty"`    // Documentation/comment for the symbol
 	FeaturePath string     `json:"feature_path,omitempty"` // RPG semantic hierarchy path (populated when RPG enabled)
 }
 
 // Reference represents a usage/call of a symbol.
 type Reference struct {
 	SymbolName string `json:"symbol_name"`
+	Kind       string `json:"kind,omitempty"`
 	File       string `json:"file"`
 	Line       int    `json:"line"`
 	Column     int    `json:"column,omitempty"`
@@ -45,6 +47,12 @@ type Reference struct {
 	CallerFile string `json:"caller_file"`
 	CallerLine int    `json:"caller_line"`
 }
+
+const (
+	RefKindCall  = "call"
+	RefKindRead  = "read"
+	RefKindWrite = "write"
+)
 
 // CallEdge represents a caller -> callee relationship.
 type CallEdge struct {
@@ -126,6 +134,16 @@ type SymbolExtractor interface {
 
 	// Mode returns "fast" or "precise".
 	Mode() string
+
+	// Version returns an opaque token that changes whenever this
+	// extractor's output for the same input would change — for example
+	// after a grammar bump, a new query, or a release that adds new
+	// language coverage. Callers persist this alongside the file's
+	// content hash so the dedup cache invalidates on extractor
+	// upgrades; without that, a binary that ships better symbol
+	// extraction never re-runs against files whose content didn't
+	// change between releases.
+	Version() string
 }
 
 // SymbolStore persists and queries the symbol index.
@@ -147,6 +165,12 @@ type SymbolStore interface {
 
 	// LookupCallees finds all symbols called by a function.
 	LookupCallees(ctx context.Context, symbolName string, file string) ([]Reference, error)
+
+	// LookupReaders finds property/data readers for a symbol name.
+	LookupReaders(ctx context.Context, symbolName string) ([]Reference, error)
+
+	// LookupWriters finds property/data writers for a symbol name.
+	LookupWriters(ctx context.Context, symbolName string) ([]Reference, error)
 
 	// GetCallGraph builds a call graph from a starting symbol.
 	GetCallGraph(ctx context.Context, symbolName string, depth int) (*CallGraph, error)

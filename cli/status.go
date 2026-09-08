@@ -3,6 +3,8 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -10,8 +12,13 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/daemon"
+	"github.com/yoanbernabeu/grepai/git"
+	"github.com/yoanbernabeu/grepai/stats"
 	"github.com/yoanbernabeu/grepai/store"
 )
+
+var statusNoUI bool
 
 var statusCmd = &cobra.Command{
 	Use:   "status",
@@ -32,20 +39,33 @@ const (
 	viewStats viewState = iota
 	viewFiles
 	viewChunks
+	viewTokenSavings
 )
 
 type model struct {
-	st            store.VectorStore
-	cfg           *config.Config
-	state         viewState
-	stats         *store.IndexStats
-	files         []store.FileStats
-	chunks        []store.Chunk
-	selectedFile  int
-	selectedChunk int
-	width         int
-	height        int
-	err           error
+	st              store.VectorStore
+	cfg             *config.Config
+	state           viewState
+	stats           *store.IndexStats
+	files           []store.FileStats
+	chunks          []store.Chunk
+	selectedFile    int
+	selectedChunk   int
+	width           int
+	height          int
+	watchRunning    bool
+	watchPID        int
+	watchLogDir     string
+	watchLogFile    string
+	worktreeID      string
+	err             error
+	savingsSummary  *stats.Summary
+	savingsDays     []stats.DaySummary
+	savingsSelected int
+}
+
+func init() {
+	statusCmd.Flags().BoolVar(&statusNoUI, "no-ui", false, "Print plain text summary instead of interactive UI")
 }
 
 // Styles
@@ -90,6 +110,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = viewStats
 			case viewChunks:
 				m.state = viewFiles
+			case viewTokenSavings:
+				m.state = viewStats
+			}
+
+		case "s":
+			if m.state == viewStats {
+				m.state = viewTokenSavings
+				m.savingsSelected = 0
 			}
 
 		case "enter":
@@ -120,6 +148,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.selectedChunk > 0 {
 					m.selectedChunk--
 				}
+			case viewTokenSavings:
+				if m.savingsSelected > 0 {
+					m.savingsSelected--
+				}
 			}
 
 		case "down", "j":
@@ -131,6 +163,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case viewChunks:
 				if m.selectedChunk < len(m.chunks)-1 {
 					m.selectedChunk++
+				}
+			case viewTokenSavings:
+				if m.savingsSelected < len(m.savingsDays)-1 {
+					m.savingsSelected++
 				}
 			}
 		}
@@ -155,6 +191,8 @@ func (m model) View() string {
 		return m.viewFiles()
 	case viewChunks:
 		return m.viewChunks()
+	case viewTokenSavings:
+		return m.viewTokenSavingsView()
 	}
 
 	return ""
@@ -185,8 +223,21 @@ func (m model) viewStats() string {
 	sb.WriteString(normalStyle.Render("Provider:         "))
 	sb.WriteString(fmt.Sprintf("%s (%s)\n", m.cfg.Embedder.Provider, m.cfg.Embedder.Model))
 
+	sb.WriteString(normalStyle.Render("Watcher status:   "))
+	if m.watchRunning {
+		sb.WriteString(fmt.Sprintf("running (PID %d)\n", m.watchPID))
+	} else {
+		sb.WriteString("not running\n")
+	}
+	sb.WriteString(normalStyle.Render("Watcher logs:     "))
+	if m.watchLogFile == "" {
+		sb.WriteString("N/A\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("%s\n", m.watchLogFile))
+	}
+
 	sb.WriteString("\n")
-	sb.WriteString(helpStyle.Render("[Enter] Browse files  [q] Quit"))
+	sb.WriteString(helpStyle.Render("[Enter] Browse files  [s] Token savings  [q] Quit"))
 
 	return boxStyle.Render(sb.String())
 }
@@ -297,6 +348,91 @@ func (m model) viewChunks() string {
 	return boxStyle.Render(sb.String())
 }
 
+func (m model) viewTokenSavingsView() string {
+	var sb strings.Builder
+
+	sb.WriteString(titleStyle.Render("Token Savings"))
+	sb.WriteString("\n\n")
+
+	if m.savingsSummary == nil {
+		sb.WriteString(dimStyle.Render("No stats recorded yet."))
+		sb.WriteString("\n\n")
+		sb.WriteString(helpStyle.Render("[Esc] Back  [q] Quit"))
+		return boxStyle.Render(sb.String())
+	}
+
+	s := m.savingsSummary
+	label := normalStyle.Width(20)
+
+	sb.WriteString(label.Render("Queries"))
+	sb.WriteString(fmt.Sprintf("%d\n", s.TotalQueries))
+	sb.WriteString(label.Render("Tokens saved"))
+	sb.WriteString(fmt.Sprintf("%s\n", formatInt(s.TokensSaved)))
+	sb.WriteString(label.Render("Savings"))
+	sb.WriteString(fmt.Sprintf("%.1f%%\n", s.SavingsPct))
+	if s.CostSavedUSD != nil {
+		sb.WriteString(label.Render("Cost saved"))
+		sb.WriteString(fmt.Sprintf("~$%.4f", *s.CostSavedUSD))
+		sb.WriteString(dimStyle.Render("  (cloud provider)"))
+		sb.WriteString("\n")
+	}
+
+	if len(m.savingsDays) > 0 {
+		sb.WriteString("\n")
+		colDate := 16
+		colQ := 10
+		colSaved := 16
+		colPct := 10
+		sb.WriteString(dimStyle.Render(fmt.Sprintf("%-*s %-*s %-*s %-*s",
+			colDate, "Date", colQ, "Queries", colSaved, "Tokens saved", colPct, "Savings")))
+		sb.WriteString("\n")
+		sb.WriteString(dimStyle.Render(fmt.Sprintf("%-*s %-*s %-*s %-*s",
+			colDate, "────────────────", colQ, "─────────", colSaved, "───────────────", colPct, "────────")))
+		sb.WriteString("\n")
+
+		maxVisible := 10
+		if m.height > 0 {
+			maxVisible = m.height - 20
+		}
+		if maxVisible < 3 {
+			maxVisible = 3
+		}
+		start := 0
+		if m.savingsSelected >= maxVisible {
+			start = m.savingsSelected - maxVisible + 1
+		}
+		end := start + maxVisible
+		if end > len(m.savingsDays) {
+			end = len(m.savingsDays)
+		}
+
+		for i := start; i < end; i++ {
+			d := m.savingsDays[i]
+			pct := 0.0
+			if d.GrepTokens > 0 {
+				pct = float64(d.TokensSaved) / float64(d.GrepTokens) * 100
+			}
+			row := fmt.Sprintf("%-*s %-*d %-*s %-*.1f%%",
+				colDate, d.Date,
+				colQ, d.QueryCount,
+				colSaved, formatInt(d.TokensSaved),
+				colPct-1, pct,
+			)
+			if i == m.savingsSelected {
+				sb.WriteString(selectedStyle.Render("> " + row))
+			} else {
+				sb.WriteString(normalStyle.Render("  " + row))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(helpStyle.Render("[↑/↓] Navigate  [Esc] Back  [q] Quit"))
+
+	return boxStyle.Render(sb.String())
+}
+
 func runStatus(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
@@ -324,7 +460,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		st = gobStore
 	case "postgres":
 		var err error
-		st, err = store.NewPostgresStore(ctx, cfg.Store.Postgres.DSN, projectRoot, cfg.Embedder.GetDimensions())
+		st, err = store.NewPostgresStore(ctx, cfg.Store.Postgres.DSN, projectRoot, cfg.Embedder.GetDimensions(), cfg.Embedder.CacheNamespace())
 		if err != nil {
 			return fmt.Errorf("failed to connect to postgres: %w", err)
 		}
@@ -343,30 +479,49 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 	defer st.Close()
 
-	// Get stats
-	stats, err := st.GetStats(ctx)
+	// Get index stats
+	indexStats, err := st.GetStats(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get stats: %w", err)
 	}
 
-	// Get files
-	files, err := st.ListFilesWithStats(ctx)
+	// Load token savings stats (non-fatal)
+	var savingsSummary *stats.Summary
+	var savingsDays []stats.DaySummary
+	statsPath := stats.StatsPath(projectRoot)
+	if entries, serr := stats.ReadAll(statsPath); serr == nil && len(entries) > 0 {
+		s := stats.Summarize(entries, cfg.Embedder.Provider)
+		savingsSummary = &s
+		savingsDays = stats.HistoryByDay(entries)
+	}
+
+	watchStatus := resolveWatcherRuntimeStatus(projectRoot)
+	useUI := shouldUseStatusUI(isInteractiveTerminal(), statusNoUI)
+
+	if !useUI {
+		fmt.Print(renderStatusSummary(cfg, indexStats, watchStatus))
+		return nil
+	}
+
+	files, err := loadStatusFiles(ctx, useUI, st.ListFilesWithStats)
 	if err != nil {
 		return fmt.Errorf("failed to list files: %w", err)
 	}
 
-	// Sort files by path
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].Path < files[j].Path
-	})
-
 	// Create model
 	m := model{
-		st:    st,
-		cfg:   cfg,
-		state: viewStats,
-		stats: stats,
-		files: files,
+		st:             st,
+		cfg:            cfg,
+		state:          viewStats,
+		stats:          indexStats,
+		files:          files,
+		watchRunning:   watchStatus.running,
+		watchPID:       watchStatus.pid,
+		watchLogDir:    watchStatus.logDir,
+		watchLogFile:   watchStatus.logFile,
+		worktreeID:     watchStatus.worktreeID,
+		savingsSummary: savingsSummary,
+		savingsDays:    savingsDays,
 	}
 
 	// Run TUI
@@ -396,4 +551,125 @@ func truncatePath(path string, maxLen int) string {
 		return path
 	}
 	return "..." + path[len(path)-maxLen+3:]
+}
+
+type watcherRuntimeStatus struct {
+	running    bool
+	pid        int
+	logDir     string
+	logFile    string
+	worktreeID string
+}
+
+func resolveWatcherRuntimeStatus(projectRoot string) watcherRuntimeStatus {
+	status := watcherRuntimeStatus{}
+
+	logDirs, err := resolveWatcherCandidateLogDirs(projectRoot)
+	if err != nil {
+		return status
+	}
+	if len(logDirs) == 0 {
+		return status
+	}
+
+	cwd, err := os.Getwd()
+	var worktreeID string
+	if err == nil {
+		gitInfo, gitErr := git.Detect(cwd)
+		if gitErr == nil && gitInfo.WorktreeID != "" {
+			worktreeID = gitInfo.WorktreeID
+		}
+	}
+
+	for idx, logDir := range logDirs {
+		status.logDir = logDir
+		status.worktreeID = worktreeID
+		if worktreeID != "" {
+			pid, _ := daemon.GetRunningWorktreePID(logDir, worktreeID)
+			logFile := daemon.GetWorktreeLogFile(logDir, worktreeID)
+			if pid == 0 {
+				legacyPID, _ := daemon.GetRunningPID(logDir)
+				if legacyPID > 0 {
+					pid = legacyPID
+					logFile = filepath.Join(logDir, "grepai-watch.log")
+				}
+			}
+			status.pid = pid
+			status.running = pid > 0
+			status.logFile = logFile
+		} else {
+			pid, _ := daemon.GetRunningPID(logDir)
+			status.pid = pid
+			status.running = pid > 0
+			status.logFile = filepath.Join(logDir, "grepai-watch.log")
+		}
+		if status.running || idx == len(logDirs)-1 {
+			return status
+		}
+	}
+
+	return status
+}
+
+func resolveWatcherCandidateLogDirs(projectRoot string) ([]string, error) {
+	defaultLogDir, err := daemon.GetDefaultLogDir()
+	if err != nil {
+		return nil, err
+	}
+
+	logDirs := make([]string, 0, 2)
+	if projectRoot != "" {
+		hintedLogDir, readErr := readWatchLogDirHint(projectRoot)
+		if readErr == nil && hintedLogDir != "" {
+			hintedLogDir = filepath.Clean(hintedLogDir)
+			if hintedLogDir != filepath.Clean(defaultLogDir) {
+				logDirs = append(logDirs, hintedLogDir)
+			}
+		}
+	}
+
+	logDirs = append(logDirs, defaultLogDir)
+	return logDirs, nil
+}
+
+func renderStatusSummary(cfg *config.Config, stats *store.IndexStats, watch watcherRuntimeStatus) string {
+	var sb strings.Builder
+	sb.WriteString("grepai index status\n")
+	sb.WriteString(fmt.Sprintf("Files indexed: %d\n", stats.TotalFiles))
+	sb.WriteString(fmt.Sprintf("Total chunks: %d\n", stats.TotalChunks))
+	sb.WriteString(fmt.Sprintf("Index size: %s\n", formatBytes(stats.IndexSize)))
+	if stats.LastUpdated.IsZero() {
+		sb.WriteString("Last updated: Never\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("Last updated: %s\n", stats.LastUpdated.Format("2006-01-02 15:04:05")))
+	}
+	sb.WriteString(fmt.Sprintf("Provider: %s (%s)\n", cfg.Embedder.Provider, cfg.Embedder.Model))
+	if watch.running {
+		sb.WriteString(fmt.Sprintf("Watcher: running (PID %d)\n", watch.pid))
+	} else {
+		sb.WriteString("Watcher: not running\n")
+	}
+	if watch.logFile != "" {
+		sb.WriteString(fmt.Sprintf("Watcher log: %s\n", watch.logFile))
+	}
+	return sb.String()
+}
+
+func loadStatusFiles(
+	ctx context.Context,
+	useUI bool,
+	listFn func(context.Context) ([]store.FileStats, error),
+) ([]store.FileStats, error) {
+	if !useUI {
+		return nil, nil
+	}
+
+	files, err := listFn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].Path < files[j].Path
+	})
+	return files, nil
 }

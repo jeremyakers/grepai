@@ -25,6 +25,13 @@ grepai init
 grepai watch
 ```
 
+In interactive terminals, `grepai watch` now opens a Bubble Tea monitoring UI by default (foreground mode).
+Use `--no-ui` to force plain text output:
+
+```bash
+grepai watch --no-ui
+```
+
 Output:
 
 ```text
@@ -73,12 +80,14 @@ The watcher indexes files with these extensions:
 | JavaScript/TypeScript | `.js`, `.jsx`, `.ts`, `.tsx` |
 | Python | `.py` |
 | PHP | `.php` |
+| Lua | `.lua` |
 | Rust | `.rs` |
 | C/C++ | `.c`, `.cpp`, `.h`, `.hpp`, `.cc`, `.cxx`, `.hxx` |
 | Zig | `.zig` |
 | Java | `.java` |
 | Ruby | `.rb` |
 | C# | `.cs` |
+| F# | `.fs`, `.fsx`, `.fsi` |
 | Pascal/Delphi | `.pas`, `.dpr` |
 
 ### What Gets Skipped
@@ -144,7 +153,11 @@ watch:
   rpg_persist_interval_ms: 1000
   rpg_full_reconcile_interval_sec: 300
   rpg_max_dirty_files_per_batch: 128
+  # Auto-discover and watch linked git worktrees (default: true)
+  discover_worktrees: true
 ```
+
+To watch only the main worktree, set `discover_worktrees: false` in the **main worktree's** config — see [Git Worktrees](/grepai/git-worktrees/#disabling-worktree-discovery).
 
 ### Persistence
 
@@ -219,6 +232,16 @@ grepai watch --background --log-dir /custom/path
 grepai watch --status --log-dir /custom/path
 grepai watch --stop --log-dir /custom/path
 ```
+
+### Foreground UI Controls
+
+When running foreground watch UI:
+
+| Key | Action |
+|-----|--------|
+| `q` | Graceful shutdown (persists index before exit) |
+| `p` | Pause/resume event ledger auto-scroll |
+| `?` | Toggle help |
 
 #### Log Management
 
