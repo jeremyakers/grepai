@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/yoanbernabeu/grepai/git"
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -769,37 +771,69 @@ func AutoInitWorktree(worktreeRoot, mainWorktree string) error {
 // search and trace work immediately with the main worktree's index as a seed,
 // and watch will incrementally update for worktree-specific changes.
 func autoInitFromMainWorktree(worktreeRoot, mainWorktree string) error {
+	return autoInitFromMainWorktreeWithCopy(worktreeRoot, mainWorktree, copyFileIfExists)
+}
+
+func autoInitFromMainWorktreeWithCopy(worktreeRoot, mainWorktree string, copyFile func(src, dst string) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	writerLock, err := fileutil.AcquireProjectWriterLockContext(ctx, worktreeRoot)
+	if err != nil {
+		return fmt.Errorf("failed to lock worktree auto-init: %w", err)
+	}
+	defer writerLock.Close()
+	worktreeRoot = writerLock.ProjectRoot()
+
+	// config.yaml is the completion marker and is copied last. If another
+	// initializer completed while this caller waited, its seed is ready to use.
+	if projectConfigIsValid(worktreeRoot) {
+		return nil
+	}
+
 	localGrepai := filepath.Join(worktreeRoot, ".grepai")
 	if err := os.MkdirAll(localGrepai, 0755); err != nil {
 		return err
 	}
 
 	mainGrepai := filepath.Join(mainWorktree, ".grepai")
-
-	// Copy config.yaml (required)
-	srcConfig := filepath.Join(mainGrepai, "config.yaml")
-	dstConfig := filepath.Join(localGrepai, "config.yaml")
-	if err := copyFileIfExists(srcConfig, dstConfig); err != nil {
-		os.RemoveAll(localGrepai)
-		return err
-	}
-	// Verify config.yaml was actually copied (it's required)
-	if _, err := os.Stat(dstConfig); os.IsNotExist(err) {
-		os.RemoveAll(localGrepai)
-		return fmt.Errorf("config.yaml not found in main worktree: %s", srcConfig)
+	created := make([]string, 0, 3)
+	cleanup := func() {
+		for _, path := range created {
+			_ = os.Remove(path)
+		}
 	}
 
 	// Copy index.gob as seed (search works immediately)
-	_ = copyFileIfExists(
-		filepath.Join(mainGrepai, "index.gob"),
-		filepath.Join(localGrepai, "index.gob"),
-	)
+	dstIndex := filepath.Join(localGrepai, "index.gob")
+	created = append(created, dstIndex)
+	_ = os.Remove(dstIndex)
+	if err := copyFile(filepath.Join(mainGrepai, "index.gob"), dstIndex); err != nil {
+		cleanup()
+		return err
+	}
 
 	// Copy symbols.gob as seed (trace works immediately)
-	_ = copyFileIfExists(
-		filepath.Join(mainGrepai, "symbols.gob"),
-		filepath.Join(localGrepai, "symbols.gob"),
-	)
+	dstSymbols := filepath.Join(localGrepai, "symbols.gob")
+	created = append(created, dstSymbols)
+	_ = os.Remove(dstSymbols)
+	if err := copyFile(filepath.Join(mainGrepai, "symbols.gob"), dstSymbols); err != nil {
+		cleanup()
+		return err
+	}
+
+	// Copy required config last so its presence means every seed copy finished.
+	srcConfig := filepath.Join(mainGrepai, "config.yaml")
+	dstConfig := filepath.Join(localGrepai, "config.yaml")
+	created = append(created, dstConfig)
+	_ = os.Remove(dstConfig)
+	if err := copyFile(srcConfig, dstConfig); err != nil {
+		cleanup()
+		return err
+	}
+	if !projectConfigIsValid(worktreeRoot) {
+		cleanup()
+		return fmt.Errorf("valid config.yaml not found in main worktree: %s", srcConfig)
+	}
 
 	// Ensure .grepai/ is in .gitignore
 	ensureGitignoreEntry(worktreeRoot, ".grepai/")
@@ -807,17 +841,9 @@ func autoInitFromMainWorktree(worktreeRoot, mainWorktree string) error {
 	return nil
 }
 
-// copyFileIfExists copies src to dst if src exists. Returns error only if src
-// exists but copy fails. Returns nil if src doesn't exist.
-func copyFileIfExists(src, dst string) error {
-	data, err := os.ReadFile(src)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	return os.WriteFile(dst, data, 0600)
+func projectConfigIsValid(projectRoot string) bool {
+	_, err := Load(projectRoot)
+	return err == nil
 }
 
 // ensureGitignoreEntry adds an entry to .gitignore if not already present.
