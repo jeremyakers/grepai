@@ -689,7 +689,7 @@ func startRPGRealtimeWorkers(ctx context.Context, projectLabel string, symbolSto
 }
 
 //nolint:unused // Retained for upcoming watch-loop refactor across fg/bg modes.
-func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore *trace.GOBSymbolStore, w *watcher.Watcher, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, tracedLanguages []string, projectRoot string, cfg *config.Config, isBackgroundChild bool, processors ...*framework.ProcessorRegistry) error {
+func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore trace.SymbolStore, w *watcher.Watcher, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, tracedLanguages []string, projectRoot string, cfg *config.Config, isBackgroundChild bool, processors ...*framework.ProcessorRegistry) error {
 	// Handle signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -748,7 +748,14 @@ func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore *trace.
 	}
 }
 
-func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore *trace.GOBSymbolStore, tracedLanguages []string, lastIndexTime time.Time, isBackgroundChild bool, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), processors ...*framework.ProcessorRegistry) (*indexer.IndexStats, error) {
+func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore trace.SymbolStore, tracedLanguages []string, lastIndexTime time.Time, isBackgroundChild bool, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), processors ...*framework.ProcessorRegistry) (*indexer.IndexStats, error) {
+	fingerprints, ok := symbolStore.(interface {
+		GetFileContentHash(string) (string, bool)
+		GetFileExtractorVersion(string) (string, bool)
+	})
+	if !ok {
+		return nil, fmt.Errorf("symbol store does not support file fingerprints")
+	}
 	// Initial scan with progress
 	if !isBackgroundChild {
 		fmt.Println("\nPerforming initial scan...")
@@ -824,7 +831,7 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 		if !lastIndexTime.IsZero() {
 			fileModTime := time.Unix(file.ModTime, 0)
 			if (fileModTime.Before(lastIndexTime) || fileModTime.Equal(lastIndexTime)) && symbolStore.IsFileIndexed(file.Path) {
-				if v, ok := symbolStore.GetFileExtractorVersion(file.Path); ok && v == extractor.Version() {
+				if v, ok := fingerprints.GetFileExtractorVersion(file.Path); ok && v == extractor.Version() {
 					continue
 				}
 			}
@@ -844,8 +851,8 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 		// enough — a release that ships better extraction (new tree-sitter
 		// grammar, expanded regex patterns, bug-fixed query) needs to
 		// re-process unchanged files to surface the improved symbols.
-		existingHash, hashOK := symbolStore.GetFileContentHash(fileInfo.Path)
-		existingVersion, versionOK := symbolStore.GetFileExtractorVersion(fileInfo.Path)
+		existingHash, hashOK := fingerprints.GetFileContentHash(fileInfo.Path)
+		existingVersion, versionOK := fingerprints.GetFileExtractorVersion(fileInfo.Path)
 		if hashOK && versionOK && existingHash == fileInfo.Hash && existingVersion == extractor.Version() {
 			continue
 		}
@@ -1048,11 +1055,14 @@ func watchProjectWithEventObserverLocked(ctx context.Context, projectRoot string
 	idx := indexer.NewIndexer(projectRoot, st, emb, chunker, scanner, cfg.Watch.LastIndexTime, processorRegistry)
 
 	// Initialize symbol store and extractor
-	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
-	if err := symbolStore.Load(ctx); err != nil {
-		log.Printf("Warning: failed to load symbol index for %s: %v", projectRoot, err)
+	symbolStore, err := trace.NewSymbolStore(ctx, cfg, projectRoot)
+	if err != nil {
+		return err
 	}
 	defer symbolStore.Close()
+	if err := runAfterWatcherSymbolLoad(ctx, cfg.Trace.StoreBackend, projectRoot, symbolStore, nil); err != nil {
+		return err
+	}
 
 	extractor := trace.NewRegexExtractor()
 
@@ -1188,7 +1198,7 @@ func emitInitialStatsSnapshot(ctx context.Context, vectorStore store.VectorStore
 	}
 }
 
-func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore *trace.GOBSymbolStore, w *watcher.Watcher, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, rpgEncoder *rpg.RPGEncoder, rpgStore rpg.RPGStore, tracedLanguages []string, projectRoot string, cfg *config.Config, onEvent watchEventObserver, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) error {
+func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore trace.SymbolStore, w *watcher.Watcher, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, rpgEncoder *rpg.RPGEncoder, rpgStore rpg.RPGStore, tracedLanguages []string, projectRoot string, cfg *config.Config, onEvent watchEventObserver, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) error {
 	persistTicker := time.NewTicker(30 * time.Second)
 	defer persistTicker.Stop()
 
@@ -2097,7 +2107,7 @@ func extractSymbolsWithFramework(ctx context.Context, extractor trace.SymbolExtr
 	return symbols, refs, nil
 }
 
-func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore *trace.GOBSymbolStore, rpgEncoder *rpg.RPGEncoder, vectorStore store.VectorStore, enabledLanguages []string, projectRoot string, cfg *config.Config, lastConfigWrite *time.Time, rpgManager *rpgRealtimeManager, event watcher.FileEvent, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) {
+func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore trace.SymbolStore, rpgEncoder *rpg.RPGEncoder, vectorStore store.VectorStore, enabledLanguages []string, projectRoot string, cfg *config.Config, lastConfigWrite *time.Time, rpgManager *rpgRealtimeManager, event watcher.FileEvent, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) {
 	// An atomic write -- write to a temp file, then rename it over the target
 	// -- surfaces on the destination path as RENAME/REMOVE with no follow-up
 	// CREATE or WRITE. Editors and coding agents (Claude Code, Cursor) save
@@ -2824,7 +2834,7 @@ type workspaceProjectRuntime struct {
 	scanner         *indexer.Scanner
 	extractor       *trace.RegexExtractor
 	processor       *framework.ProcessorRegistry
-	symbolStore     *trace.GOBSymbolStore
+	symbolStore     trace.SymbolStore
 	rpgEncoder      *rpg.RPGEncoder
 	rpgStore        rpg.RPGStore
 	vectorStore     store.VectorStore
@@ -2863,19 +2873,22 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 	}
 	idx := indexer.NewIndexer(project.Path, vectorStore, emb, chunker, scanner, projectCfg.Watch.LastIndexTime, processorRegistry)
 	extractor := trace.NewRegexExtractor()
-	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(project.Path))
-	if err := symbolStore.Load(ctx); err != nil {
-		log.Printf("Warning: failed to load symbol index for %s: %v", project.Path, err)
+	symbolStore, err := trace.NewSymbolStoreWithWorkspace(ctx, projectCfg, project.Path, &ws.Store)
+	if err != nil {
+		return nil, nil, err
 	}
-
 	tracedLanguages := projectCfg.Trace.EnabledLanguages
 	if len(tracedLanguages) == 0 {
 		tracedLanguages = config.DefaultConfig().Trace.EnabledLanguages
 	}
 
-	stats, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, projectCfg.Watch.LastIndexTime, isBackgroundChild, nil, nil, processorRegistry)
+	var stats *indexer.IndexStats
+	err = initializeWorkspaceSymbolStore(ctx, projectCfg.Trace.StoreBackend, project.Path, symbolStore, func() error {
+		var scanErr error
+		stats, scanErr = runInitialScan(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, projectCfg.Watch.LastIndexTime, isBackgroundChild, nil, nil, processorRegistry)
+		return scanErr
+	})
 	if err != nil {
-		_ = symbolStore.Close()
 		return nil, nil, err
 	}
 	if stats.FilesIndexed > 0 || stats.ChunksCreated > 0 {

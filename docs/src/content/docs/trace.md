@@ -63,7 +63,7 @@ grepai trace callers "HandleRequest" --workspace my-fullstack
 grepai trace graph "ProcessOrder" --workspace my-fullstack --depth 3
 ```
 
-When `--workspace` is specified without `--project`, results are aggregated from all projects. Each project maintains its own symbol index in `.grepai/symbols.gob`, regardless of the workspace's vector store backend.
+When `--workspace` is specified without `--project`, results are aggregated from all projects. Each project has its own namespaced symbol index, using the configured trace storage backend.
 
 | Flag | Description |
 |------|-------------|
@@ -150,6 +150,12 @@ Configure trace behavior in `.grepai/config.yaml`:
 ```yaml
 trace:
   mode: fast                    # fast | precise
+
+  # Optional. GOB remains the default.
+  store_backend: postgres       # gob | postgres
+  postgres:
+    dsn: postgres://localhost:5432/grepai
+
   enabled_languages:
     - .go
     - .js
@@ -177,12 +183,19 @@ trace:
     - "*.spec.ts"
 ```
 
+The Postgres symbol backend is independent of `store.backend`, which controls vector storage. Its DSN is resolved from `trace.postgres.dsn`, then the workspace's `store.postgres.dsn` (in workspace mode), then the project's `store.postgres.dsn`, and finally `postgres://localhost:5432/grepai`.
+
+When Postgres is enabled for a project that already has `.grepai/symbols.gob`, grepai imports that index automatically. Migration is serialized with project-scoped Postgres and exclusive GOB file locks, and the complete import commits atomically. An interruption before commit leaves no partial project data and retains the GOB file for retry. After a successful import, the original file is renamed to `.grepai/symbols.gob.migrated.bak`; if commit succeeds but archiving is interrupted, the next startup completes the archive only after verifying the locked file's SHA-256 fingerprint. A different or newly-created GOB file is never archived as though it were the imported snapshot.
+
+Postgres stores project, path, filename, and symbol identity values as raw bytes. This preserves unusual filesystem names exactly; invalid UTF-8 is replaced only in display-oriented text such as signatures, documentation, and reference context.
+
 ### How It Works
 
 1. **Symbol Indexing**: During `grepai watch`, symbols (functions, methods, classes) are extracted from source files
 2. **Reference Tracking**: Function calls are identified and linked to their callers
 3. **Call Graph**: A graph is built mapping caller → callee relationships
-4. **Persistent Storage**: Symbols are stored in `.grepai/symbols.gob`
+   Duplicate caller → callee edges use a stable canonical source location across storage backends.
+4. **Persistent Storage**: Symbols are stored in `.grepai/symbols.gob` by default, or written incrementally to Postgres when configured
 
 ### Use Cases
 

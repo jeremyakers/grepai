@@ -72,6 +72,23 @@ func pickBestSymbolForFile(candidates []trace.Symbol, preferredFile string) *tra
 	return &candidates[0]
 }
 
+func uniqueReferenceSymbolNames(refs []trace.Reference, caller bool) []string {
+	names := make([]string, 0, len(refs))
+	seen := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		name := ref.SymbolName
+		if caller {
+			name = ref.CallerName
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
+}
+
 var (
 	traceMode      string
 	traceDepth     int
@@ -199,11 +216,12 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 			if len(symbols) > 0 && result.Symbol == nil {
 				result.Symbol = pickBestTargetSymbol(symbols, refs)
 			}
+			callerSymbols, err := ss.LookupSymbolsBatch(ctx, uniqueReferenceSymbolNames(refs, true))
+			if err != nil {
+				log.Printf("Warning: failed to lookup caller symbols: %v", err)
+			}
 			for _, ref := range refs {
-				callerSyms, err := ss.LookupSymbol(ctx, ref.CallerName)
-				if err != nil {
-					log.Printf("Warning: failed to lookup caller symbol %q: %v", ref.CallerName, err)
-				}
+				callerSyms := callerSymbols[ref.CallerName]
 				var callerSym trace.Symbol
 				if len(callerSyms) > 0 {
 					if picked := pickBestSymbolForFile(callerSyms, ref.CallerFile); picked != nil {
@@ -238,7 +256,14 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 	}
 
 	// Initialize symbol store
-	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		return fmt.Errorf("failed to load configuration: %w", err)
+	}
+	symbolStore, err := trace.NewSymbolStore(ctx, cfg, projectRoot)
+	if err != nil {
+		return fmt.Errorf("failed to create symbol store: %w", err)
+	}
 	if err := symbolStore.Load(ctx); err != nil {
 		if traceUI {
 			return showTraceActionCardUIError(
@@ -295,11 +320,12 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 	}
 
 	// Convert refs to CallerInfo
+	callerSymbols, err := symbolStore.LookupSymbolsBatch(ctx, uniqueReferenceSymbolNames(refs, true))
+	if err != nil {
+		log.Printf("Warning: failed to lookup caller symbols: %v", err)
+	}
 	for _, ref := range refs {
-		callerSyms, err := symbolStore.LookupSymbol(ctx, ref.CallerName)
-		if err != nil {
-			log.Printf("Warning: failed to lookup caller symbol %q: %v", ref.CallerName, err)
-		}
+		callerSyms := callerSymbols[ref.CallerName]
 		var callerSym trace.Symbol
 		if len(callerSyms) > 0 {
 			if picked := pickBestSymbolForFile(callerSyms, ref.CallerFile); picked != nil {
@@ -321,13 +347,7 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 	}
 
 	// Enrich with RPG feature paths
-	cfg, err := config.Load(projectRoot)
-	if err != nil {
-		log.Printf("Warning: failed to load config for RPG enrichment: %v", err)
-	}
-	if cfg != nil {
-		enrichTraceWithRPG(projectRoot, cfg, &result)
-	}
+	enrichTraceWithRPG(projectRoot, cfg, &result)
 
 	return outputAndRecord(result, traceViewCallers, projectRoot, gstats.TraceCallers, len(result.Callers))
 }
@@ -366,11 +386,12 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 				if err != nil {
 					log.Printf("Warning: failed to lookup callees of %q: %v", symbolName, err)
 				}
+				calleeSymbols, err := ss.LookupSymbolsBatch(ctx, uniqueReferenceSymbolNames(refs, false))
+				if err != nil {
+					log.Printf("Warning: failed to lookup callee symbols: %v", err)
+				}
 				for _, ref := range refs {
-					calleeSyms, err := ss.LookupSymbol(ctx, ref.SymbolName)
-					if err != nil {
-						log.Printf("Warning: failed to lookup callee symbol %q: %v", ref.SymbolName, err)
-					}
+					calleeSyms := calleeSymbols[ref.SymbolName]
 					var calleeSym trace.Symbol
 					if len(calleeSyms) > 0 {
 						calleeSym = calleeSyms[0]
@@ -401,7 +422,14 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		return fmt.Errorf("failed to load configuration: %w", err)
+	}
+	symbolStore, err := trace.NewSymbolStore(ctx, cfg, projectRoot)
+	if err != nil {
+		return fmt.Errorf("failed to create symbol store: %w", err)
+	}
 	if err := symbolStore.Load(ctx); err != nil {
 		if traceUI {
 			return showTraceActionCardUIError(
@@ -452,11 +480,12 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 		Symbol: &symbols[0],
 	}
 
+	calleeSymbols, err := symbolStore.LookupSymbolsBatch(ctx, uniqueReferenceSymbolNames(refs, false))
+	if err != nil {
+		log.Printf("Warning: failed to lookup callee symbols: %v", err)
+	}
 	for _, ref := range refs {
-		calleeSyms, err := symbolStore.LookupSymbol(ctx, ref.SymbolName)
-		if err != nil {
-			log.Printf("Warning: failed to lookup callee symbol %q: %v", ref.SymbolName, err)
-		}
+		calleeSyms := calleeSymbols[ref.SymbolName]
 		var calleeSym trace.Symbol
 		if len(calleeSyms) > 0 {
 			calleeSym = calleeSyms[0]
@@ -474,13 +503,7 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 	}
 
 	// Enrich with RPG feature paths
-	cfg, err := config.Load(projectRoot)
-	if err != nil {
-		log.Printf("Warning: failed to load config for RPG enrichment: %v", err)
-	}
-	if cfg != nil {
-		enrichTraceWithRPG(projectRoot, cfg, &result)
-	}
+	enrichTraceWithRPG(projectRoot, cfg, &result)
 
 	return outputAndRecord(result, traceViewCallees, projectRoot, gstats.TraceCallees, len(result.Callees))
 }
@@ -547,7 +570,14 @@ func runTraceGraph(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
+	cfg, err := config.Load(projectRoot)
+	if err != nil {
+		return fmt.Errorf("failed to load configuration: %w", err)
+	}
+	symbolStore, err := trace.NewSymbolStore(ctx, cfg, projectRoot)
+	if err != nil {
+		return fmt.Errorf("failed to create symbol store: %w", err)
+	}
 	if err := symbolStore.Load(ctx); err != nil {
 		if traceUI {
 			return showTraceActionCardUIError(
@@ -587,13 +617,7 @@ func runTraceGraph(cmd *cobra.Command, args []string) error {
 	}
 
 	// Enrich with RPG feature paths
-	cfg, err := config.Load(projectRoot)
-	if err != nil {
-		log.Printf("Warning: failed to load config for RPG enrichment: %v", err)
-	}
-	if cfg != nil {
-		enrichTraceWithRPG(projectRoot, cfg, &result)
-	}
+	enrichTraceWithRPG(projectRoot, cfg, &result)
 
 	nodeCount := 0
 	if result.Graph != nil {

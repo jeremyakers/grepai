@@ -179,7 +179,14 @@ func runRefs(symbolName string, readers bool) (refsResult, error) {
 			return refsResult{}, fmt.Errorf("failed to find project root: %w", err)
 		}
 
-		symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
+		cfg, err := config.Load(projectRoot)
+		if err != nil {
+			return refsResult{}, fmt.Errorf("failed to load configuration: %w", err)
+		}
+		symbolStore, err := trace.NewSymbolStore(ctx, cfg, projectRoot)
+		if err != nil {
+			return refsResult{}, fmt.Errorf("failed to create symbol store: %w", err)
+		}
 		if err := symbolStore.Load(ctx); err != nil {
 			return refsResult{}, fmt.Errorf("failed to load symbol index: %w", err)
 		}
@@ -206,9 +213,21 @@ func runRefs(symbolName string, readers bool) (refsResult, error) {
 			log.Printf("Warning: failed to lookup refs for %q: %v", symbolName, err)
 			continue
 		}
+		names := make([]string, 0, len(refs))
+		seen := make(map[string]struct{}, len(refs))
+		for _, ref := range refs {
+			if _, ok := seen[ref.CallerName]; !ok {
+				seen[ref.CallerName] = struct{}{}
+				names = append(names, ref.CallerName)
+			}
+		}
+		callerSymbols, batchErr := ss.LookupSymbolsBatch(ctx, names)
+		if batchErr != nil {
+			log.Printf("Warning: failed to lookup ref caller symbols: %v", batchErr)
+		}
 
 		for _, ref := range refs {
-			sym := resolveRefCallerSymbol(ctx, ss, ref)
+			sym := resolveRefCallerSymbol(callerSymbols, ref)
 			usage := refsUsage{
 				Symbol: sym,
 				Access: ref.Kind,
@@ -264,13 +283,13 @@ func compactRefsGraphResult(result refsGraphResult) refsResultCompact {
 	}
 }
 
-func resolveRefCallerSymbol(ctx context.Context, ss trace.SymbolStore, ref trace.Reference) trace.Symbol {
+func resolveRefCallerSymbol(candidatesByName map[string][]trace.Symbol, ref trace.Reference) trace.Symbol {
 	if ref.CallerName == "" || ref.CallerName == "<top-level>" {
 		return trace.Symbol{Name: ref.CallerName, File: ref.CallerFile, Line: ref.CallerLine}
 	}
 
-	candidates, err := ss.LookupSymbol(ctx, ref.CallerName)
-	if err != nil || len(candidates) == 0 {
+	candidates := candidatesByName[ref.CallerName]
+	if len(candidates) == 0 {
 		return trace.Symbol{Name: ref.CallerName, File: ref.CallerFile, Line: ref.CallerLine}
 	}
 	best := pickBestSymbolForFile(candidates, ref.CallerFile)
