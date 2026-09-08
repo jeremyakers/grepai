@@ -155,7 +155,7 @@ func indexInitialSymbols(ctx context.Context, scanner *indexer.Scanner, extracto
 			err = symbolStore.SaveFile(ctx, info.Path, symbols, refs)
 		}
 		if err != nil {
-			log.Printf("Warning: failed to save symbols for %s: %v", info.Path, err)
+			return count, fmt.Errorf("save symbols for %s: %w", info.Path, err)
 		}
 		count += len(symbols)
 	}
