@@ -38,6 +38,21 @@ func abortWatcherReadiness(abortStores *bool, watchers []watchSource, scope stri
 	return &watcher.FatalError{Operation: "publish watcher readiness", Path: scope, Cause: err}
 }
 
+func publishWorkspaceReadiness(fence *watchMutationFence, watchers []watchSource, scope string, publish func() error, withdraw func(), abortStores, abortWatcherClose *bool) error {
+	err := fence.ready(publish)
+	if err == nil {
+		return nil
+	}
+	*abortStores = true
+	*abortWatcherClose = true
+	fatalErr := err
+	if !isFatalWatcherError(fatalErr) {
+		fatalErr = &watcher.FatalError{Operation: "publish watcher readiness", Path: scope, Cause: err}
+	}
+	fence.failWithCause(fatalErr, func() { abortWatchSources(watchers) }, withdraw)
+	return fmt.Errorf("failed to publish workspace readiness: %w", fatalErr)
+}
+
 func abortWatchSources(watchers []watchSource) {
 	for _, w := range watchers {
 		w.Abort()
@@ -62,7 +77,7 @@ func isFatalWatcherError(err error) bool {
 	return errors.As(err, &registrationErr) || errors.As(err, &fatalErr)
 }
 
-func forwardWorkspaceWatcher(ctx context.Context, runtime *workspaceProjectRuntime, events chan<- workspaceWatchEvent, fatals chan<- error) {
+func forwardWorkspaceWatcher(ctx context.Context, runtime *workspaceProjectRuntime, events chan<- workspaceWatchEvent) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -73,13 +88,20 @@ func forwardWorkspaceWatcher(ctx context.Context, runtime *workspaceProjectRunti
 			case <-ctx.Done():
 				return
 			}
-		case err := <-runtime.watcher.Errors():
-			fatal := &workspaceWatcherError{ProjectName: runtime.project.Name, ProjectPath: runtime.project.Path, Cause: err}
-			select {
-			case fatals <- fatal:
-			default:
-			}
-			return
+		}
+	}
+}
+
+func monitorWorkspaceWatcher(ctx context.Context, runtime *workspaceProjectRuntime, fence *watchMutationFence, abort, withdraw func(), fatals chan<- error) {
+	select {
+	case <-ctx.Done():
+		return
+	case err := <-runtime.watcher.Errors():
+		fatal := &workspaceWatcherError{ProjectName: runtime.project.Name, ProjectPath: runtime.project.Path, Cause: err}
+		fence.failWithCause(fatal, abort, withdraw)
+		select {
+		case fatals <- fatal:
+		default:
 		}
 	}
 }

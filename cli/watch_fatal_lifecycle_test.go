@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/indexer"
 	"github.com/yoanbernabeu/grepai/trace"
 	"github.com/yoanbernabeu/grepai/watcher"
 )
@@ -16,6 +19,91 @@ type persistCountingStore struct {
 	mockVectorStore
 	persists  int
 	onPersist func()
+}
+
+type cancellationBlockingMutationStore struct {
+	mockVectorStore
+	started  chan struct{}
+	canceled chan struct{}
+	release  chan struct{}
+	persists atomic.Int32
+}
+
+func (s *cancellationBlockingMutationStore) DeleteByFile(ctx context.Context, _ string) error {
+	close(s.started)
+	<-ctx.Done()
+	close(s.canceled)
+	<-s.release
+	return ctx.Err()
+}
+
+func (s *cancellationBlockingMutationStore) Persist(context.Context) error {
+	s.persists.Add(1)
+	return nil
+}
+
+func TestRunProjectWatchLoopFatalWaitsForInFlightMutationBeforeWithdrawal(t *testing.T) {
+	root := t.TempDir()
+	source := newFakeWatchSource()
+	fence := newWatchMutationFence()
+	if !fence.addWatcher(source) {
+		t.Fatal("failed to register project watcher with mutation fence")
+	}
+	st := &cancellationBlockingMutationStore{
+		started:  make(chan struct{}),
+		canceled: make(chan struct{}),
+		release:  make(chan struct{}),
+	}
+	idx := indexer.NewIndexer(root, st, nil, nil, nil, time.Time{})
+	symbolStore := trace.NewGOBSymbolStore(filepath.Join(root, "symbols.gob"))
+	withdrawn := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- runProjectWatchLoopWithFence(
+			context.Background(), st, symbolStore, source, idx, nil, nil, nil, nil, nil,
+			root, config.DefaultConfig(), nil, nil, nil, func() { close(withdrawn) }, fence,
+		)
+	}()
+
+	sendTimer := time.NewTimer(5 * time.Second)
+	select {
+	case source.events <- watcher.FileEvent{Type: watcher.EventDelete, Path: "obsolete.go"}:
+	case <-sendTimer.C:
+		t.Fatal("timed out delivering project event")
+	}
+	if !sendTimer.Stop() {
+		select {
+		case <-sendTimer.C:
+		default:
+		}
+	}
+	awaitWatchTestSignal(t, st.started, "project vector mutation")
+	fatal := &watcher.FatalError{Operation: "process filesystem events", Path: root, Cause: syscall.ENOSPC}
+	source.errors <- fatal
+	awaitWatchTestSignal(t, st.canceled, "project mutation cancellation")
+	select {
+	case <-withdrawn:
+		t.Fatal("project readiness withdrawn before mutation quiesced")
+	default:
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("project loop returned before mutation quiesced: %v", err)
+	default:
+	}
+	if got := st.persists.Load(); got != 0 {
+		t.Fatalf("fatal project path persisted %d times before mutation release, want 0", got)
+	}
+
+	close(st.release)
+	err := awaitWatchTestValue(t, result, "project fatal return")
+	if !errors.Is(err, fatal) {
+		t.Fatalf("runProjectWatchLoopWithFence() error = %v, want fatal", err)
+	}
+	awaitWatchTestSignal(t, withdrawn, "project readiness withdrawal")
+	if got := st.persists.Load(); got != 0 {
+		t.Fatalf("fatal project path persisted %d times, want 0", got)
+	}
 }
 
 func (s *persistCountingStore) Persist(context.Context) error {
@@ -96,6 +184,47 @@ func TestRunProjectWatchLoopGracefulShutdownStillPersists(t *testing.T) {
 	}
 	if st.persists != 1 {
 		t.Fatalf("graceful shutdown persisted %d times, want 1", st.persists)
+	}
+}
+
+func TestRunProjectWatchLoopQueuedEventCancellationUsesGracefulShutdown(t *testing.T) {
+	root := t.TempDir()
+	source := newFakeWatchSource()
+	ctx, cancel := context.WithCancel(context.Background())
+	source.readyFn = func(func() error) error {
+		cancel()
+		return context.Canceled
+	}
+	st := &persistCountingStore{}
+	symbolStore := trace.NewGOBSymbolStore(filepath.Join(root, "symbols.gob"))
+	fence := newWatchMutationFence()
+	fence.addWatcher(source)
+	withdrawn := make(chan struct{}, 1)
+	result := make(chan error, 1)
+	go func() {
+		result <- runProjectWatchLoopWithFence(ctx, st, symbolStore, source, nil, nil, nil, nil, nil, nil, root, config.DefaultConfig(), nil, nil, nil, func() { withdrawn <- struct{}{} }, fence)
+	}()
+
+	sendTimer := time.NewTimer(5 * time.Second)
+	defer sendTimer.Stop()
+	select {
+	case source.events <- watcher.FileEvent{Type: watcher.EventDelete, Path: "queued.go"}:
+	case <-sendTimer.C:
+		t.Fatal("timed out delivering queued project event")
+	}
+	if err := awaitWatchTestValue(t, result, "graceful project loop return"); err != nil {
+		t.Fatalf("runProjectWatchLoopWithFence() error = %v, want nil", err)
+	}
+	if st.persists != 1 {
+		t.Fatalf("graceful queued-event cancellation persisted %d times, want 1", st.persists)
+	}
+	select {
+	case <-withdrawn:
+		t.Fatal("graceful queued-event cancellation withdrew readiness")
+	default:
+	}
+	if source.aborted != 0 {
+		t.Fatalf("graceful queued-event cancellation aborted watcher %d times, want 0", source.aborted)
 	}
 }
 

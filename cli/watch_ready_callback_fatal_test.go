@@ -14,6 +14,16 @@ type nonCooperativeCloseWatchSource struct {
 	blockClose   chan struct{}
 }
 
+type abortNotifyingCloseWatchSource struct {
+	*nonCooperativeCloseWatchSource
+	abortStarted chan struct{}
+}
+
+func (w *abortNotifyingCloseWatchSource) Abort() {
+	w.nonCooperativeCloseWatchSource.Abort()
+	close(w.abortStarted)
+}
+
 func newNonCooperativeCloseWatchSource() *nonCooperativeCloseWatchSource {
 	return &nonCooperativeCloseWatchSource{
 		fakeWatchSource: newFakeWatchSource(),
@@ -86,5 +96,76 @@ func TestWorkspaceReadyCallbackErrorIsFatalWithoutBlockingCloses(t *testing.T) {
 		if source.aborted != 1 {
 			t.Fatalf("workspace watcher %d aborted %d times, want 1", i, source.aborted)
 		}
+	}
+}
+
+func TestPublishWorkspaceReadinessFailureWaitsForWorkerQuiescence(t *testing.T) {
+	source := &abortNotifyingCloseWatchSource{
+		nonCooperativeCloseWatchSource: newNonCooperativeCloseWatchSource(),
+		abortStarted:                   make(chan struct{}),
+	}
+	defer close(source.blockClose)
+	fence := newWatchMutationFence()
+	if !fence.addWatcher(source) {
+		t.Fatal("failed to register workspace watcher")
+	}
+	workerCanceled := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	worker := startWatchMutationWorker(context.Background(), fence, func(ctx context.Context) {
+		<-ctx.Done()
+		close(workerCanceled)
+		<-releaseWorker
+	})
+	awaitWatchTestSignal(t, worker.started, "workspace worker admission")
+
+	publishErr := errors.New("write workspace ready marker: permission denied")
+	withdrawn := make(chan struct{})
+	abortStores := false
+	abortWatcherClose := false
+	result := make(chan error, 1)
+	go func() {
+		result <- publishWorkspaceReadiness(
+			fence, []watchSource{source}, "workspace ws",
+			func() error { return publishErr }, func() { close(withdrawn) },
+			&abortStores, &abortWatcherClose,
+		)
+	}()
+	awaitWatchTestSignal(t, workerCanceled, "workspace worker cancellation")
+	awaitWatchTestSignal(t, source.abortStarted, "workspace watcher abort")
+	select {
+	case <-withdrawn:
+		t.Fatal("workspace readiness withdrawn before worker quiesced")
+	default:
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("workspace readiness failure returned before worker quiesced: %v", err)
+	default:
+	}
+	close(releaseWorker)
+	err := awaitWatchTestValue(t, result, "workspace readiness failure return")
+	if !errors.Is(err, publishErr) {
+		t.Fatalf("publishWorkspaceReadiness() error = %v, want original publication error", err)
+	}
+	awaitWatchTestSignal(t, withdrawn, "workspace readiness withdrawal")
+	awaitWatchTestSignal(t, worker.done, "workspace worker return")
+	if !abortStores || !abortWatcherClose {
+		t.Fatalf("abort flags = stores:%t watcher-close:%t, want both true", abortStores, abortWatcherClose)
+	}
+	if source.aborted != 1 || source.closed != 0 {
+		t.Fatalf("watcher aborts/closes = %d/%d, want 1/0", source.aborted, source.closed)
+	}
+	persisted := false
+	closeUnlessAborted(context.Background(), &abortStores, func() error {
+		persisted = true
+		return nil
+	})
+	if persisted {
+		t.Fatal("workspace readiness fatal path invoked persistence-bearing cleanup")
+	}
+	select {
+	case <-source.closeStarted:
+		t.Fatal("workspace readiness fatal path invoked watcher Close")
+	default:
 	}
 }

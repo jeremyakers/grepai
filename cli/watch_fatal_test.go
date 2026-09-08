@@ -21,6 +21,7 @@ type fakeWatchSource struct {
 	closed   int
 	aborted  int
 	readyErr error
+	readyFn  func(func() error) error
 }
 
 func newFakeWatchSource() *fakeWatchSource {
@@ -34,6 +35,9 @@ func (w *fakeWatchSource) Events() <-chan watcher.FileEvent { return w.events }
 func (w *fakeWatchSource) Errors() <-chan error             { return w.errors }
 
 func (w *fakeWatchSource) Ready(publish func() error) error {
+	if w.readyFn != nil {
+		return w.readyFn(publish)
+	}
 	if w.readyErr != nil {
 		return w.readyErr
 	}
@@ -77,7 +81,7 @@ func TestFatalWatcherErrorClassificationPreservesWrapping(t *testing.T) {
 	}
 }
 
-func TestForwardWorkspaceWatcherFatalIdentifiesProjectAndStops(t *testing.T) {
+func TestMonitorWorkspaceWatcherFatalIdentifiesProjectAndStops(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	source := newFakeWatchSource()
@@ -85,16 +89,49 @@ func TestForwardWorkspaceWatcherFatalIdentifiesProjectAndStops(t *testing.T) {
 		project: config.ProjectEntry{Name: "api", Path: "/workspace/api"},
 		watcher: source,
 	}
-	events := make(chan workspaceWatchEvent)
 	fatals := make(chan error, 1)
+	fence := newWatchMutationFence()
+	fence.addWatcher(source)
+	mutationStarted := make(chan struct{})
+	mutationCanceled := make(chan struct{})
+	releaseMutation := make(chan struct{})
+	mutationDone := make(chan error, 1)
+	go func() {
+		mutationDone <- fence.handle(ctx, func(eventCtx context.Context) {
+			close(mutationStarted)
+			<-eventCtx.Done()
+			close(mutationCanceled)
+			<-releaseMutation
+		})
+	}()
+	awaitWatchTestSignal(t, mutationStarted, "workspace mutation admission")
+	withdrawn := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
-		forwardWorkspaceWatcher(ctx, runtime, events, fatals)
+		monitorWorkspaceWatcher(ctx, runtime, fence, nil, func() { close(withdrawn) }, fatals)
 		close(done)
 	}()
 	source.errors <- &watcher.FatalError{Operation: "process filesystem events", Cause: syscall.ENOSPC}
+	awaitWatchTestSignal(t, mutationCanceled, "workspace mutation cancellation")
+	if err := fence.handle(ctx, func(context.Context) { t.Error("mutation admitted after workspace fatal") }); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("post-fatal handle() error = %v, want ENOSPC", err)
+	}
+	select {
+	case err := <-fatals:
+		t.Fatalf("fatal delivered before mutation quiesced: %v", err)
+	default:
+	}
+	select {
+	case <-withdrawn:
+		t.Fatal("workspace readiness withdrawn before mutation quiesced")
+	default:
+	}
+	close(releaseMutation)
+	if err := awaitWatchTestValue(t, mutationDone, "workspace mutation return"); err != nil {
+		t.Fatalf("workspace mutation error = %v", err)
+	}
 
-	err := <-fatals
+	err := awaitWatchTestValue(t, fatals, "workspace fatal delivery")
 	var projectErr *workspaceWatcherError
 	if !errors.As(err, &projectErr) || projectErr.ProjectName != "api" || projectErr.ProjectPath != "/workspace/api" {
 		t.Fatalf("fatal error = %#v, want tagged api project", err)
@@ -102,7 +139,8 @@ func TestForwardWorkspaceWatcherFatalIdentifiesProjectAndStops(t *testing.T) {
 	if !errors.Is(err, syscall.ENOSPC) {
 		t.Fatalf("fatal error = %v, want ENOSPC", err)
 	}
-	<-done
+	awaitWatchTestSignal(t, withdrawn, "workspace readiness withdrawal")
+	awaitWatchTestSignal(t, done, "workspace fatal monitor return")
 }
 
 func TestInitializeWorkspaceRuntimesRegistrationFailureCleansPriorRuntime(t *testing.T) {

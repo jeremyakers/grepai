@@ -167,12 +167,14 @@ The watcher periodically saves the index:
 - **Shutdown save**: Clean save on Ctrl+C or SIGTERM
 - **Location**: `.grepai/index.gob` (or PostgreSQL)
 
-Fatal filesystem coverage errors use a different shutdown path: event handling
-is aborted immediately and potentially untrustworthy derived state is not
-persisted. The CLI returns and exits without waiting for the filesystem backend
-to close, so the operating system reclaims its watcher descriptors at process
-exit. Embedded library callers that keep the process alive may call `Close`
-after handling the returned fatal error to release the backend explicitly.
+Fatal filesystem coverage errors use a different shutdown path: new index
+mutations are rejected immediately, contexts for admitted event, persistence,
+and background RPG work are canceled, and readiness is withdrawn after that
+work finishes. Potentially untrustworthy derived state is not persisted. The
+CLI returns without waiting for the filesystem backend to close, so the
+operating system reclaims its watcher descriptors at process exit. Embedded
+library callers that keep the process alive may call `Close` after handling the
+returned fatal error to release the backend explicitly.
 
 ### Background Daemon Mode
 
@@ -202,7 +204,7 @@ Use 'grepai watch --stop' to stop the watcher
 
 The daemon waits for full initialization (embedder connection, initial scan) before returning success. Ready markers include the child PID, so a marker left by an older process cannot make a failed restart appear healthy.
 
-It only reports ready after every required filesystem watch is registered. If registration fails at startup or while adding a newly created directory, fsnotify stops unexpectedly, or the internal event queue fills, the watcher exits instead of continuing with partial or stale coverage. Fatal coverage shutdown withdraws readiness and releases filesystem watches immediately, and deliberately does **not** flush derived indexes because their state is no longer trustworthy. The next startup performs a full repair scan. Workspace mode applies the same rule to every project: one fatal watcher error stops the workspace watcher.
+It only reports ready after every required filesystem watch is registered. If registration fails at startup or while adding a newly created directory, fsnotify stops unexpectedly, or the internal event queue fills, the watcher exits instead of continuing with partial or stale coverage. Fatal observation immediately rejects new mutations, cancels in-flight mutation contexts, and stops watcher event ownership; readiness is withdrawn once admitted event, periodic persistence, and background RPG work quiesces. Fatal shutdown deliberately does **not** flush derived indexes because their state is no longer trustworthy. The next startup performs a full repair scan. Workspace and multi-worktree modes apply the same fence across their full readiness scope: one fatal watcher error prevents admission in every project and stops the watcher.
 
 #### Checking Status
 
