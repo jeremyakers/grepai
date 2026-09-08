@@ -17,6 +17,25 @@ import (
 
 const migrationBatchSize = 500
 
+func (s *PostgresSymbolStore) migrationCompletedWithoutGOB(ctx context.Context) (bool, error) {
+	var completed bool
+	err := s.pool.QueryRow(ctx, `SELECT state='completed' FROM symbol_migrations WHERE project_id=$1`, identityBytes(s.projectID)).Scan(&completed)
+	if err == pgx.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to read symbol migration state: %w", err)
+	}
+	if !completed {
+		return false, nil
+	}
+	gobExists, err := fileExists(config.GetSymbolIndexPath(s.projectRoot))
+	if err != nil {
+		return false, err
+	}
+	return !gobExists, nil
+}
+
 func (s *PostgresSymbolStore) migrateGOBIfNeeded(ctx context.Context) (retErr error) {
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {

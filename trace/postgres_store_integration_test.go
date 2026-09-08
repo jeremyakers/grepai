@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
 )
 
 var schemaIntegrationCounter atomic.Uint64
@@ -588,6 +589,11 @@ func TestPostgresMigrationConcurrentLoadsSerialize(t *testing.T) {
 	one := newIntegrationSymbolStore(t, "migration-concurrent", root)
 	two := newIntegrationSymbolStore(t, "migration-concurrent", root)
 	truncateSymbolTables(t, one)
+	writerLock, err := fileutil.AcquireProjectWriterLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = writerLock.Close() })
 	var batches atomic.Int32
 	one.migrationBatchHook = func(int) error { batches.Add(1); return nil }
 	two.migrationBatchHook = func(int) error { batches.Add(1); return nil }
@@ -595,7 +601,7 @@ func TestPostgresMigrationConcurrentLoadsSerialize(t *testing.T) {
 	errs := make(chan error, 2)
 	for _, store := range []*PostgresSymbolStore{one, two} {
 		wg.Add(1)
-		go func(store *PostgresSymbolStore) { defer wg.Done(); errs <- store.Load(ctx) }(store)
+		go func(store *PostgresSymbolStore) { defer wg.Done(); errs <- store.LoadWithProjectWriterLockHeld(ctx) }(store)
 	}
 	wg.Wait()
 	close(errs)

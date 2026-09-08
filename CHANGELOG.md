@@ -15,16 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Efficiently filters results at the database layer for optimal performance
   - Available in MCP `grepai_search` tool via `path` parameter
 
-### Fixed
-
-- **Idle GOB Index Rewrites**: Vector and symbol GOB stores now persist only when modified, eliminating full-index rewrites every 30 seconds when idle (#298)
-- **Atomic GOB Replacement**: Failed cross-platform index replacement now preserves the previous index instead of falling back to a remove-then-rename window that could leave no index after interruption
-- **Concurrent Watcher Snapshot Loss**: Foreground, background, and workspace watchers now enforce one lifetime writer per canonical project root, while read-only search, MCP, and trace processes remain concurrent
-- **Missing-Index Reader Overwrites**: Read-only vector and symbol GOB stores that load before an index exists now close cleanly without replacing an index created later, while real pre-load mutations and direct first persists are preserved
-- **Worktree Seed Races**: Worktree auto-initialization now copies complete vector and symbol seed indexes under the project writer lock before exposing the copied configuration
-- **GOB Mutable Aliases**: Vector GOB stores now own deep copies of mutable inputs, and symbol lookups return detached slices, preventing caller mutations from changing clean in-memory snapshots
-- **Worktree Auto-Init Rollback**: Seed and configuration files are now atomically published from synced temporary files, failed copy stages remove partial destinations, and only a parseable configuration counts as initialization completion
-
 ### Added
 
 - **Postgres Symbol Store**: Add an opt-in `trace.store_backend: postgres` backend that writes symbol, reference, and call-edge updates incrementally instead of periodically rewriting the entire `.grepai/symbols.gob` file. Existing GOB indexes migrate automatically on first use and are retained as `symbols.gob.migrated.bak` (#298)
@@ -34,6 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Canonicalize duplicate call-graph edges so GOB and Postgres return the same deterministic source location
   - Bulk-copy GOB migrations per 500-file batch instead of issuing per-file SQL operations, with bounded-memory progress reporting
   - Preserve arbitrary filename and symbol-name bytes exactly while sanitizing invalid UTF-8 only in display text
+
+### Fixed
+
+- **Idle GOB Index Rewrites**: Vector and symbol GOB stores now persist only when modified, eliminating full-index rewrites every 30 seconds when idle (#298)
+- **Atomic GOB Replacement**: Failed cross-platform index replacement now preserves the previous index instead of falling back to a remove-then-rename window that could leave no index after interruption
+- **Concurrent Watcher Snapshot Loss**: Foreground, background, and workspace watchers now enforce one lifetime writer per canonical project root, while read-only search, MCP, and trace processes remain concurrent
+- **Missing-Index Reader Overwrites**: Read-only vector and symbol GOB stores that load before an index exists now close cleanly without replacing an index created later, while real pre-load mutations and direct first persists are preserved
+- **Worktree Seed Races**: Worktree auto-initialization now copies complete vector and symbol seed indexes under the project writer lock before exposing the copied configuration
+- **GOB Mutable Aliases**: Vector GOB stores now own deep copies of mutable inputs, and symbol lookups return detached slices, preventing caller mutations from changing clean in-memory snapshots
+- **Worktree Auto-Init Rollback**: Seed and configuration files are now atomically published from synced temporary files, failed copy stages remove partial destinations, and only a parseable configuration counts as initialization completion
+- **Incomplete or Stale File Watching**: File, worktree, and workspace watchers now fail closed when a directory watch cannot be registered, fsnotify closes or reports an error, or the internal event queue cannot keep up. Fatal coverage shutdown withdraws daemon readiness and synchronously aborts event handling without flushing potentially untrustworthy derived state; the CLI then exits immediately and lets the OS reclaim watcher descriptors. Library callers that remain alive after receiving a fatal error may call `Close` to release the backend explicitly. The next startup's full scan repairs the indexes. Ready markers are PID-validated, write failures stop startup, timed-out children are stopped and cleaned up, and stale PID cleanup removes the matching marker. On Linux, registration `ENOSPC` means the per-user inotify watch quota is exhausted, not that the filesystem is out of disk space (#304)
 
 ## [0.36.1] - 2026-09-01
 

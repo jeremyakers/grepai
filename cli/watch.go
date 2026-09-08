@@ -46,6 +46,11 @@ var (
 	watchForegroundRunner      = runWatchForeground
 	watchForegroundUIRunner    = runWatchForegroundUI
 	watchStopDaemonRunner      = stopWatchDaemon
+	watchSpawnBackground       = daemon.SpawnBackground
+	watchSpawnWorktree         = daemon.SpawnWorktreeBackground
+	watchSpawnWorkspace        = daemon.SpawnWorkspaceBackground
+	watchWaitForReady          = waitForBackgroundReady
+	watchStopProcess           = daemon.StopProcess
 )
 
 type watchProgressRenderer struct {
@@ -357,6 +362,9 @@ func startBackgroundWatch(logDir, worktreeID string) error {
 	if pid > 0 {
 		return fmt.Errorf("watcher is already running (PID %d)", pid)
 	}
+	if err := removeProjectReadyMarker(logDir, worktreeID); err != nil {
+		return fmt.Errorf("failed to remove stale ready marker: %w", err)
+	}
 
 	// Build args for background process (exclude --background flag)
 	args := []string{"watch"}
@@ -368,9 +376,9 @@ func startBackgroundWatch(logDir, worktreeID string) error {
 	var childPID int
 	var exitCh <-chan struct{}
 	if worktreeID != "" {
-		childPID, exitCh, err = daemon.SpawnWorktreeBackground(logDir, worktreeID, args)
+		childPID, exitCh, err = watchSpawnWorktree(logDir, worktreeID, args)
 	} else {
-		childPID, exitCh, err = daemon.SpawnBackground(logDir, args)
+		childPID, exitCh, err = watchSpawnBackground(logDir, args)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to start background process: %w", err)
@@ -380,41 +388,26 @@ func startBackgroundWatch(logDir, worktreeID string) error {
 	// Poll for ready file with timeout, also checking for early child exit
 	const startupTimeout = 30 * time.Second
 	const pollInterval = 250 * time.Millisecond
-	deadline := time.Now().Add(startupTimeout)
-
-	for time.Now().Before(deadline) {
-		// Check if ready file exists (initialization succeeded)
-		var isReady bool
+	isReady := func(expectedPID int) bool {
 		if worktreeID != "" {
-			isReady = daemon.IsWorktreeReady(logDir, worktreeID)
-		} else {
-			isReady = daemon.IsReady(logDir)
+			return daemon.IsWorktreeReadyForPID(logDir, worktreeID, expectedPID)
 		}
-
-		if isReady {
-			fmt.Printf("Background watcher started (PID %d)\n", childPID)
-			fmt.Printf("Logs: %s\n", logFile)
-			if worktreeID != "" {
-				fmt.Printf("Worktree ID: %s\n", worktreeID)
-			}
-			fmt.Printf("\nUse 'grepai watch --status' to check status\n")
-			fmt.Printf("Use 'grepai watch --stop' to stop the watcher\n")
-			return nil
-		}
-
-		// Check if child process exited early (detects failures immediately,
-		// unlike kill(0) which reports zombies as alive)
-		select {
-		case <-exitCh:
-			return fmt.Errorf("background process failed to start (check logs at %s)", logFile)
-		default:
-		}
-
-		time.Sleep(pollInterval)
+		return daemon.IsReadyForPID(logDir, expectedPID)
 	}
-
-	// Timeout - process is still running but hasn't become ready
-	return fmt.Errorf("timeout waiting for process to become ready after %v (check logs at %s)", startupTimeout, logFile)
+	if err := watchWaitForReady(exitCh, childPID, isReady, startupTimeout, pollInterval); err != nil {
+		primary := fmt.Errorf("background process failed to become ready: %w (check logs at %s)", err, logFile)
+		return abortBackgroundStart(primary, childPID, exitCh, func() error {
+			return removeProjectDaemonMarkers(logDir, worktreeID)
+		})
+	}
+	fmt.Printf("Background watcher started (PID %d)\n", childPID)
+	fmt.Printf("Logs: %s\n", logFile)
+	if worktreeID != "" {
+		fmt.Printf("Worktree ID: %s\n", worktreeID)
+	}
+	fmt.Printf("\nUse 'grepai watch --status' to check status\n")
+	fmt.Printf("Use 'grepai watch --stop' to stop the watcher\n")
+	return nil
 }
 
 func initializeEmbedder(ctx context.Context, cfg *config.Config) (embedder.Embedder, error) {
@@ -598,12 +591,12 @@ func (m *rpgRealtimeManager) Snapshot() (dirtyFiles int, dirtyPersist bool, last
 	return len(m.dirtyFiles), m.dirtyPersist, m.lastDerivedRun, m.lastPersistRun
 }
 
-func startRPGRealtimeWorkers(ctx context.Context, projectLabel string, symbolStore trace.SymbolStore, rpgEncoder *rpg.RPGEncoder, rpgStore rpg.RPGStore, watchCfg config.WatchConfig, manager *rpgRealtimeManager) {
+func startRPGRealtimeWorkers(ctx context.Context, mutationFence *watchMutationFence, projectLabel string, symbolStore trace.SymbolStore, rpgEncoder *rpg.RPGEncoder, rpgStore rpg.RPGStore, watchCfg config.WatchConfig, manager *rpgRealtimeManager) watchMutationWorker {
 	if manager == nil || rpgEncoder == nil || rpgStore == nil || symbolStore == nil {
-		return
+		return completedWatchMutationWorker()
 	}
 
-	go func() {
+	return startWatchMutationWorker(ctx, mutationFence, func(workerCtx context.Context) {
 		derivedTicker := time.NewTicker(time.Duration(watchCfg.RPGDerivedDebounceMs) * time.Millisecond)
 		persistTicker := time.NewTicker(time.Duration(watchCfg.RPGPersistIntervalMs) * time.Millisecond)
 		reconcileTicker := time.NewTicker(time.Duration(watchCfg.RPGFullReconcileIntervalSec) * time.Second)
@@ -613,7 +606,7 @@ func startRPGRealtimeWorkers(ctx context.Context, projectLabel string, symbolSto
 
 		for {
 			select {
-			case <-ctx.Done():
+			case <-workerCtx.Done():
 				return
 
 			case <-reconcileTicker.C:
@@ -631,9 +624,9 @@ func startRPGRealtimeWorkers(ctx context.Context, projectLabel string, symbolSto
 				mode := "incremental"
 				if full {
 					mode = "full"
-					err = rpgEncoder.RefreshDerivedEdgesFull(ctx, symbolStore)
+					err = rpgEncoder.RefreshDerivedEdgesFull(workerCtx, symbolStore)
 				} else {
-					err = rpgEncoder.RefreshDerivedEdgesIncremental(ctx, symbolStore, changedFiles)
+					err = rpgEncoder.RefreshDerivedEdgesIncremental(workerCtx, symbolStore, changedFiles)
 				}
 
 				if err != nil {
@@ -671,7 +664,7 @@ func startRPGRealtimeWorkers(ctx context.Context, projectLabel string, symbolSto
 				}
 
 				start := time.Now()
-				if err := rpgStore.Persist(ctx); err != nil {
+				if err := rpgStore.Persist(workerCtx); err != nil {
 					log.Printf("Warning: rpg_persist_ms=%d project=%s err=%v", time.Since(start).Milliseconds(), projectLabel, err)
 					continue
 				}
@@ -685,11 +678,11 @@ func startRPGRealtimeWorkers(ctx context.Context, projectLabel string, symbolSto
 				log.Printf("rpg_persist_ms=%d project=%s persist_lag_ms=%d", time.Since(start).Milliseconds(), projectLabel, lagMs)
 			}
 		}
-	}()
+	})
 }
 
 //nolint:unused // Retained for upcoming watch-loop refactor across fg/bg modes.
-func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore trace.SymbolStore, w *watcher.Watcher, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, tracedLanguages []string, projectRoot string, cfg *config.Config, isBackgroundChild bool, processors ...*framework.ProcessorRegistry) error {
+func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore trace.SymbolStore, w watchSource, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, tracedLanguages []string, projectRoot string, cfg *config.Config, isBackgroundChild bool, processors ...*framework.ProcessorRegistry) error {
 	// Handle signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -744,6 +737,10 @@ func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore trace.S
 
 		case event := <-w.Events():
 			handleFileEvent(ctx, idx, scanner, extractor, symbolStore, nil, nil, tracedLanguages, projectRoot, cfg, &lastConfigWrite, nil, event, nil, nil, processors...)
+
+		case err := <-w.Errors():
+			_ = persistAndExit()
+			return fmt.Errorf("filesystem watcher failed for %s: %w", projectRoot, err)
 		}
 	}
 }
@@ -999,12 +996,30 @@ const (
 )
 
 func watchProject(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func()) error {
-	return watchProjectWithEventObserver(ctx, projectRoot, emb, isBackgroundChild, onReady, nil, nil, nil, nil, nil, nil)
+	return watchProjectWithEventObserver(ctx, projectRoot, emb, isBackgroundChild, onReady, nil, nil, nil, nil, nil, nil, nil)
 }
 
-func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver) error {
+func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver, onFatal func()) (resultErr error) {
+	return watchProjectWithEventObserverAndFence(ctx, projectRoot, emb, isBackgroundChild, onReady, onEvent, onScan, onEmbed, onRPG, onActivity, onStats, onFatal, newWatchMutationFence())
+}
+
+func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver, onFatal func(), mutationFence *watchMutationFence) (resultErr error) {
+	var fatalOnce sync.Once
+	notifyFatal := func() {
+		fatalOnce.Do(func() {
+			if onFatal != nil {
+				onFatal()
+			}
+		})
+	}
+	defer func() {
+		if isFatalWatcherError(resultErr) {
+			mutationFence.failWithCause(resultErr, nil, notifyFatal)
+		}
+	}()
+
 	return runProjectWatchWithWriterLock(projectRoot, func(canonicalRoot string) error {
-		return watchProjectWithEventObserverLocked(ctx, canonicalRoot, emb, isBackgroundChild, onReady, onEvent, onScan, onEmbed, onRPG, onActivity, onStats)
+		return watchProjectWithEventObserverLocked(ctx, canonicalRoot, emb, isBackgroundChild, onReady, onEvent, onScan, onEmbed, onRPG, onActivity, onStats, notifyFatal, mutationFence)
 	})
 }
 
@@ -1021,7 +1036,7 @@ func runProjectWatchWithWriterLock(projectRoot string, run func(canonicalRoot st
 	return run(writerLock.ProjectRoot())
 }
 
-func watchProjectWithEventObserverLocked(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver) error {
+func watchProjectWithEventObserverLocked(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver, onFatal func(), mutationFence *watchMutationFence) error {
 	// Load configuration
 	cfg, err := config.Load(projectRoot)
 	if err != nil {
@@ -1035,7 +1050,8 @@ func watchProjectWithEventObserverLocked(ctx context.Context, projectRoot string
 	if err != nil {
 		return err
 	}
-	defer st.Close()
+	abortStores := false
+	defer func() { closeUnlessAborted(ctx, &abortStores, st.Close) }()
 
 	// Initialize ignore matcher
 	ignoreMatcher, err := indexer.NewIgnoreMatcher(projectRoot, cfg.Ignore, cfg.ExternalGitignore)
@@ -1059,7 +1075,7 @@ func watchProjectWithEventObserverLocked(ctx context.Context, projectRoot string
 	if err != nil {
 		return err
 	}
-	defer symbolStore.Close()
+	defer func() { closeUnlessAborted(ctx, &abortStores, symbolStore.Close) }()
 	if err := runAfterWatcherSymbolLoad(ctx, cfg.Trace.StoreBackend, projectRoot, symbolStore, nil); err != nil {
 		return err
 	}
@@ -1102,7 +1118,7 @@ func watchProjectWithEventObserverLocked(ctx context.Context, projectRoot string
 	}
 
 	if rpgStore != nil {
-		defer rpgStore.Close()
+		defer func() { closeUnlessAborted(ctx, &abortStores, rpgStore.Close) }()
 	}
 
 	tracedLanguages := cfg.Trace.EnabledLanguages
@@ -1147,20 +1163,50 @@ func watchProjectWithEventObserverLocked(ctx context.Context, projectRoot string
 	// Initialize watcher
 	w, err := watcher.NewWatcher(projectRoot, ignoreMatcher, cfg.Watch.DebounceMs)
 	if err != nil {
+		abortStores = isFatalWatcherError(err)
 		return fmt.Errorf("failed to initialize watcher for %s: %w", projectRoot, err)
 	}
-	defer w.Close()
+	abortWatcherClose := false
+	defer func() {
+		if !abortWatcherClose {
+			_ = w.Close()
+		}
+	}()
 
 	if err := w.Start(ctx); err != nil {
+		abortStores = isFatalWatcherError(err)
+		abortWatcherClose = abortStores
 		return fmt.Errorf("failed to start watcher for %s: %w", projectRoot, err)
 	}
+	if !mutationFence.addWatcher(w) {
+		abortStores = true
+		abortWatcherClose = true
+		w.Abort()
+		return fmt.Errorf("watcher failed before event admission for %s: %w", projectRoot, errWatchMutationAdmissionClosed)
+	}
+	defer mutationFence.removeWatcher(w)
 
-	if onReady != nil {
-		onReady()
+	if err := mutationFence.ready(func() error {
+		if onReady != nil {
+			onReady()
+		}
+		return nil
+	}); err != nil {
+		abortWatcherClose = true
+		abortStores = true
+		fatalErr := err
+		if !isFatalWatcherError(fatalErr) {
+			fatalErr = &watcher.FatalError{Operation: "publish watcher readiness", Path: projectRoot, Cause: err}
+		}
+		mutationFence.failWithCause(fatalErr, w.Abort, onFatal)
+		return fmt.Errorf("watcher failed before readiness for %s: %w", projectRoot, fatalErr)
 	}
 
 	// Run watch loop (responds to ctx.Done() for graceful shutdown)
-	return runProjectWatchLoop(ctx, st, symbolStore, w, idx, scanner, extractor, rpgEncoder, rpgStore, tracedLanguages, projectRoot, cfg, onEvent, onActivity, onStats, processorRegistry)
+	err = runProjectWatchLoopWithFence(ctx, st, symbolStore, w, idx, scanner, extractor, rpgEncoder, rpgStore, tracedLanguages, projectRoot, cfg, onEvent, onActivity, onStats, onFatal, mutationFence, processorRegistry)
+	abortStores = isFatalWatcherError(err)
+	abortWatcherClose = abortStores
+	return err
 }
 
 func emitInitialStatsSnapshot(ctx context.Context, vectorStore store.VectorStore, symbolStore trace.SymbolStore, projectRoot string, onStats watchStatsObserver) {
@@ -1198,51 +1244,98 @@ func emitInitialStatsSnapshot(ctx context.Context, vectorStore store.VectorStore
 	}
 }
 
-func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore trace.SymbolStore, w *watcher.Watcher, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, rpgEncoder *rpg.RPGEncoder, rpgStore rpg.RPGStore, tracedLanguages []string, projectRoot string, cfg *config.Config, onEvent watchEventObserver, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) error {
+func runProjectWatchLoop(ctx context.Context, st store.VectorStore, symbolStore trace.SymbolStore, w watchSource, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, rpgEncoder *rpg.RPGEncoder, rpgStore rpg.RPGStore, tracedLanguages []string, projectRoot string, cfg *config.Config, onEvent watchEventObserver, onActivity watchActivityObserver, onStats watchStatsObserver, onFatal func(), processors ...*framework.ProcessorRegistry) error {
+	mutationFence := newWatchMutationFence()
+	if !mutationFence.addWatcher(w) {
+		return errWatchMutationAdmissionClosed
+	}
+	defer mutationFence.removeWatcher(w)
+	return runProjectWatchLoopWithFence(ctx, st, symbolStore, w, idx, scanner, extractor, rpgEncoder, rpgStore, tracedLanguages, projectRoot, cfg, onEvent, onActivity, onStats, onFatal, mutationFence, processors...)
+}
+
+func runProjectWatchLoopWithFence(ctx context.Context, st store.VectorStore, symbolStore trace.SymbolStore, w watchSource, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, rpgEncoder *rpg.RPGEncoder, rpgStore rpg.RPGStore, tracedLanguages []string, projectRoot string, cfg *config.Config, onEvent watchEventObserver, onActivity watchActivityObserver, onStats watchStatsObserver, onFatal func(), mutationFence *watchMutationFence, processors ...*framework.ProcessorRegistry) error {
 	persistTicker := time.NewTicker(30 * time.Second)
 	defer persistTicker.Stop()
+	fatalMonitorCtx, stopFatalMonitor := context.WithCancel(ctx)
+	fatalMonitorDone := make(chan struct{})
+	defer func() {
+		stopFatalMonitor()
+		<-fatalMonitorDone
+	}()
+	fatalChan := make(chan error, 1)
+	go func() {
+		defer close(fatalMonitorDone)
+		select {
+		case <-fatalMonitorCtx.Done():
+			return
+		case err := <-w.Errors():
+			primary := fmt.Errorf("filesystem watcher failed for %s: %w", projectRoot, err)
+			mutationFence.failWithCause(primary, w.Abort, onFatal)
+			fatalChan <- primary
+		}
+	}()
 
 	var lastConfigWrite time.Time
 	var rpgManager *rpgRealtimeManager
+	rpgWorker := completedWatchMutationWorker()
 	if rpgEncoder != nil && rpgStore != nil {
 		rpgManager = newRPGRealtimeManager(cfg.Watch.RPGMaxDirtyFilesPerBatch)
-		startRPGRealtimeWorkers(ctx, projectRoot, symbolStore, rpgEncoder, rpgStore, cfg.Watch, rpgManager)
+		rpgWorker = startRPGRealtimeWorkers(ctx, mutationFence, projectRoot, symbolStore, rpgEncoder, rpgStore, cfg.Watch, rpgManager)
+	}
+	persistAndShutdown := func() {
+		<-rpgWorker.done
+		if err := st.Persist(ctx); err != nil {
+			log.Printf("Warning: failed to persist index on shutdown for %s: %v", projectRoot, err)
+		}
+		if err := symbolStore.Persist(ctx); err != nil {
+			log.Printf("Warning: failed to persist symbol index on shutdown for %s: %v", projectRoot, err)
+		}
+		if rpgStore != nil {
+			if err := rpgStore.Persist(ctx); err != nil {
+				log.Printf("Warning: failed to persist RPG graph on shutdown for %s: %v", projectRoot, err)
+			}
+		}
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			if err := st.Persist(ctx); err != nil {
-				log.Printf("Warning: failed to persist index on shutdown for %s: %v", projectRoot, err)
+			if cause := context.Cause(ctx); isFatalWatcherError(cause) {
+				mutationFence.failWithCause(cause, w.Abort, onFatal)
+				return cause
 			}
-			if err := symbolStore.Persist(ctx); err != nil {
-				log.Printf("Warning: failed to persist symbol index on shutdown for %s: %v", projectRoot, err)
-			}
-			if rpgStore != nil {
-				if err := rpgStore.Persist(ctx); err != nil {
-					log.Printf("Warning: failed to persist RPG graph on shutdown for %s: %v", projectRoot, err)
-				}
-			}
+			persistAndShutdown()
 			return nil
 
 		case <-persistTicker.C:
-			if err := st.Persist(ctx); err != nil {
-				log.Printf("Warning: failed to persist index for %s: %v", projectRoot, err)
-			}
-			if err := symbolStore.Persist(ctx); err != nil {
-				log.Printf("Warning: failed to persist symbol index for %s: %v", projectRoot, err)
-			}
-			if rpgStore != nil {
-				if err := rpgStore.Persist(ctx); err != nil {
-					log.Printf("Warning: failed to persist RPG graph for %s: %v", projectRoot, err)
+			if err := persistProjectPeriodically(ctx, mutationFence, st, symbolStore, rpgStore, projectRoot); err != nil {
+				if ctx.Err() != nil {
+					persistAndShutdown()
+					return nil
 				}
+				primary := fmt.Errorf("filesystem watcher failed during periodic persistence for %s: %w", projectRoot, err)
+				mutationFence.failWithCause(primary, w.Abort, onFatal)
+				return primary
 			}
 
 		case event := <-w.Events():
-			if onEvent != nil {
-				onEvent(projectRoot, event)
+			if err := mutationFence.handle(ctx, func(eventCtx context.Context) {
+				if onEvent != nil {
+					onEvent(projectRoot, event)
+				}
+				handleFileEvent(eventCtx, idx, scanner, extractor, symbolStore, rpgEncoder, st, tracedLanguages, projectRoot, cfg, &lastConfigWrite, rpgManager, event, onActivity, onStats, processors...)
+			}); err != nil {
+				if ctx.Err() != nil {
+					persistAndShutdown()
+					return nil
+				}
+				primary := fmt.Errorf("filesystem watcher failed during event admission for %s: %w", projectRoot, err)
+				mutationFence.failWithCause(primary, w.Abort, onFatal)
+				return primary
 			}
-			handleFileEvent(ctx, idx, scanner, extractor, symbolStore, rpgEncoder, st, tracedLanguages, projectRoot, cfg, &lastConfigWrite, rpgManager, event, onActivity, onStats, processors...)
+
+		case err := <-fatalChan:
+			return err
 		}
 	}
 }
@@ -1298,8 +1391,10 @@ type dynamicWatchSupervisorConfig struct {
 	activityObserver      watchActivityObserver
 	statsObserver         watchStatsObserver
 	scopeObserver         func(totalProjects int)
-	initialReadyObserver  func(totalProjects int)
+	initialReadyObserver  func(totalProjects int) error
 	initialReadySelector  watchInitialReadySelector
+	fatalObserver         func()
+	mutationFence         *watchMutationFence
 	reconcileInterval     time.Duration
 	retryBackoff          func(attempt int) time.Duration
 }
@@ -1370,7 +1465,7 @@ func withWatchSupervisorScopeObserver(observer func(totalProjects int)) dynamicW
 	}
 }
 
-func withWatchSupervisorInitialReadyObserver(observer func(totalProjects int)) dynamicWatchSupervisorOption {
+func withWatchSupervisorInitialReadyObserver(observer func(totalProjects int) error) dynamicWatchSupervisorOption {
 	return func(cfg *dynamicWatchSupervisorConfig) {
 		cfg.initialReadyObserver = observer
 	}
@@ -1379,6 +1474,18 @@ func withWatchSupervisorInitialReadyObserver(observer func(totalProjects int)) d
 func withWatchSupervisorInitialReadySelector(selector watchInitialReadySelector) dynamicWatchSupervisorOption {
 	return func(cfg *dynamicWatchSupervisorConfig) {
 		cfg.initialReadySelector = selector
+	}
+}
+
+func withWatchSupervisorFatalObserver(observer func()) dynamicWatchSupervisorOption {
+	return func(cfg *dynamicWatchSupervisorConfig) {
+		cfg.fatalObserver = observer
+	}
+}
+
+func withWatchSupervisorMutationFence(fence *watchMutationFence) dynamicWatchSupervisorOption {
+	return func(cfg *dynamicWatchSupervisorConfig) {
+		cfg.mutationFence = fence
 	}
 }
 
@@ -1411,25 +1518,7 @@ func withWatchSupervisorRetryBackoff(backoff func(attempt int) time.Duration) dy
 func newDynamicWatchSupervisorConfig() dynamicWatchSupervisorConfig {
 	return dynamicWatchSupervisorConfig{
 		discoverWorktrees: discoverWorktreesForWatch,
-		sessionRunner: func(
-			ctx context.Context,
-			projectRoot string,
-			emb embedder.Embedder,
-			isBackgroundChild bool,
-			onReady func(),
-			onEvent watchSessionEventObserver,
-			onScan func(current, total int, file string),
-			onEmbed func(info indexer.BatchProgressInfo),
-			onRPG func(step string, current, total int),
-			onActivity watchActivityObserver,
-			onStats watchStatsObserver,
-		) error {
-			var observer watchEventObserver
-			if onEvent != nil {
-				observer = watchEventObserver(onEvent)
-			}
-			return watchProjectWithEventObserver(ctx, projectRoot, emb, isBackgroundChild, onReady, observer, onScan, onEmbed, onRPG, onActivity, onStats)
-		},
+		mutationFence:     newWatchMutationFence(),
 		reconcileInterval: worktreeReconcileInterval,
 		retryBackoff:      computeWatchSessionRetryBackoff,
 	}
@@ -1480,6 +1569,24 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 	if cfg.discoverWorktrees == nil {
 		cfg.discoverWorktrees = discoverWorktreesForWatch
 	}
+	if cfg.mutationFence == nil {
+		cfg.mutationFence = newWatchMutationFence()
+	}
+	mutationFence := cfg.mutationFence
+	var readinessMu sync.Mutex
+	fatalObserved := false
+	fatalObserver := cfg.fatalObserver
+	var fatalOnce sync.Once
+	cfg.fatalObserver = func() {
+		fatalOnce.Do(func() {
+			readinessMu.Lock()
+			defer readinessMu.Unlock()
+			fatalObserved = true
+			if fatalObserver != nil {
+				fatalObserver()
+			}
+		})
+	}
 	if cfg.sessionRunner == nil {
 		cfg.sessionRunner = func(
 			ctx context.Context,
@@ -1498,7 +1605,7 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 			if onEvent != nil {
 				observer = watchEventObserver(onEvent)
 			}
-			return watchProjectWithEventObserver(ctx, projectRoot, emb, isBackgroundChild, onReady, observer, onScan, onEmbed, onRPG, onActivity, onStats)
+			return watchProjectWithEventObserverAndFence(ctx, projectRoot, emb, isBackgroundChild, onReady, observer, onScan, onEmbed, onRPG, onActivity, onStats, cfg.fatalObserver, mutationFence)
 		}
 	}
 	if cfg.reconcileInterval <= 0 {
@@ -1537,28 +1644,38 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 		}
 	}
 
-	markInitialReady := func(projectRoot string) {
+	markInitialReady := func(projectRoot string) error {
 		if !initialRoots[projectRoot] || initialReady[projectRoot] {
-			return
+			return nil
 		}
 		initialReady[projectRoot] = true
 		if cfg.initialReadyObserver == nil {
-			return
+			return nil
 		}
 		for root := range initialRoots {
 			if !initialReady[root] {
-				return
+				return nil
 			}
 		}
-		cfg.initialReadyObserver(len(initialRoots))
+		return mutationFence.publishReadiness(func() error {
+			readinessMu.Lock()
+			defer readinessMu.Unlock()
+			if fatalObserved {
+				return nil
+			}
+			if err := cfg.initialReadyObserver(len(initialRoots)); err != nil {
+				return &watcher.FatalError{Operation: "publish daemon readiness", Path: mainRoot, Cause: err}
+			}
+			return nil
+		})
 	}
 
 	sessionResults := make(chan watchSessionResult, 64)
 	sessionReady := make(chan watchSessionReady, 64)
 	retrySignalCh := make(chan watchSessionRetrySignal, 64)
 
-	supervisorCtx, supervisorCancel := context.WithCancel(ctx)
-	defer supervisorCancel()
+	supervisorCtx, supervisorCancel := context.WithCancelCause(ctx)
+	defer supervisorCancel(nil)
 
 	managed := make(map[string]*watchSessionHandle, len(desired))
 	retryAttempts := make(map[string]int)
@@ -1608,6 +1725,9 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 				cfg.activityObserver,
 				cfg.statsObserver,
 			)
+			if isFatalWatcherError(err) {
+				mutationFence.failWithCause(err, nil, cfg.fatalObserver)
+			}
 			sessionResults <- watchSessionResult{
 				projectRoot: project,
 				generation:  generation,
@@ -1642,7 +1762,7 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 		}(projectRoot, attempt, delay)
 	}
 
-	applyDesired := func(nextDesired map[string]bool) {
+	applyDesired := func(nextDesired map[string]bool) error {
 		for root := range desired {
 			if nextDesired[root] {
 				continue
@@ -1650,7 +1770,9 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 			delete(desired, root)
 			delete(scheduledRetry, root)
 			emitLifecycle(root, "removed", "worktree removed")
-			markInitialReady(root)
+			if err := markInitialReady(root); err != nil {
+				return err
+			}
 			if handle, ok := managed[root]; ok {
 				handle.markedClose = true
 				handle.cancel()
@@ -1665,6 +1787,7 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 			emitLifecycle(root, "queued", watchSessionRole(mainRoot, root))
 			startSession(root, false)
 		}
+		return nil
 	}
 
 	shutdownSessions := func(stopNote string) {
@@ -1693,6 +1816,58 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 		}
 	}
 
+	handleSessionResult := func(result watchSessionResult) (bool, error) {
+		handle, ok := managed[result.projectRoot]
+		if !ok || handle.generation != result.generation {
+			return false, nil
+		}
+		delete(managed, result.projectRoot)
+		if handle.markedClose {
+			if desired[result.projectRoot] {
+				emitLifecycle(result.projectRoot, "queued", watchSessionRole(mainRoot, result.projectRoot))
+				startSession(result.projectRoot, false)
+			}
+			return false, nil
+		}
+		if !desired[result.projectRoot] {
+			return false, nil
+		}
+
+		shuttingDown := ctx.Err() != nil || supervisorCtx.Err() != nil
+		if shuttingDown && (result.err == nil || errors.Is(result.err, context.Canceled)) {
+			if result.projectRoot == mainRoot {
+				shutdownSessions("context canceled")
+				return true, nil
+			}
+			return false, nil
+		}
+		if result.err == nil || errors.Is(result.err, context.Canceled) {
+			if result.projectRoot == mainRoot {
+				supervisorCancel(nil)
+				shutdownSessions("main session stopped")
+				return true, fmt.Errorf("main watch session stopped unexpectedly")
+			}
+			emitLifecycle(result.projectRoot, "error", "session stopped unexpectedly")
+			scheduleRetry(result.projectRoot)
+			return false, nil
+		}
+		if isFatalWatcherError(result.err) {
+			emitLifecycle(result.projectRoot, "error", result.err.Error())
+			supervisorCancel(result.err)
+			shutdownSessions("filesystem watcher failed")
+			return true, result.err
+		}
+		if result.projectRoot == mainRoot {
+			emitLifecycle(result.projectRoot, "error", result.err.Error())
+			supervisorCancel(nil)
+			shutdownSessions("main session failed")
+			return true, result.err
+		}
+		emitLifecycle(result.projectRoot, "error", result.err.Error())
+		scheduleRetry(result.projectRoot)
+		return false, nil
+	}
+
 	for _, root := range sortedWatchProjectRoots(desired) {
 		emitLifecycle(root, "queued", watchSessionRole(mainRoot, root))
 		startSession(root, true)
@@ -1708,11 +1883,26 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 			return nil
 		case <-reconcileTicker.C:
 			nextDesired := buildWatchDesiredProjects(mainRoot, cfg.discoverWorktrees(mainRoot))
-			applyDesired(nextDesired)
+			if err := applyDesired(nextDesired); err != nil {
+				mutationFence.failWithCause(err, nil, cfg.fatalObserver)
+				supervisorCancel(err)
+				shutdownSessions("readiness publication failed")
+				return err
+			}
 			if cfg.scopeObserver != nil {
 				cfg.scopeObserver(len(desired))
 			}
 		case readyMsg := <-sessionReady:
+			// A result already queued for this generation wins over stale readiness.
+			select {
+			case result := <-sessionResults:
+				if done, err := handleSessionResult(result); done {
+					return err
+				}
+				sessionReady <- readyMsg
+				continue
+			default:
+			}
 			handle, ok := managed[readyMsg.projectRoot]
 			if !ok || handle.generation != readyMsg.generation {
 				continue
@@ -1725,56 +1915,17 @@ func runDynamicWatchSupervisor(ctx context.Context, mainRoot string, emb embedde
 			delete(scheduledRetry, readyMsg.projectRoot)
 			emitLifecycle(readyMsg.projectRoot, "running", "steady")
 			if handle.initial {
-				markInitialReady(readyMsg.projectRoot)
+				if err := markInitialReady(readyMsg.projectRoot); err != nil {
+					mutationFence.failWithCause(err, nil, cfg.fatalObserver)
+					supervisorCancel(err)
+					shutdownSessions("readiness publication failed")
+					return err
+				}
 			}
 		case result := <-sessionResults:
-			handle, ok := managed[result.projectRoot]
-			if !ok || handle.generation != result.generation {
-				continue
+			if done, err := handleSessionResult(result); done {
+				return err
 			}
-			delete(managed, result.projectRoot)
-
-			if handle.markedClose {
-				if desired[result.projectRoot] {
-					emitLifecycle(result.projectRoot, "queued", watchSessionRole(mainRoot, result.projectRoot))
-					startSession(result.projectRoot, false)
-				}
-				continue
-			}
-
-			if !desired[result.projectRoot] {
-				continue
-			}
-
-			shuttingDown := ctx.Err() != nil || supervisorCtx.Err() != nil
-			if shuttingDown && (result.err == nil || errors.Is(result.err, context.Canceled)) {
-				if result.projectRoot == mainRoot {
-					shutdownSessions("context canceled")
-					return nil
-				}
-				continue
-			}
-
-			if result.err == nil || errors.Is(result.err, context.Canceled) {
-				if result.projectRoot == mainRoot {
-					supervisorCancel()
-					shutdownSessions("main session stopped")
-					return fmt.Errorf("main watch session stopped unexpectedly")
-				}
-				emitLifecycle(result.projectRoot, "error", "session stopped unexpectedly")
-				scheduleRetry(result.projectRoot)
-				continue
-			}
-
-			if result.projectRoot == mainRoot {
-				emitLifecycle(result.projectRoot, "error", result.err.Error())
-				supervisorCancel()
-				shutdownSessions("main session failed")
-				return result.err
-			}
-
-			emitLifecycle(result.projectRoot, "error", result.err.Error())
-			scheduleRetry(result.projectRoot)
 		case retrySignal := <-retrySignalCh:
 			if !desired[retrySignal.projectRoot] {
 				continue
@@ -1887,8 +2038,14 @@ func runWatchForeground() error {
 			}
 		}
 
-		// Ensure PID file is removed on exit
+		if err := removeProjectReadyMarker(logDir, worktreeID); err != nil {
+			return fmt.Errorf("failed to clear ready marker: %w", err)
+		}
+		// Install marker cleanup before project configuration or watcher setup.
 		defer func() {
+			if err := removeProjectReadyMarker(logDir, worktreeID); err != nil {
+				log.Printf("Warning: failed to remove ready file on exit: %v", err)
+			}
 			if worktreeID != "" {
 				if err := daemon.RemoveWorktreePIDFile(logDir, worktreeID); err != nil {
 					log.Printf("Warning: failed to remove PID file on exit: %v", err)
@@ -1989,32 +2146,18 @@ func runWatchForeground() error {
 		}
 	}()
 
-	if isBackgroundChild {
-		defer func() {
-			if worktreeID != "" {
-				if err := daemon.RemoveWorktreeReadyFile(logDir, worktreeID); err != nil {
-					log.Printf("Warning: failed to remove ready file on exit: %v", err)
-				}
-			} else {
-				if err := daemon.RemoveReadyFile(logDir); err != nil {
-					log.Printf("Warning: failed to remove ready file on exit: %v", err)
-				}
-			}
-		}()
-	}
-
 	var initialReadyOnce sync.Once
-	initialReadyObserver := func(totalProjects int) {
+	initialReadyObserver := func(totalProjects int) error {
+		var readyErr error
 		initialReadyOnce.Do(func() {
 			if isBackgroundChild {
-				var readyErr error
 				if worktreeID != "" {
 					readyErr = daemon.WriteWorktreeReadyFile(logDir, worktreeID)
 				} else {
 					readyErr = daemon.WriteReadyFile(logDir)
 				}
 				if readyErr != nil {
-					log.Printf("Warning: failed to write ready file: %v", readyErr)
+					readyErr = fmt.Errorf("failed to write ready file: %w", readyErr)
 				}
 				return
 			}
@@ -2024,6 +2167,7 @@ func runWatchForeground() error {
 			}
 			fmt.Printf("\nWatching %d projects for changes... (Press Ctrl+C to stop)\n", totalProjects)
 		})
+		return readyErr
 	}
 
 	printLifecycle := func(project, state, note string) {
@@ -2045,14 +2189,15 @@ func runWatchForeground() error {
 		emb,
 		withWatchSupervisorBackgroundChild(isBackgroundChild),
 		withWatchSupervisorInitialLinkedWorktrees(linkedWorktrees),
-		withWatchSupervisorInitialReadySelector(func(mainRoot, currentRoot string) bool {
-			if !isBackgroundChild {
-				return true
-			}
-			return canonicalPath(mainRoot) == canonicalPath(currentRoot)
+		withWatchSupervisorInitialReadyObserver(func(_ int) error {
+			return initialReadyObserver(initialTotalProjects)
 		}),
-		withWatchSupervisorInitialReadyObserver(func(_ int) {
-			initialReadyObserver(initialTotalProjects)
+		withWatchSupervisorFatalObserver(func() {
+			if isBackgroundChild {
+				if err := removeProjectReadyMarker(logDir, worktreeID); err != nil {
+					log.Printf("Warning: failed to withdraw ready marker: %v", err)
+				}
+			}
 		}),
 		withWatchSupervisorLifecycleObserver(func(projectRoot, state, note string) {
 			switch state {
@@ -2534,6 +2679,9 @@ func startBackgroundWorkspaceWatch(logDir string, ws *config.Workspace) error {
 	if pid > 0 {
 		return fmt.Errorf("workspace watcher %s is already running (PID %d)", ws.Name, pid)
 	}
+	if err := daemon.RemoveWorkspaceReadyFile(logDir, ws.Name); err != nil {
+		return fmt.Errorf("failed to remove stale workspace ready marker: %w", err)
+	}
 
 	// Build extra args
 	var extraArgs []string
@@ -2542,7 +2690,7 @@ func startBackgroundWorkspaceWatch(logDir string, ws *config.Workspace) error {
 	}
 
 	// Spawn background process
-	childPID, exitCh, err := daemon.SpawnWorkspaceBackground(logDir, ws.Name, extraArgs)
+	childPID, exitCh, err := watchSpawnWorkspace(logDir, ws.Name, extraArgs)
 	if err != nil {
 		return fmt.Errorf("failed to start background process: %w", err)
 	}
@@ -2550,29 +2698,23 @@ func startBackgroundWorkspaceWatch(logDir string, ws *config.Workspace) error {
 	// Wait for process to become ready
 	const startupTimeout = 60 * time.Second
 	const pollInterval = 250 * time.Millisecond
-	deadline := time.Now().Add(startupTimeout)
-
 	wsLogFile := daemon.GetWorkspaceLogFile(logDir, ws.Name)
-
-	for time.Now().Before(deadline) {
-		if daemon.IsWorkspaceReady(logDir, ws.Name) {
-			fmt.Printf("Workspace watcher %s started (PID %d)\n", ws.Name, childPID)
-			fmt.Printf("Logs: %s\n", wsLogFile)
-			fmt.Printf("\nUse 'grepai watch --workspace %s --status' to check status\n", ws.Name)
-			fmt.Printf("Use 'grepai watch --workspace %s --stop' to stop the watcher\n", ws.Name)
-			return nil
-		}
-
-		select {
-		case <-exitCh:
-			return fmt.Errorf("background process failed to start (check logs at %s)", wsLogFile)
-		default:
-		}
-
-		time.Sleep(pollInterval)
+	if err := watchWaitForReady(exitCh, childPID, func(expectedPID int) bool {
+		return daemon.IsWorkspaceReadyForPID(logDir, ws.Name, expectedPID)
+	}, startupTimeout, pollInterval); err != nil {
+		primary := fmt.Errorf("workspace background process failed to become ready: %w (check logs at %s)", err, wsLogFile)
+		return abortBackgroundStart(primary, childPID, exitCh, func() error {
+			return errors.Join(
+				daemon.RemoveWorkspaceReadyFile(logDir, ws.Name),
+				daemon.RemoveWorkspacePIDFile(logDir, ws.Name),
+			)
+		})
 	}
-
-	return fmt.Errorf("timeout waiting for process to become ready (check logs at %s)", wsLogFile)
+	fmt.Printf("Workspace watcher %s started (PID %d)\n", ws.Name, childPID)
+	fmt.Printf("Logs: %s\n", wsLogFile)
+	fmt.Printf("\nUse 'grepai watch --workspace %s --status' to check status\n", ws.Name)
+	fmt.Printf("Use 'grepai watch --workspace %s --stop' to stop the watcher\n", ws.Name)
+	return nil
 }
 
 func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
@@ -2589,7 +2731,13 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		if err := daemon.WriteWorkspacePIDFile(logDir, ws.Name); err != nil {
 			return fmt.Errorf("failed to write PID file: %w", err)
 		}
+		if err := daemon.RemoveWorkspaceReadyFile(logDir, ws.Name); err != nil {
+			return fmt.Errorf("failed to clear workspace ready marker: %w", err)
+		}
 		defer func() {
+			if err := daemon.RemoveWorkspaceReadyFile(logDir, ws.Name); err != nil {
+				log.Printf("Warning: failed to remove ready file on exit: %v", err)
+			}
 			if err := daemon.RemoveWorkspacePIDFile(logDir, ws.Name); err != nil {
 				log.Printf("Warning: failed to remove PID file on exit: %v", err)
 			}
@@ -2645,62 +2793,96 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize store: %w", err)
 	}
-	defer st.Close()
+	abortStores := false
+	defer func() { closeUnlessAborted(ctx, &abortStores, st.Close) }()
 
-	runtimes := make(map[string]*workspaceProjectRuntime, len(ws.Projects))
-	watchers := make([]*watcher.Watcher, 0, len(ws.Projects))
-
-	for _, project := range ws.Projects {
-		if !isBackgroundChild {
-			fmt.Printf("\nIndexing project: %s (%s)\n", project.Name, project.Path)
-		} else {
-			log.Printf("Indexing project: %s (%s)", project.Name, project.Path)
-		}
-
-		runtime, w, rtErr := initializeWorkspaceRuntime(ctx, ws, project, emb, st, isBackgroundChild)
-		if rtErr != nil {
-			log.Printf("Warning: failed to initialize runtime for %s: %v", project.Name, rtErr)
-			continue
-		}
-
-		projectKey := canonicalPath(project.Path)
-		runtimes[projectKey] = runtime
-		watchers = append(watchers, w)
+	runtimes, watchers, err := initializeWorkspaceRuntimes(ctx, ws, emb, st, isBackgroundChild, initializeWorkspaceRuntime)
+	if err != nil {
+		abortStores = isFatalWatcherError(err)
+		return err
 	}
 
+	var closeWatchersOnce sync.Once
+	closeWatchers := func() { closeWatchersOnce.Do(func() { closeWatchSources(watchers) }) }
+	abortWatcherClose := false
 	defer func() {
-		for _, w := range watchers {
-			w.Close()
+		if !abortWatcherClose {
+			closeWatchers()
 		}
-		for _, runtime := range runtimes {
-			if runtime.symbolStore != nil {
-				if err := runtime.symbolStore.Close(); err != nil {
-					log.Printf("Warning: failed to close symbol store for %s: %v", runtime.project.Path, err)
-				}
-			}
-			if runtime.rpgStore != nil {
-				if err := runtime.rpgStore.Close(); err != nil {
-					log.Printf("Warning: failed to close RPG store for %s: %v", runtime.project.Path, err)
-				}
-			}
+		if !abortStores {
+			closeWorkspaceStores(runtimes)
 		}
 	}()
 
-	// Write ready file
-	if isBackgroundChild {
-		if err := daemon.WriteWorkspaceReadyFile(logDir, ws.Name); err != nil {
-			return fmt.Errorf("failed to write ready file: %w", err)
+	// Collect events from all watchers
+	eventChan := make(chan workspaceWatchEvent, 100)
+	fatalChan := make(chan error, 1)
+	forwardCtx, stopForwarders := context.WithCancel(ctx)
+	defer stopForwarders()
+	mutationFence := newWatchMutationFence()
+	for _, w := range watchers {
+		if !mutationFence.addWatcher(w) {
+			abortStores = true
+			abortWatcherClose = true
+			abortWatchSources(watchers)
+			return errWatchMutationAdmissionClosed
 		}
-		defer func() {
-			if err := daemon.RemoveWorkspaceReadyFile(logDir, ws.Name); err != nil {
-				log.Printf("Warning: failed to remove ready file on exit: %v", err)
+		defer mutationFence.removeWatcher(w)
+	}
+	workerCtx, stopWorkers := context.WithCancel(ctx)
+	defer stopWorkers()
+	workers := make([]watchMutationWorker, 0, len(runtimes))
+	for _, runtime := range runtimes {
+		worker := startRPGRealtimeWorkers(workerCtx, mutationFence, fmt.Sprintf("workspace:%s/%s", ws.Name, runtime.project.Name), runtime.symbolStore, runtime.rpgEncoder, runtime.rpgStore, runtime.cfg.Watch, runtime.manager)
+		workers = append(workers, worker)
+	}
+	for _, worker := range workers {
+		<-worker.started
+	}
+	withdrawReadiness := func() {
+		if isBackgroundChild {
+			if removeErr := daemon.RemoveWorkspaceReadyFile(logDir, ws.Name); removeErr != nil {
+				log.Printf("Warning: failed to withdraw workspace ready marker: %v", removeErr)
 			}
-		}()
+		}
+	}
+	for _, runtime := range runtimes {
+		runtime := runtime
+		if runtime.watcher == nil {
+			continue
+		}
+		go forwardWorkspaceWatcher(forwardCtx, runtime, eventChan)
+		go monitorWorkspaceWatcher(forwardCtx, runtime, mutationFence, func() { abortWatchSources(watchers) }, withdrawReadiness, fatalChan)
+	}
+
+	// Publish readiness only while every watcher excludes fatal publication.
+	if isBackgroundChild {
+		select {
+		case fatalErr := <-fatalChan:
+			abortStores = true
+			abortWatcherClose = true
+			stopForwarders()
+			abortWatchSources(watchers)
+			return fatalErr
+		default:
+		}
+		if err := publishWorkspaceReadiness(
+			mutationFence, watchers, ws.Name,
+			func() error { return daemon.WriteWorkspaceReadyFile(logDir, ws.Name) },
+			func() {
+				withdrawReadiness()
+			},
+			&abortStores, &abortWatcherClose,
+		); err != nil {
+			stopForwarders()
+			return err
+		}
 	}
 
 	// Handle signals
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigChan)
 	wsStopCh := daemon.StopChannel()
 
 	if !isBackgroundChild {
@@ -2709,102 +2891,31 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		log.Printf("Watching %d projects for changes...", len(runtimes))
 	}
 
-	// Collect events from all watchers
-	eventChan := make(chan workspaceWatchEvent, 100)
-	for _, runtime := range runtimes {
-		runtime := runtime
-		if runtime.watcher == nil {
-			continue
-		}
-		go func() {
-			for event := range runtime.watcher.Events() {
-				eventChan <- workspaceWatchEvent{
-					projectPath: runtime.project.Path,
-					event:       event,
-				}
-			}
-		}()
-	}
-
-	// persistAndShutdown persists all stores before returning from the event loop.
-	persistAndShutdown := func() {
-		if err := st.Persist(ctx); err != nil {
-			log.Printf("Warning: failed to persist index on shutdown: %v", err)
-		}
-		for _, runtime := range runtimes {
-			if err := runtime.symbolStore.Persist(ctx); err != nil {
-				log.Printf("Warning: failed to persist symbol index on shutdown for %s: %v", runtime.project.Name, err)
-			}
-			if runtime.rpgStore != nil {
-				if err := runtime.rpgStore.Persist(ctx); err != nil {
-					log.Printf("Warning: failed to persist RPG graph on shutdown for %s: %v", runtime.project.Name, err)
-				}
-			}
-		}
-	}
-
-	// Event loop
 	persistTicker := time.NewTicker(30 * time.Second)
 	defer persistTicker.Stop()
-
-	for {
-		select {
-		case <-sigChan:
-			if !isBackgroundChild {
-				fmt.Println("\nShutting down...")
-			} else {
-				log.Println("Shutting down...")
-			}
-			persistAndShutdown()
-			return nil
-
-		case <-wsStopCh:
-			log.Println("Stop file detected, shutting down...")
-			persistAndShutdown()
-			return nil
-
-		case <-persistTicker.C:
-			if err := st.Persist(ctx); err != nil {
-				log.Printf("Warning: failed to persist index: %v", err)
-			}
-			for _, runtime := range runtimes {
-				if err := runtime.symbolStore.Persist(ctx); err != nil {
-					log.Printf("Warning: failed to persist symbol index for %s: %v", runtime.project.Name, err)
-				}
-				if runtime.rpgStore != nil {
-					if err := runtime.rpgStore.Persist(ctx); err != nil {
-						log.Printf("Warning: failed to persist RPG graph for %s: %v", runtime.project.Name, err)
-					}
-				}
-			}
-
-		case event := <-eventChan:
-			projectKey := canonicalPath(event.projectPath)
-			runtime := runtimes[projectKey]
-			if runtime == nil {
-				log.Printf("Warning: received event for unknown runtime: %s", event.projectPath)
-				continue
-			}
-			handleFileEvent(
-				ctx,
-				runtime.idx,
-				runtime.scanner,
-				runtime.extractor,
-				runtime.symbolStore,
-				runtime.rpgEncoder,
-				runtime.vectorStore,
-				runtime.tracedLanguages,
-				runtime.project.Path,
-				runtime.cfg,
-				&runtime.lastConfigWrite,
-				runtime.manager,
-				event.event,
-				nil,
-				nil,
-				runtime.processor,
-			)
-		}
+	err = runWorkspaceWatchLoop(&workspaceWatchLoop{
+		ctx:               ctx,
+		store:             st,
+		runtimes:          runtimes,
+		watchers:          watchers,
+		fence:             mutationFence,
+		events:            eventChan,
+		fatals:            fatalChan,
+		signals:           sigChan,
+		stops:             wsStopCh,
+		persistTicks:      persistTicker.C,
+		stopForwarders:    stopForwarders,
+		stopWorkers:       stopWorkers,
+		workers:           workers,
+		withdrawReadiness: withdrawReadiness,
+		isBackgroundChild: isBackgroundChild,
+		scope:             ws.Name,
+	})
+	if err != nil {
+		abortStores = true
+		abortWatcherClose = true
 	}
+	return err
 }
 
 func acquireWorkspaceProjectWriterLocks(projects []config.ProjectEntry) ([]*fileutil.ProjectWriterLock, error) {
@@ -2841,10 +2952,10 @@ type workspaceProjectRuntime struct {
 	tracedLanguages []string
 	lastConfigWrite time.Time
 	manager         *rpgRealtimeManager
-	watcher         *watcher.Watcher
+	watcher         watchSource
 }
 
-func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, project config.ProjectEntry, emb embedder.Embedder, sharedStore store.VectorStore, isBackgroundChild bool) (*workspaceProjectRuntime, *watcher.Watcher, error) {
+func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, project config.ProjectEntry, emb embedder.Embedder, sharedStore store.VectorStore, isBackgroundChild bool) (*workspaceProjectRuntime, watchSource, error) {
 	projectCfg := config.DefaultConfig()
 	if config.Exists(project.Path) {
 		loadedCfg, err := config.Load(project.Path)
@@ -2939,23 +3050,28 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		}
 
 		manager = newRPGRealtimeManager(projectCfg.Watch.RPGMaxDirtyFilesPerBatch)
-		startRPGRealtimeWorkers(ctx, fmt.Sprintf("workspace:%s/%s", ws.Name, project.Name), symbolStore, rpgEncoder, rpgStore, projectCfg.Watch, manager)
 	}
 
 	w, err := watcher.NewWatcher(project.Path, ignoreMatcher, projectCfg.Watch.DebounceMs)
 	if err != nil {
-		if rpgStore != nil {
-			_ = rpgStore.Close()
+		if !isFatalWatcherError(err) {
+			if rpgStore != nil {
+				_ = rpgStore.Close()
+			}
+			_ = symbolStore.Close()
 		}
-		_ = symbolStore.Close()
 		return nil, nil, fmt.Errorf("failed to create watcher: %w", err)
 	}
 	if err := w.Start(ctx); err != nil {
-		w.Close()
-		if rpgStore != nil {
-			_ = rpgStore.Close()
+		if isFatalWatcherError(err) {
+			w.Abort()
+		} else {
+			_ = w.Close()
+			if rpgStore != nil {
+				_ = rpgStore.Close()
+			}
+			_ = symbolStore.Close()
 		}
-		_ = symbolStore.Close()
 		return nil, nil, fmt.Errorf("failed to start watcher: %w", err)
 	}
 

@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
 )
 
 // PostgresSymbolStore stores symbol and trace data incrementally in Postgres.
@@ -157,7 +158,28 @@ func (s *PostgresSymbolStore) GetFileExtractorVersion(filePath string) (string, 
 	return value, err == nil
 }
 
-func (s *PostgresSymbolStore) Load(ctx context.Context) error {
+func (s *PostgresSymbolStore) Load(ctx context.Context) (retErr error) {
+	if err := s.ensureSchema(ctx); err != nil {
+		return err
+	}
+	completed, err := s.migrationCompletedWithoutGOB(ctx)
+	if err != nil {
+		return err
+	}
+	if completed {
+		return nil
+	}
+	writerLock, err := fileutil.AcquireProjectWriterLock(s.projectRoot)
+	if err != nil {
+		return fmt.Errorf("failed to acquire project writer lock for Postgres symbol migration: %w", err)
+	}
+	defer func() { retErr = errors.Join(retErr, writerLock.Close()) }()
+	return s.migrateGOBIfNeeded(ctx)
+}
+
+// LoadWithProjectWriterLockHeld loads migration state while the caller holds
+// the project writer lock for the lifetime of this operation.
+func (s *PostgresSymbolStore) LoadWithProjectWriterLockHeld(ctx context.Context) error {
 	if err := s.ensureSchema(ctx); err != nil {
 		return err
 	}

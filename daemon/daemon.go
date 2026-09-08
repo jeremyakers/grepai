@@ -218,6 +218,7 @@ func GetRunningPID(logDir string) (int, error) {
 	if !IsProcessRunning(pid) {
 		// Stale PID file - clean it up (best effort, ignore errors)
 		_ = RemovePIDFile(logDir)
+		_ = RemoveReadyFile(logDir)
 		return 0, nil
 	}
 
@@ -409,6 +410,7 @@ func GetRunningWorktreePID(logDir, worktreeID string) (int, error) {
 	// Check if process is actually running
 	if !IsProcessRunning(pid) {
 		_ = RemoveWorktreePIDFile(logDir, worktreeID)
+		_ = RemoveWorktreeReadyFile(logDir, worktreeID)
 		return 0, nil
 	}
 
