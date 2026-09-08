@@ -2079,6 +2079,16 @@ func extractSymbolsWithFramework(ctx context.Context, extractor trace.SymbolExtr
 }
 
 func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore *trace.GOBSymbolStore, rpgEncoder *rpg.RPGEncoder, vectorStore store.VectorStore, enabledLanguages []string, projectRoot string, cfg *config.Config, lastConfigWrite *time.Time, rpgManager *rpgRealtimeManager, event watcher.FileEvent, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) {
+	if event.IsDir && (event.Type == watcher.EventDelete || event.Type == watcher.EventRename) {
+		dispatch := func(fileEvent watcher.FileEvent) {
+			handleFileEvent(ctx, idx, scanner, extractor, symbolStore, rpgEncoder, vectorStore, enabledLanguages, projectRoot, cfg, lastConfigWrite, rpgManager, fileEvent, onActivity, onStats, processors...)
+		}
+		if err := reconcileDeletedDirectory(ctx, projectRoot, event.Path, vectorStore, symbolStore, dispatch); err != nil {
+			log.Printf("Failed to reconcile deleted directory %s: %v", event.Path, err)
+		}
+		return
+	}
+
 	// An atomic write -- write to a temp file, then rename it over the target
 	// -- surfaces on the destination path as RENAME/REMOVE with no follow-up
 	// CREATE or WRITE. Editors and coding agents (Claude Code, Cursor) save
@@ -2088,10 +2098,19 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 	// to a regular file; a genuine delete leaves nothing to stat.
 	eventType := event.Type
 	if eventType == watcher.EventDelete || eventType == watcher.EventRename {
-		if info, err := os.Stat(filepath.Join(projectRoot, event.Path)); err == nil && info.Mode().IsRegular() {
-			log.Printf("Treating %s of %s as a modification: file is still on disk (atomic write)", eventType.String(), event.Path)
-			eventType = watcher.EventModify
+		qualifiedType, err := requalifyRemovedFile(projectRoot, event, os.Lstat)
+		if errors.Is(err, errWatchPathReplaced) {
+			log.Printf("Preserving %s after removal event: path has a non-regular replacement", event.Path)
+			return
 		}
+		if err != nil {
+			log.Printf("Preserving %s after failed deletion check: %v", event.Path, err)
+			return
+		}
+		if qualifiedType == watcher.EventModify {
+			log.Printf("Treating %s of %s as a modification: file is still on disk (atomic write)", eventType.String(), event.Path)
+		}
+		eventType = qualifiedType
 	}
 
 	if onActivity != nil {
