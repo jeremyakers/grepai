@@ -16,22 +16,28 @@ import (
 )
 
 type Indexer struct {
-	root          string
-	store         store.VectorStore
-	embedder      embedder.Embedder
-	chunker       *Chunker
-	scanner       *Scanner
-	processor     *framework.ProcessorRegistry
-	lastIndexTime time.Time
+	root      string
+	store     store.VectorStore
+	embedder  embedder.Embedder
+	chunker   *Chunker
+	scanner   *Scanner
+	processor *framework.ProcessorRegistry
 }
 
 type IndexStats struct {
-	FilesIndexed  int
-	FilesSkipped  int
-	ChunksCreated int
-	FilesRemoved  int
-	Duration      time.Duration
-	ScannedFiles  []FileMeta // All files found during scan (for reuse by callers)
+	FilesIndexed           int
+	FilesSkipped           int
+	ChunksCreated          int
+	FilesRemoved           int
+	Duration               time.Duration
+	ScannedFiles           []FileMeta // All files found during scan (for reuse by callers)
+	VerifiedUnchangedFiles map[string]VerifiedFile
+}
+
+type VerifiedFile struct {
+	Hash    string
+	Size    int64
+	ModTime time.Time
 }
 
 // ProgressInfo contains progress information for indexing
@@ -67,19 +73,14 @@ func NewIndexer(
 	lastIndexTime time.Time,
 	processors ...*framework.ProcessorRegistry,
 ) *Indexer {
+	_ = lastIndexTime // Deprecated: exact per-file observations govern reconciliation.
 	var processor *framework.ProcessorRegistry
 	if len(processors) > 0 {
 		processor = processors[0]
 	}
 
 	return &Indexer{
-		root:          root,
-		store:         st,
-		embedder:      emb,
-		chunker:       chunker,
-		scanner:       scanner,
-		processor:     processor,
-		lastIndexTime: lastIndexTime,
+		root: root, store: st, embedder: emb, chunker: chunker, scanner: scanner, processor: processor,
 	}
 }
 
@@ -97,32 +98,19 @@ func (idx *Indexer) IndexAllWithProgress(ctx context.Context, onProgress Progres
 // When the embedder implements BatchEmbedder, files are processed in parallel using cross-file batching.
 func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress ProgressCallback, onBatchProgress BatchProgressCallback) (*IndexStats, error) {
 	start := time.Now()
-	stats := &IndexStats{}
+	stats := &IndexStats{VerifiedUnchangedFiles: make(map[string]VerifiedFile)}
 
 	// Scan all files (metadata-only first pass)
-	fileMetas, skipped, err := idx.scanner.ScanMetadata()
+	fileMetas, skipped, err := idx.scanMetadataForReconciliation(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan files: %w", err)
 	}
 	stats.FilesSkipped = len(skipped)
 	stats.ScannedFiles = fileMetas
 
-	// Get existing documents
-	existingDocs, err := idx.store.ListDocuments(ctx)
+	existingDocs, err := idx.loadExistingDocumentMetadata(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list documents: %w", err)
-	}
-
-	existingMap := make(map[string]bool)
-	for _, doc := range existingDocs {
-		existingMap[doc] = true
-	}
-
-	// Every scanned file is accounted for exactly once: it either still exists
-	// (and is removed from existingMap below) or it was deleted from disk and
-	// stays in existingMap so it gets removed from the index further down.
-	for _, fileMeta := range fileMetas {
-		delete(existingMap, fileMeta.Path)
+		return nil, fmt.Errorf("failed to load document metadata: %w", err)
 	}
 
 	// Decide which files need (re)indexing. Each file's decision only depends
@@ -140,7 +128,11 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	for i := range fileMetas {
 		fileMeta := fileMetas[i]
 		g.Go(func() error {
-			decision, err := idx.decideFileScan(gctx, fileMeta)
+			var existing *store.DocumentMetadata
+			if meta, ok := existingDocs[fileMeta.Path]; ok {
+				existing = &meta
+			}
+			decision, err := idx.decideFileScanFromMeta(gctx, fileMeta, existing)
 			if err != nil {
 				return fmt.Errorf("failed to get document %s: %w", fileMeta.Path, err)
 			}
@@ -170,6 +162,9 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		}
 		if decision.file != nil {
 			filesToIndex = append(filesToIndex, *decision.file)
+		}
+		if decision.verified != nil {
+			stats.VerifiedUnchangedFiles[decision.verifiedPath] = *decision.verified
 		}
 	}
 
@@ -211,68 +206,19 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		}
 	}
 
-	// Remove deleted files
-	for path := range existingMap {
-		if err := idx.RemoveFile(ctx, path); err != nil {
-			log.Printf("Failed to remove %s: %v", path, err)
-			continue
+	for i, fileMeta := range fileMetas {
+		if !decisions[i].missingAfterWalk {
+			delete(existingDocs, fileMeta.Path)
 		}
-		stats.FilesRemoved++
 	}
+	removed, err := idx.removeMissingFiles(ctx, existingDocs)
+	if err != nil {
+		return nil, err
+	}
+	stats.FilesRemoved = removed
 
 	stats.Duration = time.Since(start)
 	return stats, nil
-}
-
-// fileScanDecision is the outcome of deciding whether a single scanned file
-// needs (re)indexing.
-type fileScanDecision struct {
-	// file is non-nil when the file needs (re)indexing.
-	file *FileInfo
-	// countAsSkipped mirrors the original sequential bookkeeping: mtime-gated
-	// skips and unreadable/binary/oversized files count toward
-	// stats.FilesSkipped, but files that are unchanged (same content hash)
-	// do not -- matching the pre-existing (sequential) behavior exactly.
-	countAsSkipped bool
-}
-
-// decideFileScan fetches a file's existing document (if any) and determines
-// whether it needs (re)indexing, following the same rules as the original
-// sequential loop: an mtime fast-path gate, then a content-hash comparison
-// for files that need a closer look. It is safe to call concurrently for
-// different files -- it only reads from the store and the filesystem.
-func (idx *Indexer) decideFileScan(ctx context.Context, fileMeta FileMeta) (fileScanDecision, error) {
-	// Fetch the document once -- used by both the mod-time gate and hash check.
-	doc, err := idx.store.GetDocument(ctx, fileMeta.Path)
-	if err != nil {
-		return fileScanDecision{}, err
-	}
-
-	// Skip files modified before lastIndexTime -- but only if they have chunks.
-	// Files with no chunks need re-indexing even if their mod_time is old
-	// (e.g., a prior indexing run created the document but failed to embed).
-	if !idx.lastIndexTime.IsZero() && doc != nil && len(doc.ChunkIDs) > 0 {
-		fileModTime := time.Unix(fileMeta.ModTime, 0)
-		if fileModTime.Before(idx.lastIndexTime) || fileModTime.Equal(idx.lastIndexTime) {
-			return fileScanDecision{countAsSkipped: true}, nil
-		}
-	}
-
-	// Load file content and hash only after metadata filtering.
-	file, err := idx.scanner.ScanFile(fileMeta.Path)
-	if err != nil {
-		log.Printf("Failed to scan %s: %v", fileMeta.Path, err)
-		return fileScanDecision{countAsSkipped: true}, nil
-	}
-	if file == nil {
-		return fileScanDecision{countAsSkipped: true}, nil
-	}
-
-	if doc != nil && doc.Hash == file.Hash && len(doc.ChunkIDs) > 0 {
-		return fileScanDecision{}, nil // File unchanged and has chunks
-	}
-
-	return fileScanDecision{file: file}, nil
 }
 
 // scanWorkerLimit returns the number of concurrent workers to use when
@@ -410,12 +356,8 @@ func (idx *Indexer) saveFileData(ctx context.Context, fd fileChunkData, chunks [
 		return fmt.Errorf("failed to save chunks for %s: %w", fd.file.Path, err)
 	}
 
-	doc := store.Document{
-		Path:     fd.file.Path,
-		Hash:     fd.file.Hash,
-		ModTime:  time.Unix(fd.file.ModTime, 0),
-		ChunkIDs: chunkIDs,
-	}
+	modTime, exactModTime := persistedFileModTime(fd.file)
+	doc := store.Document{Path: fd.file.Path, Hash: fd.file.Hash, ModTime: modTime, HasExactModTime: exactModTime, ChunkIDs: chunkIDs}
 
 	if err := idx.store.SaveDocument(ctx, doc); err != nil {
 		return fmt.Errorf("failed to save document for %s: %w", fd.file.Path, err)
@@ -675,12 +617,8 @@ func (idx *Indexer) IndexFile(ctx context.Context, file FileInfo) (int, error) {
 	}
 
 	// Save document metadata
-	doc := store.Document{
-		Path:     file.Path,
-		Hash:     file.Hash,
-		ModTime:  time.Unix(file.ModTime, 0),
-		ChunkIDs: chunkIDs,
-	}
+	modTime, exactModTime := persistedFileModTime(file)
+	doc := store.Document{Path: file.Path, Hash: file.Hash, ModTime: modTime, HasExactModTime: exactModTime, ChunkIDs: chunkIDs}
 
 	if err := idx.store.SaveDocument(ctx, doc); err != nil {
 		return 0, fmt.Errorf("failed to save document: %w", err)
