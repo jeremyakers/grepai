@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/trace"
@@ -60,8 +62,28 @@ func writeTraceProject(t *testing.T, root string, symbols []trace.Symbol, refs [
 }
 
 func TestTraceCommandsProjectResolveBatchAndFallback(t *testing.T) {
-	// Given a real project GOB containing resolved and unresolved references.
+	const (
+		childMarker = "GREPAI_TEST_TRACE_PROJECT_RESOLVE_CHILD"
+		rootEnv     = "GREPAI_TEST_TRACE_PROJECT_RESOLVE_ROOT"
+	)
+	if os.Getenv(childMarker) == "1" {
+		testTraceCommandsProjectResolveBatchAndFallback(t, os.Getenv(rootEnv))
+		return
+	}
+
 	root := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestTraceCommandsProjectResolveBatchAndFallback$")
+	cmd.Env = append(os.Environ(), childMarker+"=1", rootEnv+"="+root)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("trace project resolve child helper failed: %v\n%s", err, output)
+	}
+}
+
+func testTraceCommandsProjectResolveBatchAndFallback(t *testing.T, root string) {
+	t.Helper()
+	// Given a real project GOB containing resolved and unresolved references.
 	writeTraceProject(t, root, []trace.Symbol{
 		{Name: "Target", File: "target.go", Line: 1},
 		{Name: "Caller", File: "caller.go", Line: 2},
