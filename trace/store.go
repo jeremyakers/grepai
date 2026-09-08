@@ -313,6 +313,9 @@ func (s *GOBSymbolStore) LookupSymbol(ctx context.Context, name string) ([]Symbo
 }
 
 // LookupSymbolsBatch finds symbol definitions grouped by name.
+// The returned slices are caller-owned: mutating them must not alter the
+// store's in-memory index (or its persisted form). A shallow element copy is
+// sufficient because Symbol fields are all value types.
 func (s *GOBSymbolStore) LookupSymbolsBatch(ctx context.Context, names []string) (map[string][]Symbol, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -325,7 +328,9 @@ func (s *GOBSymbolStore) LookupSymbolsBatch(ctx context.Context, names []string)
 		}
 		seen[name] = struct{}{}
 		if symbols, ok := s.index.Symbols[name]; ok {
-			result[name] = symbols
+			owned := make([]Symbol, len(symbols))
+			copy(owned, symbols)
+			result[name] = owned
 		}
 	}
 	return result, nil
