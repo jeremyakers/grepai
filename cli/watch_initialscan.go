@@ -64,6 +64,9 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	if err != nil {
 		return nil, fmt.Errorf("initial indexing failed: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	announceInitialScanComplete(stats, background)
 	if err := removeOfflineSymbolFiles(ctx, scanner, symbolStore, fingerprints.snapshot, stats.ScannedFiles, stats.ExcludedFiles); err != nil {
 		return nil, err
@@ -142,8 +145,14 @@ func indexInitialSymbols(ctx context.Context, scanner *indexer.Scanner, extracto
 		}
 		symbols, refs, err := extractSymbolsWithFramework(ctx, extractor, info.Path, info.Content, processors...)
 		if err != nil {
+			if ctx.Err() != nil {
+				return count, ctx.Err()
+			}
 			log.Printf("Warning: failed to extract symbols from %s: %v", info.Path, err)
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return count, err
 		}
 		err = symbolStore.SaveFileWithSignature(ctx, info.Path, info.Hash, extractor.Version(), symbols, refs)
 		if err != nil {

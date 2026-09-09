@@ -21,7 +21,7 @@ type watchMutationFence struct {
 	idle          chan struct{}
 	failed        chan struct{}
 	nextID        uint64
-	cancellations map[uint64]context.CancelFunc
+	cancellations map[uint64]context.CancelCauseFunc
 }
 
 type watchMutationWorker struct {
@@ -67,7 +67,7 @@ func (f *watchMutationFence) initializeLocked() {
 		close(f.idle)
 	}
 	if f.cancellations == nil {
-		f.cancellations = make(map[uint64]context.CancelFunc)
+		f.cancellations = make(map[uint64]context.CancelCauseFunc)
 	}
 }
 
@@ -115,24 +115,24 @@ func (f *watchMutationFence) publishReadiness(publish func() error) error {
 	return withWatchSourcesReady(f.watchers, publish)
 }
 
-func (f *watchMutationFence) handle(parent context.Context, mutate func(context.Context)) error {
+func (f *watchMutationFence) admit(parent context.Context) (context.Context, func(), error) {
 	f.mu.Lock()
 	f.initializeLocked()
 	if f.closed {
 		err := f.closedErrorLocked()
 		f.mu.Unlock()
-		return err
+		return nil, nil, err
 	}
 	if err := parent.Err(); err != nil {
 		f.mu.Unlock()
-		return err
+		return nil, nil, err
 	}
 
-	var eventCtx context.Context
-	var cancel context.CancelFunc
+	var operationCtx context.Context
+	var cancel context.CancelCauseFunc
 	var id uint64
 	err := withWatchSourcesReady(f.watchers, func() error {
-		eventCtx, cancel = context.WithCancel(parent)
+		operationCtx, cancel = context.WithCancelCause(parent)
 		if f.active == 0 {
 			f.idle = make(chan struct{})
 		}
@@ -144,11 +144,56 @@ func (f *watchMutationFence) handle(parent context.Context, mutate func(context.
 	})
 	f.mu.Unlock()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 
+	var finishOnce sync.Once
+	finish := func() {
+		finishOnce.Do(func() {
+			cancel(nil)
+			f.mu.Lock()
+			delete(f.cancellations, id)
+			f.active--
+			if f.active == 0 {
+				close(f.idle)
+			}
+			f.mu.Unlock()
+		})
+	}
+	return operationCtx, finish, nil
+}
+
+func (f *watchMutationFence) handle(parent context.Context, mutate func(context.Context)) error {
+	operationCtx, finish, err := f.admit(parent)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	mutate(operationCtx)
+	return nil
+}
+
+// cleanup admits persistence-bearing teardown without inheriting graceful
+// parent cancellation. Fatal closure either rejects it or waits for it.
+func (f *watchMutationFence) cleanup(parent context.Context, cleanup func()) {
+	f.mu.Lock()
+	f.initializeLocked()
+	if f.closed || isFatalWatcherError(context.Cause(parent)) {
+		f.mu.Unlock()
+		return
+	}
+	operationCtx, cancel := context.WithCancelCause(context.WithoutCancel(parent))
+	if f.active == 0 {
+		f.idle = make(chan struct{})
+	}
+	f.active++
+	f.nextID++
+	id := f.nextID
+	f.cancellations[id] = cancel
+	f.mu.Unlock()
+
 	defer func() {
-		cancel()
+		cancel(nil)
 		f.mu.Lock()
 		delete(f.cancellations, id)
 		f.active--
@@ -157,8 +202,9 @@ func (f *watchMutationFence) handle(parent context.Context, mutate func(context.
 		}
 		f.mu.Unlock()
 	}()
-	mutate(eventCtx)
-	return nil
+	if !isFatalWatcherError(context.Cause(operationCtx)) {
+		cleanup()
+	}
 }
 
 func (f *watchMutationFence) fail(withdraw func()) {
@@ -186,7 +232,7 @@ func (f *watchMutationFence) failWithCause(cause error, afterClose, withdraw fun
 	f.cause = cause
 	f.failed = make(chan struct{})
 	failed := f.failed
-	cancels := make([]context.CancelFunc, 0, len(f.cancellations))
+	cancels := make([]context.CancelCauseFunc, 0, len(f.cancellations))
 	for _, cancel := range f.cancellations {
 		cancels = append(cancels, cancel)
 	}
@@ -194,7 +240,7 @@ func (f *watchMutationFence) failWithCause(cause error, afterClose, withdraw fun
 	f.mu.Unlock()
 
 	for _, cancel := range cancels {
-		cancel()
+		cancel(cause)
 	}
 	if afterClose != nil {
 		afterClose()

@@ -26,6 +26,17 @@ func closeUnlessAborted(ctx context.Context, aborted *bool, closeFn func() error
 	}
 }
 
+func closeWithMutationFence(ctx context.Context, fence *watchMutationFence, aborted *bool, closeFn func() error) {
+	if *aborted {
+		return
+	}
+	fence.cleanup(ctx, func() {
+		if !*aborted {
+			_ = closeFn()
+		}
+	})
+}
+
 func abortWatcherReadiness(abortStores *bool, watchers []watchSource, scope string, err error, onFatal func()) error {
 	*abortStores = true
 	if onFatal != nil {
