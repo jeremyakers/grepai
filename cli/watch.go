@@ -2080,9 +2080,50 @@ func extractSymbolsWithFramework(ctx context.Context, extractor trace.SymbolExtr
 }
 
 func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore *trace.GOBSymbolStore, rpgEncoder *rpg.RPGEncoder, vectorStore store.VectorStore, enabledLanguages []string, projectRoot string, cfg *config.Config, lastConfigWrite *time.Time, rpgManager *rpgRealtimeManager, event watcher.FileEvent, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) {
+	forgetIndex := func(path string, eventType watcher.EventType) {
+		var oldChunkCount, oldSymbolCount int
+		if vectorStore != nil {
+			if doc, err := vectorStore.GetDocument(ctx, path); err == nil && doc != nil {
+				oldChunkCount = len(doc.ChunkIDs)
+			}
+		}
+		if symbolStore != nil {
+			if syms, err := symbolStore.GetSymbolsForFile(ctx, path); err == nil {
+				oldSymbolCount = len(syms)
+			}
+		}
+		if onActivity != nil {
+			onActivity("removing", path)
+			defer onActivity("steady", "")
+		}
+		start := time.Now()
+		if err := idx.RemoveFile(ctx, path); err != nil {
+			log.Printf("Failed to remove %s from index: %v", path, err)
+			return
+		}
+		if err := symbolStore.DeleteFile(ctx, path); err != nil {
+			log.Printf("Failed to remove symbols for %s: %v", path, err)
+		}
+		if onStats != nil {
+			onStats(projectRoot, watchStatsDelta{FilesRemoved: 1, ChunksRemoved: oldChunkCount, SymbolsLost: oldSymbolCount})
+		}
+		if rpgEncoder != nil {
+			if err := rpgEncoder.HandleFileEvent(ctx, "delete", path, nil); err != nil {
+				log.Printf("Warning: failed to update RPG for deleted %s: %v", path, err)
+			} else if rpgManager != nil {
+				rpgManager.MarkFileDirty(path)
+				dirtyCount, _, _, _ := rpgManager.Snapshot()
+				log.Printf("rpg_event_applied_ms=%d file=%s event=%s rpg_dirty_files_count=%d", time.Since(start).Milliseconds(), path, eventType.String(), dirtyCount)
+			}
+		}
+		log.Printf("Removed %s from index", path)
+	}
+
 	if event.IsDir {
-		dispatch := func(fileEvent watcher.FileEvent) {
-			if (fileEvent.Type == watcher.EventCreate || fileEvent.Type == watcher.EventModify) && !scanner.ShouldIndexPath(fileEvent.Path) {
+		dispatch := func(action directoryAction) {
+			fileEvent := action.event
+			if action.kind == directoryActionForgetIndex || ((fileEvent.Type == watcher.EventCreate || fileEvent.Type == watcher.EventModify) && !scanner.ShouldIndexPath(fileEvent.Path)) {
+				forgetIndex(fileEvent.Path, watcher.EventDelete)
 				return
 			}
 			handleFileEvent(ctx, idx, scanner, extractor, symbolStore, rpgEncoder, vectorStore, enabledLanguages, projectRoot, cfg, lastConfigWrite, rpgManager, fileEvent, onActivity, onStats, processors...)
@@ -2115,6 +2156,10 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			log.Printf("Treating %s of %s as a modification: file is still on disk (atomic write)", eventType.String(), event.Path)
 		}
 		eventType = qualifiedType
+	}
+	if eventType == watcher.EventDelete || eventType == watcher.EventRename {
+		forgetIndex(event.Path, eventType)
+		return
 	}
 
 	if onActivity != nil {
@@ -2242,40 +2287,6 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			}
 		}
 
-	case watcher.EventDelete, watcher.EventRename:
-		start := time.Now()
-		if err := idx.RemoveFile(ctx, event.Path); err != nil {
-			log.Printf("Failed to remove %s from index: %v", event.Path, err)
-			return
-		}
-		// Also remove from symbol index
-		if err := symbolStore.DeleteFile(ctx, event.Path); err != nil {
-			log.Printf("Failed to remove symbols for %s: %v", event.Path, err)
-		}
-
-		if onStats != nil {
-			onStats(projectRoot, watchStatsDelta{
-				FilesRemoved:  1,
-				ChunksRemoved: oldChunkCount,
-				SymbolsLost:   oldSymbolCount,
-			})
-		}
-
-		if rpgEncoder != nil {
-			if err := rpgEncoder.HandleFileEvent(ctx, "delete", event.Path, nil); err != nil {
-				log.Printf("Warning: failed to update RPG for deleted %s: %v", event.Path, err)
-			} else if rpgManager != nil {
-				rpgManager.MarkFileDirty(event.Path)
-				dirtyCount, _, _, _ := rpgManager.Snapshot()
-				log.Printf("rpg_event_applied_ms=%d file=%s event=%s rpg_dirty_files_count=%d",
-					time.Since(start).Milliseconds(),
-					event.Path,
-					eventType.String(),
-					dirtyCount,
-				)
-			}
-		}
-		log.Printf("Removed %s from index", event.Path)
 	}
 }
 

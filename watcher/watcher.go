@@ -42,6 +42,7 @@ type Watcher struct {
 	events        chan FileEvent
 	done          chan struct{}
 	directories   map[string]struct{}
+	registered    map[string]struct{}
 	directoriesMu sync.Mutex
 
 	// Debouncing state
@@ -83,6 +84,7 @@ func NewWatcher(root string, ignore *indexer.IgnoreMatcher, debounceMs int, opts
 		done:        make(chan struct{}),
 		pending:     make(map[string]FileEvent),
 		directories: make(map[string]struct{}),
+		registered:  make(map[string]struct{}),
 		flushReady:  make(chan struct{}, 1),
 	}
 	for _, opt := range opts {
@@ -174,17 +176,9 @@ func (w *Watcher) handleEvent(event fsnotify.Event) error {
 		return w.ignore.RefreshSubtree(scope)
 	}
 
-	// Hidden paths are never watched or indexed.
-	if strings.HasPrefix(filepath.Base(relPath), ".") {
-		return nil
-	}
-
 	if event.Has(fsnotify.Create) {
 		info, err := os.Stat(event.Name)
 		if err == nil && info.IsDir() {
-			if w.ignore.ShouldSkipDir(relPath) {
-				return nil
-			}
 			if err := w.addRecursiveWithFiles(event.Name, true); err != nil {
 				log.Printf("Failed to add new directory %s: %v", event.Name, err)
 			}
@@ -205,6 +199,13 @@ func (w *Watcher) handleEvent(event fsnotify.Event) error {
 		if releaseErr != nil {
 			return releaseErr
 		}
+	}
+
+	// Hidden files are not indexed, but indexable dot-directories must reach the
+	// directory lifecycle above. Configured metadata directories are rejected by
+	// ShouldSkipDir during recursive registration.
+	if strings.HasPrefix(filepath.Base(relPath), ".") {
+		return nil
 	}
 
 	if w.ignore.ShouldIgnore(relPath) {

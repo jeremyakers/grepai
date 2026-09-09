@@ -41,12 +41,20 @@ func (w *Watcher) addRecursiveWithFiles(root string, emitFiles bool) error {
 			}
 			// An ignored directory may contain a negated child, so every directory
 			// that must be traversed also needs a watch.
-			if err := w.addWatch(path); err != nil {
-				log.Printf("Failed to watch %s: %v", path, err)
-			} else {
-				w.directoriesMu.Lock()
+			addErr := w.addWatch(path)
+			w.directoriesMu.Lock()
+			// A failed child Add still has directory identity from this walk and
+			// may later be reported removed by its watched parent. Keep failed root
+			// registration behavior unchanged; it has no watched parent.
+			if addErr == nil || filepath.Clean(path) != filepath.Clean(w.root) {
 				w.directories[path] = struct{}{}
-				w.directoriesMu.Unlock()
+			}
+			if addErr == nil {
+				w.registered[path] = struct{}{}
+			}
+			w.directoriesMu.Unlock()
+			if addErr != nil {
+				log.Printf("Failed to watch %s: %v", path, addErr)
 			}
 			return nil
 		}

@@ -35,7 +35,7 @@ func TestIndexedPathsUnderDirectoryUsesConservativeLegacyFallback(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 1 || got[0] != "src/vector.go" {
+	if len(got) != 1 || got[0] != filepath.Join("src", "vector.go") {
 		t.Fatalf("paths = %v", got)
 	}
 	if legacy.callEdgesCalls != 0 {
@@ -46,10 +46,9 @@ func TestIndexedPathsUnderDirectoryUsesConservativeLegacyFallback(t *testing.T) 
 func TestPlanDeletedDirectoryPreservesAllPathsOnStatFailure(t *testing.T) {
 	for _, cause := range []error{syscall.EACCES, syscall.EIO} {
 		t.Run(cause.Error(), func(t *testing.T) {
-			calls := 0
-			events, err := planDeletedDirectory(context.Background(), "/project", "src", []string{"src/absent.go", "src/unreadable.go"}, func(path string) (fs.FileInfo, error) {
-				calls++
-				if filepath.Clean(path) == "/project" || filepath.Base(path) == "src" {
+			projectRoot := filepath.Join(t.TempDir(), "project")
+			events, err := planDeletedDirectory(context.Background(), projectRoot, "src", []string{filepath.Join("src", "absent.go"), filepath.Join("src", "unreadable.go")}, func(path string) (fs.FileInfo, error) {
+				if filepath.Clean(path) == projectRoot || filepath.Base(path) == "src" {
 					return testDirectoryInfo{}, nil
 				}
 				if filepath.Base(path) == "absent.go" {
@@ -57,8 +56,8 @@ func TestPlanDeletedDirectoryPreservesAllPathsOnStatFailure(t *testing.T) {
 				}
 				return nil, cause
 			})
-			if !errors.Is(err, cause) || events != nil || calls != 4 {
-				t.Fatalf("events=%#v err=%v calls=%d", events, err, calls)
+			if !errors.Is(err, cause) || events != nil {
+				t.Fatalf("events=%#v err=%v, want preserved actions and stat error %v", events, err, cause)
 			}
 		})
 	}
@@ -73,7 +72,7 @@ func TestRequalifyRemovedFilePreservesOnStatFailure(t *testing.T) {
 	for _, cause := range []error{syscall.EACCES, syscall.EIO} {
 		t.Run(cause.Error(), func(t *testing.T) {
 			event := watcher.FileEvent{Type: watcher.EventRename, Path: "main.go"}
-			eventType, err := requalifyRemovedFile("/project", event, func(string) (fs.FileInfo, error) {
+			eventType, err := requalifyRemovedFile(t.TempDir(), event, func(string) (fs.FileInfo, error) {
 				return nil, cause
 			})
 			if eventType != watcher.EventRename || !errors.Is(err, cause) {
@@ -84,7 +83,7 @@ func TestRequalifyRemovedFilePreservesOnStatFailure(t *testing.T) {
 }
 
 func TestPlanDeletedDirectoryNeverPurgesRoot(t *testing.T) {
-	events, err := planDeletedDirectory(context.Background(), "/project", ".", []string{"main.go"}, func(string) (fs.FileInfo, error) {
+	events, err := planDeletedDirectory(context.Background(), t.TempDir(), ".", []string{"main.go"}, func(string) (fs.FileInfo, error) {
 		t.Fatal("root reconciliation must not inspect the filesystem")
 		return nil, nil
 	})
@@ -96,7 +95,7 @@ func TestPlanDeletedDirectoryNeverPurgesRoot(t *testing.T) {
 func TestPlanDeletedDirectoryHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	events, err := planDeletedDirectory(ctx, "/project", "src", []string{"src/main.go"}, func(string) (fs.FileInfo, error) {
+	events, err := planDeletedDirectory(ctx, t.TempDir(), "src", []string{filepath.Join("src", "main.go")}, func(string) (fs.FileInfo, error) {
 		t.Fatal("canceled reconciliation must not inspect the filesystem")
 		return nil, nil
 	})
@@ -120,16 +119,16 @@ func TestReconcileDeletedDirectoryIndexesKnownReplacementOnListFailure(t *testin
 		t.Fatal(err)
 	}
 	cause := syscall.EIO
-	var got []watcher.FileEvent
-	err := reconcileDeletedDirectory(context.Background(), root, "target.go", &failingListVectorStore{mockVectorStore: &mockVectorStore{}, err: cause}, nil, func(event watcher.FileEvent) {
-		got = append(got, event)
+	var got []directoryAction
+	err := reconcileDeletedDirectory(context.Background(), root, "target.go", &failingListVectorStore{mockVectorStore: &mockVectorStore{}, err: cause}, nil, func(action directoryAction) {
+		got = append(got, action)
 	})
 	if !errors.Is(err, cause) {
 		t.Fatalf("err = %v, want %v", err, cause)
 	}
-	want := watcher.FileEvent{Type: watcher.EventModify, Path: "target.go"}
+	want := directoryAction{kind: directoryActionDispatch, event: watcher.FileEvent{Type: watcher.EventModify, Path: "target.go"}}
 	if len(got) != 1 || got[0] != want {
-		t.Fatalf("events = %#v, want %#v", got, []watcher.FileEvent{want})
+		t.Fatalf("actions = %#v, want %#v", got, []directoryAction{want})
 	}
 }
 

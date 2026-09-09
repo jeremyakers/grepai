@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func TestRealFSNotifyPopulatedMoveInAndRenameOut(t *testing.T) {
+func TestRealFSNotifyPopulatedMoveInAndRenameAway(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
 	staged := filepath.Join(outside, "src")
@@ -33,10 +33,7 @@ func TestRealFSNotifyPopulatedMoveInAndRenameOut(t *testing.T) {
 		return event.Type == EventCreate && event.Path == wantChild
 	})
 
-	renamed := filepath.Join(outside, "renamed")
-	if err := os.Rename(inside, renamed); err != nil {
-		t.Fatal(err)
-	}
+	renamed := renameWatchedTreeOut(t, inside, outside)
 	awaitFileEvent(t, w, func(event FileEvent) bool {
 		return event.Type == EventRename && event.Path == "src" && event.IsDir
 	})
