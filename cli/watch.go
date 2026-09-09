@@ -879,6 +879,7 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 
 type watchProjectStartupWiring struct {
 	beforeWatcherRegistration func(context.Context)
+	initializeStore           func(context.Context, *config.Config, string) (store.VectorStore, error)
 }
 
 func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver, onFatal func(), mutationFence *watchMutationFence, startupWiring ...watchProjectStartupWiring) (resultErr error) {
@@ -890,15 +891,21 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 			}
 		})
 	}
+	startupCtx, finishStartup, err := mutationFence.admit(ctx)
+	if err != nil {
+		if isFatalWatcherError(err) {
+			mutationFence.failWithCause(err, nil, notifyFatal)
+		}
+		return err
+	}
 	defer func() {
+		if cause := context.Cause(startupCtx); isFatalWatcherError(cause) {
+			resultErr = cause
+		}
 		if isFatalWatcherError(resultErr) {
 			mutationFence.failWithCause(resultErr, nil, notifyFatal)
 		}
 	}()
-	startupCtx, finishStartup, err := mutationFence.admit(ctx)
-	if err != nil {
-		return err
-	}
 	defer finishStartup()
 
 	return runProjectWatchWithWriterLock(projectRoot, func(canonicalRoot string) error {
@@ -932,7 +939,11 @@ func watchProjectWithEventObserverLocked(ctx, startupCtx context.Context, projec
 	log.Printf("Watching project: %s (backend: %s)", projectRoot, cfg.Store.Backend)
 
 	// Initialize store
-	st, err := initializeStore(startupCtx, cfg, projectRoot)
+	storeInitializer := initializeStore
+	if len(startupWiring) > 0 && startupWiring[0].initializeStore != nil {
+		storeInitializer = startupWiring[0].initializeStore
+	}
+	st, err := storeInitializer(startupCtx, cfg, projectRoot)
 	if err != nil {
 		return err
 	}
@@ -2717,8 +2728,9 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize store: %w", err)
 	}
+	mutationFence := newWatchMutationFence()
 	abortStores := false
-	defer func() { closeUnlessAborted(ctx, &abortStores, st.Close) }()
+	defer func() { closeWithMutationFence(ctx, mutationFence, &abortStores, st.Close) }()
 
 	runtimes, watchers, err := initializeWorkspaceRuntimes(ctx, ws, emb, st, isBackgroundChild, initializeWorkspaceRuntime)
 	if err != nil {
@@ -2733,9 +2745,10 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 		if !abortWatcherClose {
 			closeWatchers()
 		}
-		if !abortStores {
+		closeWithMutationFence(ctx, mutationFence, &abortStores, func() error {
 			closeWorkspaceStores(runtimes)
-		}
+			return nil
+		})
 	}()
 
 	// Collect events from all watchers
@@ -2743,7 +2756,6 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 	fatalChan := make(chan error, 1)
 	forwardCtx, stopForwarders := context.WithCancel(ctx)
 	defer stopForwarders()
-	mutationFence := newWatchMutationFence()
 	for _, w := range watchers {
 		if !mutationFence.addWatcher(w) {
 			abortStores = true

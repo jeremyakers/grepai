@@ -47,7 +47,9 @@ func (l *workspaceWatchLoop) gracefulShutdown(message string) error {
 		log.Println(message)
 	}
 	l.stopWorkersAndWait()
-	persistWorkspaceOnShutdown(l.ctx, l.store, l.runtimes)
+	l.fence.cleanup(l.ctx, func() {
+		persistWorkspaceOnShutdown(l.ctx, l.store, l.runtimes)
+	})
 	return nil
 }
 
