@@ -13,10 +13,15 @@ func TestScannerPreservesNanosecondModTime(t *testing.T) {
 	if err := os.WriteFile(path, []byte("package a\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	want := time.Unix(1_700_000_000, 123456789)
-	if err := os.Chtimes(path, want, want); err != nil {
+	requested := time.Unix(1_700_000_000, 123456789)
+	if err := os.Chtimes(path, requested, requested); err != nil {
 		t.Fatal(err)
 	}
+	stat, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := stat.ModTime()
 	ignore, err := NewIgnoreMatcher(root, nil, "")
 	if err != nil {
 		t.Fatal(err)

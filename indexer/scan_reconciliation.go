@@ -125,13 +125,22 @@ func (idx *Indexer) refreshMatchingDocument(ctx context.Context, file *FileInfo,
 	return fileScanDecision{}, fmt.Errorf("refresh document timestamp: concurrent updates did not stabilize")
 }
 
-func (idx *Indexer) removeMissingFiles(ctx context.Context, candidates map[string]store.DocumentMetadata) (int, error) {
-	return idx.removeMissingFilesWith(ctx, candidates, os.Lstat)
+func (idx *Indexer) removeMissingFilesForScan(ctx context.Context, candidates map[string]store.DocumentMetadata, scanned []FileMeta) (int, error) {
+	paths := make([]string, 0, len(candidates))
+	for path := range candidates {
+		paths = append(paths, path)
+	}
+	witnesses := FindCaseRenameWitnesses(idx.root, paths, scanned)
+	return idx.removeMissingFilesWithWitnesses(ctx, candidates, witnesses, os.Lstat)
 }
 
 type lstatFunc func(string) (os.FileInfo, error)
 
 func (idx *Indexer) removeMissingFilesWith(ctx context.Context, candidates map[string]store.DocumentMetadata, lstat lstatFunc) (int, error) {
+	return idx.removeMissingFilesWithWitnesses(ctx, candidates, nil, lstat)
+}
+
+func (idx *Indexer) removeMissingFilesWithWitnesses(ctx context.Context, candidates map[string]store.DocumentMetadata, caseRenames map[string]string, lstat lstatFunc) (int, error) {
 	if err := checkScanRoot(idx.root); err != nil {
 		return 0, fmt.Errorf("scan root unavailable while reconciling removals: %w", err)
 	}
@@ -140,9 +149,10 @@ func (idx *Indexer) removeMissingFilesWith(ctx context.Context, candidates map[s
 		if err := ctx.Err(); err != nil {
 			return removed, err
 		}
-		if _, err := lstat(filepath.Join(idx.root, path)); err == nil {
+		_, caseRenamed := caseRenames[path]
+		if _, err := lstat(filepath.Join(idx.root, path)); err == nil && !caseRenamed {
 			continue
-		} else if !errors.Is(err, fs.ErrNotExist) {
+		} else if err != nil && !errors.Is(err, fs.ErrNotExist) && !caseRenamed {
 			log.Printf("Warning: cannot verify %s (%v); keeping its index entry", path, err)
 			continue
 		}

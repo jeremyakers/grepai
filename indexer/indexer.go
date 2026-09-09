@@ -211,7 +211,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			delete(existingDocs, fileMeta.Path)
 		}
 	}
-	removed, err := idx.removeMissingFiles(ctx, existingDocs)
+	removed, err := idx.removeMissingFilesForScan(ctx, existingDocs, fileMetas)
 	if err != nil {
 		return nil, err
 	}

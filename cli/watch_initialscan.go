@@ -163,6 +163,12 @@ func indexInitialSymbols(ctx context.Context, scanner *indexer.Scanner, extracto
 }
 
 func removeOfflineSymbolFiles(ctx context.Context, scanner *indexer.Scanner, symbolStore trace.SymbolStore, snapshot map[string]trace.FileFingerprint, scanned []indexer.FileMeta) error {
+	return removeOfflineSymbolFilesWithCaseRenames(ctx, scanner, symbolStore, snapshot, scanned, indexer.FindCaseRenameWitnesses)
+}
+
+type caseRenameFinder func(string, []string, []indexer.FileMeta) map[string]string
+
+func removeOfflineSymbolFilesWithCaseRenames(ctx context.Context, scanner *indexer.Scanner, symbolStore trace.SymbolStore, snapshot map[string]trace.FileFingerprint, scanned []indexer.FileMeta, findCaseRenames caseRenameFinder) error {
 	if snapshot == nil {
 		return nil
 	}
@@ -174,12 +180,18 @@ func removeOfflineSymbolFiles(ctx context.Context, scanner *indexer.Scanner, sym
 	for _, file := range scanned {
 		seen[file.Path] = struct{}{}
 	}
+	indexedPaths := make([]string, 0, len(snapshot))
+	for path := range snapshot {
+		indexedPaths = append(indexedPaths, path)
+	}
+	caseRenames := findCaseRenames(root, indexedPaths, scanned)
 	var candidates []string
 	for path := range snapshot {
 		if _, ok := seen[path]; ok {
 			continue
 		}
-		if _, err := os.Lstat(filepath.Join(root, path)); os.IsNotExist(err) {
+		_, caseRenamed := caseRenames[path]
+		if _, err := os.Lstat(filepath.Join(root, path)); os.IsNotExist(err) || caseRenamed {
 			candidates = append(candidates, path)
 		}
 	}
@@ -188,7 +200,8 @@ func removeOfflineSymbolFiles(ctx context.Context, scanner *indexer.Scanner, sym
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if _, err := os.Lstat(filepath.Join(root, path)); err == nil || !os.IsNotExist(err) {
+		_, caseRenamed := caseRenames[path]
+		if _, err := os.Lstat(filepath.Join(root, path)); (err == nil || !os.IsNotExist(err)) && !caseRenamed {
 			continue
 		}
 		if _, err := os.Stat(root); err != nil {
