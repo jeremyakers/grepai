@@ -1311,18 +1311,20 @@ func runProjectWatchLoopWithFence(ctx context.Context, st store.VectorStore, sym
 		rpgWorker = startRPGRealtimeWorkers(ctx, mutationFence, projectRoot, symbolStore, rpgEncoder, rpgStore, cfg.Watch, rpgManager)
 	}
 	persistAndShutdown := func() {
-		<-rpgWorker.done
-		if err := st.Persist(ctx); err != nil {
-			log.Printf("Warning: failed to persist index on shutdown for %s: %v", projectRoot, err)
-		}
-		if err := symbolStore.Persist(ctx); err != nil {
-			log.Printf("Warning: failed to persist symbol index on shutdown for %s: %v", projectRoot, err)
-		}
-		if rpgStore != nil {
-			if err := rpgStore.Persist(ctx); err != nil {
-				log.Printf("Warning: failed to persist RPG graph on shutdown for %s: %v", projectRoot, err)
+		mutationFence.cleanup(ctx, func() {
+			<-rpgWorker.done
+			if err := st.Persist(ctx); err != nil {
+				log.Printf("Warning: failed to persist index on shutdown for %s: %v", projectRoot, err)
 			}
-		}
+			if err := symbolStore.Persist(ctx); err != nil {
+				log.Printf("Warning: failed to persist symbol index on shutdown for %s: %v", projectRoot, err)
+			}
+			if rpgStore != nil {
+				if err := rpgStore.Persist(ctx); err != nil {
+					log.Printf("Warning: failed to persist RPG graph on shutdown for %s: %v", projectRoot, err)
+				}
+			}
+		})
 	}
 
 	for {
