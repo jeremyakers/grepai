@@ -232,29 +232,12 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		return nil, err
 	}
 	stats.FilesRemoved = removed
-	for _, file := range reeligible {
-		chunks, err := idx.IndexFile(ctx, file)
-		if err != nil {
-			return nil, fmt.Errorf("index re-eligible file %s: %w", file.Path, err)
-		}
-		stats.FilesIndexed++
-		stats.ChunksCreated += chunks
-		stats.ScannedFiles = append(stats.ScannedFiles, FileMeta{Path: file.Path, Size: file.Size, ModTime: file.ModTime, ObservedModTime: file.ObservedModTime})
-		stats.ExcludedFiles = removePath(stats.ExcludedFiles, file.Path)
+	if err := idx.indexReeligibleFiles(ctx, stats, reeligible); err != nil {
+		return nil, err
 	}
 
 	stats.Duration = time.Since(start)
 	return stats, nil
-}
-
-func removePath(paths []string, target string) []string {
-	filtered := paths[:0]
-	for _, path := range paths {
-		if path != target {
-			filtered = append(filtered, path)
-		}
-	}
-	return filtered
 }
 
 // scanWorkerLimit returns the number of concurrent workers to use when

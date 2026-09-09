@@ -147,3 +147,50 @@ func TestIndexAllReconcilesOfflineCaseOnlyRename(t *testing.T) {
 		t.Fatalf("new spelling missing: doc=%v err=%v", current, err)
 	}
 }
+
+func TestCachedCaseRenameReversalRestoresFinalVectorSpelling(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	finalPath := filepath.Join(root, "Foo.go")
+	if err := os.WriteFile(finalPath, []byte("package foo\nfunc Final() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ignore, err := NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewGOBStore(filepath.Join(root, "index.gob"))
+	for _, doc := range []store.Document{
+		{Path: "Foo.go", Hash: "old", ChunkIDs: []string{"old"}},
+		{Path: "foo.go", Hash: "temporary", ChunkIDs: []string{"temporary"}},
+	} {
+		if err := st.SaveChunks(ctx, []store.Chunk{{ID: doc.ChunkIDs[0], FilePath: doc.Path}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SaveDocument(ctx, doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	idx := NewIndexer(root, st, newMockEmbedder(), NewChunker(512, 50), NewScanner(root, ignore), time.Time{})
+	removed, reeligible, err := idx.removeCandidatesWithRevalidation(ctx,
+		map[string]store.DocumentMetadata{"Foo.go": {Path: "Foo.go"}}, nil,
+		map[string]string{"Foo.go": "foo.go"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 1 || len(reeligible) != 1 || reeligible[0].file.Path != "Foo.go" {
+		t.Fatalf("removed=%d reeligible=%v", removed, reeligible)
+	}
+	stats := &IndexStats{ScannedFiles: []FileMeta{{Path: "foo.go"}}}
+	if err := idx.indexReeligibleFiles(ctx, stats, reeligible); err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.ScannedFiles) != 1 || stats.ScannedFiles[0].Path != "Foo.go" {
+		t.Fatalf("consumer metadata retained temporary alias: %v", stats.ScannedFiles)
+	}
+	documents, err := st.ListDocuments(ctx)
+	if err != nil || len(documents) != 1 || documents[0] != "Foo.go" {
+		t.Fatalf("final documents=%v err=%v", documents, err)
+	}
+}

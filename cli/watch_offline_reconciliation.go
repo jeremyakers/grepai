@@ -16,19 +16,23 @@ func removeOfflineSymbolFiles(ctx context.Context, scanner *indexer.Scanner, sym
 	return err
 }
 
-func removeOfflineSymbolFilesForScan(ctx context.Context, scanner *indexer.Scanner, symbolStore trace.SymbolStore, snapshot map[string]trace.FileFingerprint, scanned []indexer.FileMeta, excluded []string) ([]indexer.FileInfo, error) {
+func removeOfflineSymbolFilesForScan(ctx context.Context, scanner *indexer.Scanner, symbolStore trace.SymbolStore, snapshot map[string]trace.FileFingerprint, scanned []indexer.FileMeta, excluded []string) ([]reeligibleSymbolFile, error) {
 	return removeOfflineSymbolFilesForScanWithSeams(ctx, scanner, symbolStore, snapshot, scanned, excluded, indexer.FindCaseRenameWitnesses, scanner.InspectExistingPath)
 }
 
 type caseRenameFinder func(string, []string, []indexer.FileMeta) map[string]string
 type existingPathInspector func(string) (*indexer.FileInfo, indexer.PathExclusionReason, error)
+type reeligibleSymbolFile struct {
+	file       indexer.FileInfo
+	staleAlias string
+}
 
 func removeOfflineSymbolFilesWithCaseRenames(ctx context.Context, scanner *indexer.Scanner, symbolStore trace.SymbolStore, snapshot map[string]trace.FileFingerprint, scanned []indexer.FileMeta, excluded []string, findCaseRenames caseRenameFinder) error {
 	_, err := removeOfflineSymbolFilesForScanWithSeams(ctx, scanner, symbolStore, snapshot, scanned, excluded, findCaseRenames, scanner.InspectExistingPath)
 	return err
 }
 
-func removeOfflineSymbolFilesForScanWithSeams(ctx context.Context, scanner *indexer.Scanner, symbolStore trace.SymbolStore, snapshot map[string]trace.FileFingerprint, scanned []indexer.FileMeta, excluded []string, findCaseRenames caseRenameFinder, inspect existingPathInspector) ([]indexer.FileInfo, error) {
+func removeOfflineSymbolFilesForScanWithSeams(ctx context.Context, scanner *indexer.Scanner, symbolStore trace.SymbolStore, snapshot map[string]trace.FileFingerprint, scanned []indexer.FileMeta, excluded []string, findCaseRenames caseRenameFinder, inspect existingPathInspector) ([]reeligibleSymbolFile, error) {
 	if snapshot == nil {
 		return nil, nil
 	}
@@ -67,21 +71,67 @@ func removeOfflineSymbolFilesForScanWithSeams(ctx context.Context, scanner *inde
 		}
 	}
 	sort.Strings(candidates)
-	var reeligible []indexer.FileInfo
+	var reeligible []reeligibleSymbolFile
 	for _, path := range candidates {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		_, caseRenamed := caseRenames[path]
+		caseWitness, caseRenamed := caseRenames[path]
 		_, statErr := os.Lstat(filepath.Join(root, path))
 		forced := caseRenamed
+		if caseRenamed {
+			current, err := indexer.RevalidateCaseRenameWitness(root, path, caseWitness)
+			if err != nil && !os.IsNotExist(err) {
+				return nil, fmt.Errorf("revalidate symbol case rename %s to %s: %w", path, caseWitness, err)
+			}
+			if !current {
+				file, reason, inspectErr := inspect(path)
+				if inspectErr != nil && !os.IsNotExist(inspectErr) {
+					return nil, fmt.Errorf("inspect reversed symbol case rename %s: %w", path, inspectErr)
+				}
+				caseRenamed = false
+				forced = reason != ""
+				if file != nil && reason == "" {
+					retireAlias, retireErr := indexer.CanRetireCaseAlias(root, path, caseWitness)
+					if retireErr != nil {
+						return nil, fmt.Errorf("verify temporary symbol case alias %s: %w", caseWitness, retireErr)
+					}
+					recovered := reeligibleSymbolFile{file: *file}
+					if retireAlias {
+						if err := verifyInitialScanRoot(root); err != nil {
+							return nil, fmt.Errorf("symbol cleanup root lost before reconciling reversed case rename %s: %w", path, err)
+						}
+						if err := symbolStore.DeleteFile(ctx, caseWitness); err != nil {
+							return nil, fmt.Errorf("delete temporary symbol case alias %s: %w", caseWitness, err)
+						}
+						recovered.staleAlias = caseWitness
+					}
+					reeligible = append(reeligible, recovered)
+					continue
+				}
+				if forced {
+					retireAlias, retireErr := indexer.CanRetireCaseAlias(root, path, caseWitness)
+					if retireErr != nil {
+						return nil, fmt.Errorf("verify temporary excluded symbol case alias %s: %w", caseWitness, retireErr)
+					}
+					if retireAlias {
+						if err := verifyInitialScanRoot(root); err != nil {
+							return nil, fmt.Errorf("symbol cleanup root lost before removing excluded case alias %s: %w", caseWitness, err)
+						}
+						if err := symbolStore.DeleteFile(ctx, caseWitness); err != nil {
+							return nil, fmt.Errorf("delete temporary excluded symbol case alias %s: %w", caseWitness, err)
+						}
+					}
+				}
+			}
+		}
 		if statErr == nil && !caseRenamed {
 			file, reason, inspectErr := inspect(path)
 			if inspectErr != nil {
 				continue
 			}
 			if reason == "" && file != nil {
-				reeligible = append(reeligible, *file)
+				reeligible = append(reeligible, reeligibleSymbolFile{file: *file})
 				continue
 			}
 			forced = reason != ""

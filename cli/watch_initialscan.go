@@ -72,7 +72,14 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	if err != nil {
 		return nil, err
 	}
-	for _, file := range reeligibleSymbols {
+	for _, recovered := range reeligibleSymbols {
+		file := recovered.file
+		if recovered.staleAlias != "" {
+			if err := idx.RemoveFile(ctx, recovered.staleAlias); err != nil {
+				return nil, fmt.Errorf("remove temporary vector case alias %s: %w", recovered.staleAlias, err)
+			}
+			stats.ScannedFiles = withoutFilePaths(stats.ScannedFiles, []string{recovered.staleAlias})
+		}
 		chunks, err := idx.IndexFile(ctx, file)
 		if err != nil {
 			return nil, fmt.Errorf("index re-eligible file %s: %w", file.Path, err)
