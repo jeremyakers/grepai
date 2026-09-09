@@ -99,7 +99,7 @@ func BenchmarkWarmStartBulkSnapshotNoContentIO(b *testing.B) {
 		reads.Add(1)
 		return nil, fmt.Errorf("unexpected content read")
 	}
-	idx := NewIndexer(root, st, newMockEmbedder(), NewChunker(512, 50), scanner, time.Time{})
+	idx := NewIndexer(root, st, newMockEmbedder(), NewChunker(512, 50), scanner, time.Now())
 	b.ResetTimer()
 	for range b.N {
 		stats, err := idx.IndexAll(context.Background())

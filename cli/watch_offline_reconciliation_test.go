@@ -34,7 +34,7 @@ func TestRemoveOfflineSymbolFilesRemovesOnlyConfirmedOrphans(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := removeOfflineSymbolFiles(ctx, scanner, symbols, snapshot, []indexer.FileMeta{{Path: "kept.go"}}); err != nil {
+	if err := removeOfflineSymbolFiles(ctx, scanner, symbols, snapshot, []indexer.FileMeta{{Path: "kept.go"}}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if !symbols.IsFileIndexed("kept.go") {
@@ -62,7 +62,7 @@ func TestRemoveOfflineSymbolFilesPreservesSnapshotWhenRootIsMissing(t *testing.T
 	if err := symbols.SaveFile(context.Background(), "old.go", nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	err = removeOfflineSymbolFiles(context.Background(), scanner, symbols, map[string]trace.FileFingerprint{"old.go": {}}, nil)
+	err = removeOfflineSymbolFiles(context.Background(), scanner, symbols, map[string]trace.FileFingerprint{"old.go": {}}, nil, nil)
 	if err == nil || !symbols.IsFileIndexed("old.go") {
 		t.Fatalf("err=%v indexed=%v", err, symbols.IsFileIndexed("old.go"))
 	}
@@ -93,7 +93,7 @@ func TestRemoveOfflineSymbolFilesAcceptsVerifiedCaseRenameWitness(t *testing.T) 
 		}
 		return map[string]string{"Foo.go": "foo.go"}
 	}
-	if err := removeOfflineSymbolFilesWithCaseRenames(ctx, scanner, symbols, snapshot, []indexer.FileMeta{{Path: "foo.go"}}, finder); err != nil {
+	if err := removeOfflineSymbolFilesWithCaseRenames(ctx, scanner, symbols, snapshot, []indexer.FileMeta{{Path: "foo.go"}}, nil, finder); err != nil {
 		t.Fatal(err)
 	}
 	if symbols.IsFileIndexed("Foo.go") {
@@ -143,7 +143,7 @@ func TestOfflineCaseRenameWithAncestorSpellingChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := removeOfflineSymbolFiles(ctx, scanner, symbols, snapshot, scanned); err != nil {
+	if err := removeOfflineSymbolFiles(ctx, scanner, symbols, snapshot, scanned, nil); err != nil {
 		t.Fatal(err)
 	}
 	if symbols.IsFileIndexed("Dir/Foo.go") {

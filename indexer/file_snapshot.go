@@ -54,9 +54,6 @@ func readFileSnapshotWithHooks(path, relPath string, hooks snapshotHooks) (*File
 			}
 		}
 		content, readErr := io.ReadAll(io.LimitReader(file, maxFileSize+1))
-		if readErr == nil && hooks.afterRead != nil {
-			readErr = hooks.afterRead(attempt)
-		}
 		after, statErr := file.Stat()
 		closeErr := file.Close()
 		if readErr != nil {
@@ -70,6 +67,11 @@ func readFileSnapshotWithHooks(path, relPath string, hooks snapshotHooks) (*File
 		}
 		if len(content) > maxFileSize {
 			return nil, nil
+		}
+		if hooks.afterRead != nil {
+			if err := hooks.afterRead(attempt); err != nil {
+				return nil, err
+			}
 		}
 		current, err := os.Stat(path)
 		if err != nil {

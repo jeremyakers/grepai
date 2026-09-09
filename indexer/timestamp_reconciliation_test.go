@@ -193,3 +193,44 @@ func TestRefreshConflictDiscardsStaleSourceSnapshot(t *testing.T) {
 		})
 	}
 }
+
+func TestZeroLastIndexTimeForcesHashVerification(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "a.go")
+	oldContent := "package a\nfunc A() {}\n"
+	newContent := "package a\nfunc B() {}\n"
+	if len(oldContent) != len(newContent) {
+		t.Fatal("fixture contents must have equal size")
+	}
+	if err := os.WriteFile(path, []byte(oldContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	scanner := timestampTestScanner(t, root)
+	old, err := scanner.ScanFile("a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := store.NewGOBStore(filepath.Join(root, "index.gob"))
+	if err := st.SaveDocument(ctx, store.Document{Path: "a.go", Hash: old.Hash, ModTime: old.ObservedModTime, HasExactModTime: true, ChunkIDs: []string{"old-chunk"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(newContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, old.ObservedModTime, old.ObservedModTime); err != nil {
+		t.Fatal(err)
+	}
+	idx := NewIndexer(root, st, newMockEmbedder(), NewChunker(512, 50), scanner, time.Time{})
+	stats, err := idx.IndexAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.FilesIndexed != 1 {
+		t.Fatalf("indexed = %d, want changed content reindexed", stats.FilesIndexed)
+	}
+	doc, err := st.GetDocument(ctx, "a.go")
+	if err != nil || doc == nil || doc.Hash == old.Hash {
+		t.Fatalf("document hash was not refreshed: doc=%+v err=%v", doc, err)
+	}
+}
