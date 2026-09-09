@@ -116,6 +116,18 @@ scanner:
 
 ### Real-Time Updates
 
+Directory moves and deletions are reconciled for all indexed descendants, not
+just the directory name. A populated directory moved into the project is watched
+and its supported files are indexed; a directory moved out releases its subtree
+watches. Cleanup uses path boundaries, so deleting `src/` does not remove
+`src-old/`. Atomic file replacements are still treated as modifications, while
+permission and I/O failures are preserved rather than treated as deletions.
+
+This reconciliation covers files and subdirectories inside an active project.
+Losing or renaming the project root is a watcher-lifecycle failure, not a reason
+to purge every project entry based on an unavailable root. Root coverage-loss
+handling is tracked separately in [#306](https://github.com/yoanbernabeu/grepai/pull/306).
+
 When files change, the watcher logs updates:
 
 ```text
@@ -140,6 +152,20 @@ The watcher also builds a symbol index for call graph analysis:
 - **Used by**: `grepai trace` for call graph analysis
 
 See [Call Graph Analysis](/grepai/trace/) for more details.
+
+### Restart Reconciliation
+
+On restart, the watcher reconciles changes made while it was offline. GOB and
+PostgreSQL vector stores load compact document metadata in bulk, while the GOB
+symbol store loads one fingerprint snapshot. Exact per-file modification times
+let unchanged files skip content reads without relying on the legacy global
+startup timestamp.
+
+Documents with missing chunks are retried. Older indexes without exact
+timestamps receive a conservative one-time content verification before their
+timestamp metadata is refreshed. Files are removed only when their absence can
+be confirmed; an unavailable project root or other filesystem error preserves
+existing vector and symbol records for a later reconciliation.
 
 ### Configuration
 
@@ -167,6 +193,33 @@ The watcher periodically saves the index:
 - **Shutdown save**: Clean save on Ctrl+C or SIGTERM
 - **Location**: `.grepai/index.gob` (or PostgreSQL)
 
+Only one watcher may write a project at a time. Foreground, background, and
+workspace watchers all acquire the same nonblocking lifetime lock at
+`.grepai/writer.lock`; a second watcher exits immediately with an error naming
+the contended project. This prevents concurrent watchers from overwriting each
+other's index snapshots, even when they use different log directories. The lock
+is released automatically when the watcher exits or crashes.
+
+The lifetime writer lock is acquired before vector, symbol, or RPG stores are
+loaded. Their shorter per-load and per-persist locks are nested inside it, which
+keeps lock ordering consistent and avoids deadlocks.
+
+Searches, MCP servers, and trace commands are read-only and do not acquire this
+lifetime lock, so they can continue to run concurrently with the watcher.
+Vector and symbol GOB readers also keep explicit mutation state: closing a
+clean reader does not rewrite an existing index or create a missing one.
+Vector GOB stores own mutable vectors and chunk ID lists, and symbol lookups
+return detached slices rather than live writable store state.
+
+Fatal filesystem coverage errors use a different shutdown path: new index
+mutations are rejected immediately, contexts for admitted event, persistence,
+and background RPG work are canceled, and readiness is withdrawn after that
+work finishes. Potentially untrustworthy derived state is not persisted. The
+CLI returns without waiting for the filesystem backend to close, so the
+operating system reclaims its watcher descriptors at process exit. Embedded
+library callers that keep the process alive may call `Close` after handling the
+returned fatal error to release the backend explicitly.
+
 ### Background Daemon Mode
 
 Run the watcher as a background daemon with built-in lifecycle management:
@@ -193,7 +246,9 @@ Use 'grepai watch --status' to check status
 Use 'grepai watch --stop' to stop the watcher
 ```
 
-The daemon waits for full initialization (embedder connection, initial scan) before returning success.
+The daemon waits for full initialization (embedder connection, initial scan) before returning success. Ready markers include the child PID, so a marker left by an older process cannot make a failed restart appear healthy.
+
+It only reports ready after every required filesystem watch is registered. If registration fails at startup or while adding a newly created directory, fsnotify stops unexpectedly, or the internal event queue fills, the watcher exits instead of continuing with partial or stale coverage. Fatal observation immediately rejects new mutations, cancels in-flight mutation contexts, and stops watcher event ownership; readiness is withdrawn once admitted event, periodic persistence, and background RPG work quiesces. Fatal shutdown deliberately does **not** flush derived indexes because their state is no longer trustworthy. The next startup performs a full repair scan. Workspace and multi-worktree modes apply the same fence across their full readiness scope: one fatal watcher error prevents admission in every project and stops the watcher.
 
 #### Checking Status
 
@@ -297,6 +352,8 @@ sudo sysctl fs.inotify.max_user_watches=524288
 # Increase permanently
 echo "fs.inotify.max_user_watches=524288" | sudo tee -a /etc/sysctl.conf
 ```
+
+If the watcher reports `no space left on device` (`ENOSPC`) while registering a directory, this refers to the per-user inotify watch quota, **not filesystem disk space**. The quota is shared by all processes owned by the user, so another editor, language server, or watcher can exhaust it after grepai starts. Increase `fs.inotify.max_user_watches` or stop unnecessary watcher processes, then restart `grepai watch`.
 
 ### Use Cases
 

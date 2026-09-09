@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,8 +13,61 @@ import (
 
 	"github.com/yoanbernabeu/grepai/config"
 	"github.com/yoanbernabeu/grepai/daemon"
+	"github.com/yoanbernabeu/grepai/embedder"
 	"github.com/yoanbernabeu/grepai/indexer"
+	"github.com/yoanbernabeu/grepai/store"
 )
+
+func TestInitializeWorkspaceRuntimesFailureIsAllOrNothing(t *testing.T) {
+	wantErr := errors.New("fingerprint snapshot failed")
+	tests := []struct {
+		name        string
+		failOnCall  int
+		wantCloses  int
+		wantInitRun int
+	}{
+		{name: "first project fails", failOnCall: 1, wantCloses: 0, wantInitRun: 1},
+		{name: "second project fails", failOnCall: 2, wantCloses: 1, wantInitRun: 2},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ws := &config.Workspace{Name: "ws", Projects: []config.ProjectEntry{
+				{Name: "first", Path: "/first"},
+				{Name: "second", Path: "/second"},
+			}}
+			opened := &failingWatchSymbolStore{}
+			initCalls := 0
+			initializer := func(_ context.Context, _ *config.Workspace, project config.ProjectEntry, _ embedder.Embedder, _ store.VectorStore, _ bool) (*workspaceProjectRuntime, watchSource, error) {
+				initCalls++
+				if initCalls == test.failOnCall {
+					return nil, nil, wantErr
+				}
+				return &workspaceProjectRuntime{project: project, symbolStore: opened}, nil, nil
+			}
+			_, _, err := initializeWorkspaceRuntimes(context.Background(), ws, nil, nil, true, initializer)
+
+			if !errors.Is(err, wantErr) || !strings.Contains(err.Error(), ws.Projects[test.failOnCall-1].Name) {
+				t.Fatalf("error = %v, want wrapped project error %v", err, wantErr)
+			}
+			if initCalls != test.wantInitRun || opened.closes != test.wantCloses {
+				t.Fatalf("init calls=%d closes=%d; want %d/%d", initCalls, opened.closes, test.wantInitRun, test.wantCloses)
+			}
+		})
+	}
+}
+
+func TestInitializeWorkspaceRuntimesPreservesEmptyWorkspace(t *testing.T) {
+	ws := &config.Workspace{Name: "empty"}
+	initializer := func(context.Context, *config.Workspace, config.ProjectEntry, embedder.Embedder, store.VectorStore, bool) (*workspaceProjectRuntime, watchSource, error) {
+		t.Fatal("initializer called for empty workspace")
+		return nil, nil, nil
+	}
+
+	runtimes, watchers, err := initializeWorkspaceRuntimes(context.Background(), ws, nil, nil, true, initializer)
+	if err != nil || len(runtimes) != 0 || len(watchers) != 0 {
+		t.Fatalf("runtimes=%d watchers=%d err=%v; want empty success", len(runtimes), len(watchers), err)
+	}
+}
 
 func withWatchGlobals(t *testing.T, workspace string, status, stop, background bool) {
 	t.Helper()
