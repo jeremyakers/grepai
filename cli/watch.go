@@ -788,6 +788,9 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	if err != nil {
 		return nil, fmt.Errorf("initial indexing failed: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	if !isBackgroundChild {
 		fmt.Printf("Initial scan complete: %d files indexed, %d chunks created, %d files removed, %d skipped (took %s)\n",
@@ -807,6 +810,9 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	files := stats.ScannedFiles
 
 	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		ext := strings.ToLower(filepath.Ext(file.Path))
 		if !isTracedLanguage(ext, tracedLanguages) {
 			continue
@@ -848,13 +854,22 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 
 		symbols, refs, err := extractSymbolsWithFramework(ctx, extractor, fileInfo.Path, fileInfo.Content, processors...)
 		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			log.Printf("Warning: failed to extract symbols from %s: %v", fileInfo.Path, err)
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 		if err := symbolStore.SaveFileWithSignature(ctx, fileInfo.Path, fileInfo.Hash, extractor.Version(), symbols, refs); err != nil {
 			log.Printf("Warning: failed to save symbols for %s: %v", fileInfo.Path, err)
 		}
 		symbolCount += len(symbols)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if err := symbolStore.Persist(ctx); err != nil {
 		log.Printf("Warning: failed to persist symbol index: %v", err)
@@ -996,7 +1011,11 @@ func watchProjectWithEventObserver(ctx context.Context, projectRoot string, emb 
 	return watchProjectWithEventObserverAndFence(ctx, projectRoot, emb, isBackgroundChild, onReady, onEvent, onScan, onEmbed, onRPG, onActivity, onStats, onFatal, newWatchMutationFence())
 }
 
-func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver, onFatal func(), mutationFence *watchMutationFence) (resultErr error) {
+type watchProjectStartupWiring struct {
+	beforeWatcherRegistration func(context.Context)
+}
+
+func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver, onFatal func(), mutationFence *watchMutationFence, startupWiring ...watchProjectStartupWiring) (resultErr error) {
 	var fatalOnce sync.Once
 	notifyFatal := func() {
 		fatalOnce.Do(func() {
@@ -1010,22 +1029,33 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 			mutationFence.failWithCause(resultErr, nil, notifyFatal)
 		}
 	}()
+	startupCtx, finishStartup, err := mutationFence.admit(ctx)
+	if err != nil {
+		return err
+	}
+	defer finishStartup()
 
 	// Load configuration
 	cfg, err := config.Load(projectRoot)
 	if err != nil {
 		return fmt.Errorf("failed to load config for %s: %w", projectRoot, err)
 	}
+	if err := startupCtx.Err(); err != nil {
+		return context.Cause(startupCtx)
+	}
 
 	log.Printf("Watching project: %s (backend: %s)", projectRoot, cfg.Store.Backend)
 
 	// Initialize store
-	st, err := initializeStore(ctx, cfg, projectRoot)
+	st, err := initializeStore(startupCtx, cfg, projectRoot)
 	if err != nil {
 		return err
 	}
 	abortStores := false
-	defer func() { closeUnlessAborted(ctx, &abortStores, st.Close) }()
+	defer func() { closeWithMutationFence(ctx, mutationFence, &abortStores, st.Close) }()
+	if err := startupCtx.Err(); err != nil {
+		return context.Cause(startupCtx)
+	}
 
 	// Initialize ignore matcher
 	ignoreMatcher, err := indexer.NewIgnoreMatcher(projectRoot, cfg.Ignore, cfg.ExternalGitignore)
@@ -1046,10 +1076,13 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 
 	// Initialize symbol store and extractor
 	symbolStore := trace.NewGOBSymbolStore(config.GetSymbolIndexPath(projectRoot))
-	if err := symbolStore.Load(ctx); err != nil {
+	if err := symbolStore.Load(startupCtx); err != nil {
 		log.Printf("Warning: failed to load symbol index for %s: %v", projectRoot, err)
 	}
-	defer func() { closeUnlessAborted(ctx, &abortStores, symbolStore.Close) }()
+	defer func() { closeWithMutationFence(ctx, mutationFence, &abortStores, symbolStore.Close) }()
+	if err := startupCtx.Err(); err != nil {
+		return context.Cause(startupCtx)
+	}
 
 	extractor := trace.NewRegexExtractor()
 
@@ -1058,8 +1091,11 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 	var rpgStore rpg.RPGStore
 	if cfg.RPG.Enabled {
 		rpgStore = rpg.NewGOBRPGStore(config.GetRPGIndexPath(projectRoot))
-		if err := rpgStore.Load(ctx); err != nil {
+		if err := rpgStore.Load(startupCtx); err != nil {
 			log.Printf("Warning: failed to load RPG index for %s: %v", projectRoot, err)
+		}
+		if err := startupCtx.Err(); err != nil {
+			return context.Cause(startupCtx)
 		}
 
 		var featureExtractor rpg.FeatureExtractor
@@ -1089,7 +1125,7 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 	}
 
 	if rpgStore != nil {
-		defer func() { closeUnlessAborted(ctx, &abortStores, rpgStore.Close) }()
+		defer func() { closeWithMutationFence(ctx, mutationFence, &abortStores, rpgStore.Close) }()
 	}
 
 	tracedLanguages := cfg.Trace.EnabledLanguages
@@ -1099,9 +1135,15 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 	// In multi-worktree mode callers pass isBackgroundChild=true for non-interactive output.
 	// Run initial scan and build symbol index.
 	// In multi-worktree mode callers pass isBackgroundChild=true for non-interactive output.
-	stats, err := runInitialScan(ctx, idx, scanner, extractor, symbolStore, tracedLanguages, cfg.Watch.LastIndexTime, isBackgroundChild, onScan, onEmbed, processorRegistry)
+	stats, err := runInitialScan(startupCtx, idx, scanner, extractor, symbolStore, tracedLanguages, cfg.Watch.LastIndexTime, isBackgroundChild, onScan, onEmbed, processorRegistry)
 	if err != nil {
+		if cause := context.Cause(startupCtx); isFatalWatcherError(cause) {
+			return cause
+		}
 		return err
+	}
+	if cause := context.Cause(startupCtx); isFatalWatcherError(cause) {
+		return cause
 	}
 
 	if stats.FilesIndexed > 0 || stats.ChunksCreated > 0 {
@@ -1112,26 +1154,40 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 	}
 
 	if rpgEncoder != nil {
-		if err := rpgEncoder.BuildFull(ctx, symbolStore, st, onRPG); err != nil {
+		if err := rpgEncoder.BuildFull(startupCtx, symbolStore, st, onRPG); err != nil {
 			log.Printf("Warning: failed to build RPG graph for %s: %v", projectRoot, err)
 		} else {
 			rpgStats := rpgEncoder.Stats()
 			log.Printf("RPG graph built for %s: %d nodes, %d edges", projectRoot, rpgStats.TotalNodes, rpgStats.TotalEdges)
 		}
 	}
+	if cause := context.Cause(startupCtx); isFatalWatcherError(cause) {
+		return cause
+	}
 
-	emitInitialStatsSnapshot(ctx, st, symbolStore, projectRoot, onStats)
+	emitInitialStatsSnapshot(startupCtx, st, symbolStore, projectRoot, onStats)
 
-	if err := st.Persist(ctx); err != nil {
+	if err := st.Persist(startupCtx); err != nil {
 		log.Printf("Warning: failed to persist index: %v", err)
 	}
+	if cause := context.Cause(startupCtx); isFatalWatcherError(cause) {
+		return cause
+	}
 	if rpgStore != nil {
-		if err := rpgStore.Persist(ctx); err != nil {
+		if err := rpgStore.Persist(startupCtx); err != nil {
 			log.Printf("Warning: failed to persist RPG graph: %v", err)
 		}
 	}
-
+	if cause := context.Cause(startupCtx); isFatalWatcherError(cause) {
+		return cause
+	}
 	// Initialize watcher
+	if len(startupWiring) > 0 && startupWiring[0].beforeWatcherRegistration != nil {
+		startupWiring[0].beforeWatcherRegistration(startupCtx)
+	}
+	if err := startupCtx.Err(); err != nil {
+		return context.Cause(startupCtx)
+	}
 	w, err := watcher.NewWatcher(projectRoot, ignoreMatcher, cfg.Watch.DebounceMs)
 	if err != nil {
 		abortStores = isFatalWatcherError(err)
@@ -1156,6 +1212,7 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 		return fmt.Errorf("watcher failed before event admission for %s: %w", projectRoot, errWatchMutationAdmissionClosed)
 	}
 	defer mutationFence.removeWatcher(w)
+	finishStartup()
 
 	if err := mutationFence.ready(func() error {
 		if onReady != nil {
