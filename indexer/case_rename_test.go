@@ -172,18 +172,18 @@ func TestCachedCaseRenameReversalRestoresFinalVectorSpelling(t *testing.T) {
 		}
 	}
 	idx := NewIndexer(root, st, newMockEmbedder(), NewChunker(512, 50), NewScanner(root, ignore), time.Time{})
-	removed, reeligible, err := idx.removeCandidatesWithRevalidation(ctx,
+	removed, reconciliation, err := idx.removeCandidatesWithRevalidation(ctx,
 		map[string]store.DocumentMetadata{"Foo.go": {Path: "Foo.go"}}, nil,
 		map[string]string{"Foo.go": "foo.go"},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if removed != 1 || len(reeligible) != 1 || reeligible[0].file.Path != "Foo.go" {
-		t.Fatalf("removed=%d reeligible=%v", removed, reeligible)
+	if removed != 1 || len(reconciliation.reeligible) != 1 || reconciliation.reeligible[0].Path != "Foo.go" {
+		t.Fatalf("removed=%d reconciliation=%v", removed, reconciliation)
 	}
 	stats := &IndexStats{ScannedFiles: []FileMeta{{Path: "foo.go"}}}
-	if err := idx.indexReeligibleFiles(ctx, stats, reeligible); err != nil {
+	if err := idx.applyRemovalReconciliation(ctx, stats, reconciliation); err != nil {
 		t.Fatal(err)
 	}
 	if len(stats.ScannedFiles) != 1 || stats.ScannedFiles[0].Path != "Foo.go" {

@@ -135,7 +135,7 @@ func (idx *Indexer) refreshMatchingDocument(ctx context.Context, file *FileInfo,
 	return fileScanDecision{}, fmt.Errorf("refresh document timestamp: concurrent updates did not stabilize")
 }
 
-func (idx *Indexer) removeMissingFilesForScan(ctx context.Context, candidates map[string]store.DocumentMetadata, scanned []FileMeta, forcedRemovals map[string]string) (int, []reeligibleFile, error) {
+func (idx *Indexer) removeMissingFilesForScan(ctx context.Context, candidates map[string]store.DocumentMetadata, scanned []FileMeta, forcedRemovals map[string]string) (int, removalReconciliation, error) {
 	paths := make([]string, 0, len(candidates))
 	for path := range candidates {
 		paths = append(paths, path)

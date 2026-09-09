@@ -36,6 +36,12 @@ type IndexStats struct {
 	ScannedFiles           []FileMeta // All files found during scan (for reuse by callers)
 	VerifiedUnchangedFiles map[string]VerifiedFile
 	ExcludedFiles          []string
+	RetiredAliases         []RetiredAlias
+}
+
+type RetiredAlias struct {
+	Path          string
+	CanonicalPath string
 }
 
 type VerifiedFile struct {
@@ -227,12 +233,12 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			forcedRemovals[fileMeta.Path] = "scan exclusion"
 		}
 	}
-	removed, reeligible, err := idx.removeMissingFilesForScan(ctx, existingDocs, fileMetas, forcedRemovals)
+	removed, reconciliation, err := idx.removeMissingFilesForScan(ctx, existingDocs, fileMetas, forcedRemovals)
 	if err != nil {
 		return nil, err
 	}
 	stats.FilesRemoved = removed
-	if err := idx.indexReeligibleFiles(ctx, stats, reeligible); err != nil {
+	if err := idx.applyRemovalReconciliation(ctx, stats, reconciliation); err != nil {
 		return nil, err
 	}
 

@@ -68,18 +68,18 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 		return nil, fmt.Errorf("initial indexing failed: %w", err)
 	}
 	announceInitialScanComplete(stats, background)
-	reeligibleSymbols, err := removeOfflineSymbolFilesForScan(ctx, scanner, symbolStore, fingerprints.snapshot, stats.ScannedFiles, stats.ExcludedFiles)
+	if err := consumeRetiredAliases(ctx, idx, scanner, symbolStore, fingerprints.snapshot, stats, stats.RetiredAliases); err != nil {
+		return nil, err
+	}
+	stats.RetiredAliases = nil
+	symbolReconciliation, err := removeOfflineSymbolFilesForScan(ctx, scanner, symbolStore, fingerprints.snapshot, stats.ScannedFiles, stats.ExcludedFiles)
 	if err != nil {
 		return nil, err
 	}
-	for _, recovered := range reeligibleSymbols {
-		file := recovered.file
-		if recovered.staleAlias != "" {
-			if err := idx.RemoveFile(ctx, recovered.staleAlias); err != nil {
-				return nil, fmt.Errorf("remove temporary vector case alias %s: %w", recovered.staleAlias, err)
-			}
-			stats.ScannedFiles = withoutFilePaths(stats.ScannedFiles, []string{recovered.staleAlias})
-		}
+	if err := consumeRetiredAliases(ctx, idx, scanner, symbolStore, fingerprints.snapshot, stats, symbolReconciliation.retiredAliases); err != nil {
+		return nil, err
+	}
+	for _, file := range symbolReconciliation.reeligible {
 		chunks, err := idx.IndexFile(ctx, file)
 		if err != nil {
 			return nil, fmt.Errorf("index re-eligible file %s: %w", file.Path, err)

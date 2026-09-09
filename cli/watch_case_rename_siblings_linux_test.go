@@ -50,12 +50,12 @@ func TestCachedSymbolCaseRenamePreservesActualCaseSibling(t *testing.T) {
 				return map[string]string{"Foo.go": "foo.go"}
 			}
 			snapshot := map[string]trace.FileFingerprint{"Foo.go": {ContentHash: "stale", HasContentHash: true}}
-			recovered, err := removeOfflineSymbolFilesForScanWithSeams(ctx, scanner, symbols, snapshot, []indexer.FileMeta{{Path: "foo.go"}}, nil, finder, scanner.InspectExistingPath)
+			reconciliation, err := removeOfflineSymbolFilesForScanWithSeams(ctx, scanner, symbols, snapshot, []indexer.FileMeta{{Path: "foo.go"}}, nil, finder, scanner.InspectExistingPath)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(recovered) != 1 || recovered[0].file.Path != "Foo.go" || recovered[0].staleAlias != "" {
-				t.Fatalf("recovered=%v", recovered)
+			if len(reconciliation.reeligible) != 1 || reconciliation.reeligible[0].Path != "Foo.go" || len(reconciliation.retiredAliases) != 0 {
+				t.Fatalf("reconciliation=%v", reconciliation)
 			}
 			idx := indexer.NewIndexer(root, store.NewGOBStore(filepath.Join(t.TempDir(), "index.gob")), &noOpEmbedder{}, indexer.NewChunker(512, 50), scanner, time.Time{})
 			if _, _, err := indexInitialSymbols(ctx, idx, scanner, trace.NewRegexExtractor(), symbols,
@@ -66,7 +66,7 @@ func TestCachedSymbolCaseRenamePreservesActualCaseSibling(t *testing.T) {
 				t.Fatalf("case siblings: Foo=%v foo=%v", symbols.IsFileIndexed("Foo.go"), symbols.IsFileIndexed("foo.go"))
 			}
 			fingerprints, err := symbols.ListFileFingerprints(ctx)
-			if err != nil || fingerprints["Foo.go"].ContentHash != recovered[0].file.Hash || fingerprints["foo.go"].ContentHash != "foo.go" {
+			if err != nil || fingerprints["Foo.go"].ContentHash != reconciliation.reeligible[0].Hash || fingerprints["foo.go"].ContentHash != "foo.go" {
 				t.Fatalf("fingerprints=%v err=%v", fingerprints, err)
 			}
 		})

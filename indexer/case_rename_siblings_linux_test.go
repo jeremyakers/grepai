@@ -50,7 +50,7 @@ func TestCachedCaseRenamePreservesActualCaseSibling(t *testing.T) {
 				}
 			}
 			idx := NewIndexer(root, st, newMockEmbedder(), NewChunker(512, 50), NewScanner(root, ignore), time.Time{})
-			removed, recovered, err := idx.removeCandidatesWithRevalidation(ctx,
+			removed, reconciliation, err := idx.removeCandidatesWithRevalidation(ctx,
 				map[string]store.DocumentMetadata{"Foo.go": {Path: "Foo.go"}}, nil,
 				map[string]string{"Foo.go": "foo.go"},
 			)
@@ -58,7 +58,7 @@ func TestCachedCaseRenamePreservesActualCaseSibling(t *testing.T) {
 				t.Fatal(err)
 			}
 			stats := &IndexStats{ScannedFiles: []FileMeta{{Path: "foo.go"}}}
-			if err := idx.indexReeligibleFiles(ctx, stats, recovered); err != nil {
+			if err := idx.applyRemovalReconciliation(ctx, stats, reconciliation); err != nil {
 				t.Fatal(err)
 			}
 			if removed != 0 || len(stats.ScannedFiles) != 2 {

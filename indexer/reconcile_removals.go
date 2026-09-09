@@ -12,17 +12,18 @@ import (
 	"github.com/yoanbernabeu/grepai/store"
 )
 
-type reeligibleFile struct {
-	file           FileInfo
-	retiredAliases []string
+type removalReconciliation struct {
+	reeligible     []FileInfo
+	retiredAliases []RetiredAlias
 }
 
-func (idx *Indexer) indexReeligibleFiles(ctx context.Context, stats *IndexStats, files []reeligibleFile) error {
-	for _, recovered := range files {
-		file := recovered.file
-		for _, alias := range recovered.retiredAliases {
-			stats.ScannedFiles = removeFileMetaPath(stats.ScannedFiles, alias)
-		}
+func (idx *Indexer) applyRemovalReconciliation(ctx context.Context, stats *IndexStats, result removalReconciliation) error {
+	for _, alias := range result.retiredAliases {
+		stats.ScannedFiles = removeFileMetaPath(stats.ScannedFiles, alias.Path)
+		stats.ExcludedFiles = removeStringPath(stats.ExcludedFiles, alias.Path)
+		stats.RetiredAliases = append(stats.RetiredAliases, alias)
+	}
+	for _, file := range result.reeligible {
 		chunks, err := idx.IndexFile(ctx, file)
 		if err != nil {
 			return fmt.Errorf("index re-eligible file %s: %w", file.Path, err)
@@ -55,15 +56,15 @@ func removeStringPath(paths []string, target string) []string {
 	return filtered
 }
 
-func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candidates map[string]store.DocumentMetadata, exclusions, caseRenames map[string]string) (int, []reeligibleFile, error) {
+func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candidates map[string]store.DocumentMetadata, exclusions, caseRenames map[string]string) (int, removalReconciliation, error) {
 	if err := checkScanRoot(idx.root); err != nil {
-		return 0, nil, fmt.Errorf("scan root unavailable while reconciling removals: %w", err)
+		return 0, removalReconciliation{}, fmt.Errorf("scan root unavailable while reconciling removals: %w", err)
 	}
 	removed := 0
-	var reeligible []reeligibleFile
+	result := removalReconciliation{}
 	for path := range candidates {
 		if err := ctx.Err(); err != nil {
-			return removed, reeligible, err
+			return removed, result, err
 		}
 		_, excluded := exclusions[path]
 		caseWitness, caseRenamed := caseRenames[path]
@@ -71,47 +72,47 @@ func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candid
 		if caseRenamed {
 			current, err := RevalidateCaseRenameWitness(idx.root, path, caseWitness)
 			if err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return removed, reeligible, fmt.Errorf("revalidate case rename %s to %s: %w", path, caseWitness, err)
+				return removed, result, fmt.Errorf("revalidate case rename %s to %s: %w", path, caseWitness, err)
 			}
 			if !current {
 				file, reason, inspectErr := idx.scanner.InspectExistingPath(path)
 				if inspectErr != nil && !errors.Is(inspectErr, fs.ErrNotExist) {
-					return removed, reeligible, fmt.Errorf("inspect reversed case rename %s: %w", path, inspectErr)
+					return removed, result, fmt.Errorf("inspect reversed case rename %s: %w", path, inspectErr)
 				}
 				caseRenamed = false
 				if file != nil && reason == "" {
 					retireAlias, retireErr := CanRetireCaseAlias(idx.root, path, caseWitness)
 					if retireErr != nil {
-						return removed, reeligible, fmt.Errorf("verify temporary case alias %s: %w", caseWitness, retireErr)
+						return removed, result, fmt.Errorf("verify temporary case alias %s: %w", caseWitness, retireErr)
 					}
-					recovered := reeligibleFile{file: *file}
 					if retireAlias {
 						if err := checkScanRoot(idx.root); err != nil {
-							return removed, reeligible, fmt.Errorf("scan root lost before reconciling reversed case rename %s: %w", path, err)
+							return removed, result, fmt.Errorf("scan root lost before reconciling reversed case rename %s: %w", path, err)
 						}
 						if err := idx.RemoveFile(ctx, caseWitness); err != nil {
-							return removed, reeligible, fmt.Errorf("remove temporary case alias %s: %w", caseWitness, err)
+							return removed, result, fmt.Errorf("remove temporary case alias %s: %w", caseWitness, err)
 						}
 						removed++
-						recovered.retiredAliases = []string{caseWitness}
+						result.retiredAliases = append(result.retiredAliases, RetiredAlias{Path: caseWitness, CanonicalPath: path})
 					}
-					reeligible = append(reeligible, recovered)
+					result.reeligible = append(result.reeligible, *file)
 					continue
 				}
 				excluded = reason != ""
 				if excluded {
 					retireAlias, retireErr := CanRetireCaseAlias(idx.root, path, caseWitness)
 					if retireErr != nil {
-						return removed, reeligible, fmt.Errorf("verify temporary excluded case alias %s: %w", caseWitness, retireErr)
+						return removed, result, fmt.Errorf("verify temporary excluded case alias %s: %w", caseWitness, retireErr)
 					}
 					if retireAlias {
 						if err := checkScanRoot(idx.root); err != nil {
-							return removed, reeligible, fmt.Errorf("scan root lost before removing excluded case alias %s: %w", caseWitness, err)
+							return removed, result, fmt.Errorf("scan root lost before removing excluded case alias %s: %w", caseWitness, err)
 						}
 						if err := idx.RemoveFile(ctx, caseWitness); err != nil {
-							return removed, reeligible, fmt.Errorf("remove temporary excluded case alias %s: %w", caseWitness, err)
+							return removed, result, fmt.Errorf("remove temporary excluded case alias %s: %w", caseWitness, err)
 						}
 						removed++
+						result.retiredAliases = append(result.retiredAliases, RetiredAlias{Path: caseWitness, CanonicalPath: path})
 					}
 				}
 			}
@@ -123,7 +124,7 @@ func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candid
 				continue
 			}
 			if reason == "" && file != nil {
-				reeligible = append(reeligible, reeligibleFile{file: *file})
+				result.reeligible = append(result.reeligible, *file)
 				continue
 			}
 			excluded = reason != ""
@@ -136,7 +137,7 @@ func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candid
 			continue
 		}
 		if err := checkScanRoot(idx.root); err != nil {
-			return removed, reeligible, fmt.Errorf("scan root lost before removing %s: %w", path, err)
+			return removed, result, fmt.Errorf("scan root lost before removing %s: %w", path, err)
 		}
 		if err := idx.RemoveFile(ctx, path); err != nil {
 			log.Printf("Failed to remove %s: %v", path, err)
@@ -144,5 +145,5 @@ func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candid
 		}
 		removed++
 	}
-	return removed, reeligible, nil
+	return removed, result, nil
 }
