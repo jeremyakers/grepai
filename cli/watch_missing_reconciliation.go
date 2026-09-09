@@ -14,8 +14,11 @@ import (
 
 func removeFileMissingDuringSymbolScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, symbolStore trace.SymbolStore, path string) (bool, error) {
 	_, err := os.Lstat(filepath.Join(scanner.Root(), path))
-	if err == nil || !errors.Is(err, os.ErrNotExist) {
-		return false, nil
+	if err == nil {
+		return false, fmt.Errorf("missing symbol path %s reappeared before cleanup", path)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("recheck missing symbol path %s: %w", path, err)
 	}
 	if err := verifyInitialScanRoot(scanner.Root()); err != nil {
 		return false, fmt.Errorf("symbol scan root unavailable before removing %s: %w", path, err)
@@ -27,6 +30,58 @@ func removeFileMissingDuringSymbolScan(ctx context.Context, idx *indexer.Indexer
 		return false, fmt.Errorf("remove missing symbol file %s: %w", path, err)
 	}
 	return true, nil
+}
+
+func removeExcludedDuringSymbolScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, symbolStore trace.SymbolStore, path string, reason indexer.PathExclusionReason) error {
+	if err := verifyInitialScanRoot(scanner.Root()); err != nil {
+		return fmt.Errorf("symbol scan root unavailable before removing excluded %s: %w", path, err)
+	}
+	if err := idx.RemoveFile(ctx, path); err != nil {
+		return fmt.Errorf("remove excluded vector file %s: %w", path, err)
+	}
+	if err := symbolStore.DeleteFile(ctx, path); err != nil {
+		return fmt.Errorf("remove excluded symbol file %s (%s): %w", path, reason, err)
+	}
+	return nil
+}
+
+type emptySymbolScanResolution struct {
+	file      *indexer.FileInfo
+	removed   bool
+	chunks    int
+	uncertain error
+}
+
+func reconcileEmptySymbolScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, symbolStore trace.SymbolStore, path string) (emptySymbolScanResolution, error) {
+	return reconcileEmptySymbolScanWithInspect(ctx, idx, scanner, symbolStore, path, scanner.InspectExistingPath)
+}
+
+func reconcileEmptySymbolScanWithInspect(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, symbolStore trace.SymbolStore, path string, inspect existingPathInspector) (emptySymbolScanResolution, error) {
+	fresh, reason, err := inspect(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return emptySymbolScanResolution{uncertain: err}, nil
+		}
+		removed, removeErr := removeFileMissingDuringSymbolScan(ctx, idx, scanner, symbolStore, path)
+		return emptySymbolScanResolution{removed: removed}, removeErr
+	}
+	if reason != "" {
+		if err := removeExcludedDuringSymbolScan(ctx, idx, scanner, symbolStore, path, reason); err != nil {
+			return emptySymbolScanResolution{}, err
+		}
+		return emptySymbolScanResolution{removed: true}, nil
+	}
+	if fresh == nil {
+		return emptySymbolScanResolution{}, fmt.Errorf("symbol scan state changed for %s without a stable snapshot", path)
+	}
+	if err := validateReeligiblePath(fresh, path); err != nil {
+		return emptySymbolScanResolution{}, err
+	}
+	chunks, err := idx.IndexFile(ctx, *fresh)
+	if err != nil {
+		return emptySymbolScanResolution{}, fmt.Errorf("repair vector index for %s after symbol scan change: %w", path, err)
+	}
+	return emptySymbolScanResolution{file: fresh, chunks: chunks}, nil
 }
 
 func verifyInitialScanRoot(root string) error {
@@ -130,6 +185,16 @@ func validateReeligiblePath(file *indexer.FileInfo, indexedPath string) error {
 func appendFileMetaIfMissing(files []indexer.FileMeta, candidate indexer.FileMeta) []indexer.FileMeta {
 	for _, file := range files {
 		if file.Path == candidate.Path {
+			return files
+		}
+	}
+	return append(files, candidate)
+}
+
+func replaceFileMeta(files []indexer.FileMeta, candidate indexer.FileMeta) []indexer.FileMeta {
+	for i := range files {
+		if files[i].Path == candidate.Path {
+			files[i] = candidate
 			return files
 		}
 	}

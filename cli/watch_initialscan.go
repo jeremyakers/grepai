@@ -94,12 +94,17 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	} else {
 		fmt.Println("Building symbol index...")
 	}
-	count, missingDuringSymbols, err := indexInitialSymbols(ctx, idx, scanner, extractor, symbolStore, fingerprints, stats.ScannedFiles, stats.VerifiedUnchangedFiles, tracedLanguages, lastIndexTime, processors...)
+	count, symbolChanges, err := indexInitialSymbols(ctx, idx, scanner, extractor, symbolStore, fingerprints, stats.ScannedFiles, stats.VerifiedUnchangedFiles, tracedLanguages, lastIndexTime, processors...)
 	if err != nil {
 		return nil, err
 	}
-	stats.ScannedFiles = withoutFilePaths(stats.ScannedFiles, missingDuringSymbols)
-	stats.FilesRemoved += len(missingDuringSymbols)
+	stats.ScannedFiles = withoutFilePaths(stats.ScannedFiles, symbolChanges.removed)
+	stats.FilesRemoved += len(symbolChanges.removed)
+	stats.FilesIndexed += len(symbolChanges.reindexed)
+	stats.ChunksCreated += symbolChanges.chunksCreated
+	for _, file := range symbolChanges.reindexed {
+		stats.ScannedFiles = replaceFileMeta(stats.ScannedFiles, indexer.FileMeta{Path: file.Path, Size: file.Size, ModTime: file.ModTime, ObservedModTime: file.ObservedModTime})
+	}
 	if err := symbolStore.Persist(ctx); err != nil {
 		return nil, fmt.Errorf("persist symbol index: %w", err)
 	}
@@ -134,13 +139,19 @@ func indexInitialFiles(ctx context.Context, idx *indexer.Indexer, background boo
 	return stats, err
 }
 
-func indexInitialSymbols(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore trace.SymbolStore, fingerprints initialSymbolFingerprints, files []indexer.FileMeta, verified map[string]indexer.VerifiedFile, languages []string, lastIndexTime time.Time, processors ...*framework.ProcessorRegistry) (int, []string, error) {
+type symbolScanChanges struct {
+	removed       []string
+	reindexed     []indexer.FileInfo
+	chunksCreated int
+}
+
+func indexInitialSymbols(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore trace.SymbolStore, fingerprints initialSymbolFingerprints, files []indexer.FileMeta, verified map[string]indexer.VerifiedFile, languages []string, lastIndexTime time.Time, processors ...*framework.ProcessorRegistry) (int, symbolScanChanges, error) {
 	_ = lastIndexTime // Deprecated: per-file exact observations govern correctness.
 	count := 0
-	var missing []string
+	changes := symbolScanChanges{}
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
-			return 0, missing, err
+			return 0, changes, err
 		}
 		if !isTracedLanguage(strings.ToLower(filepath.Ext(file.Path)), languages) {
 			continue
@@ -157,10 +168,10 @@ func indexInitialSymbols(ctx context.Context, idx *indexer.Indexer, scanner *ind
 			if errors.Is(err, os.ErrNotExist) {
 				removed, removeErr := removeFileMissingDuringSymbolScan(ctx, idx, scanner, symbolStore, file.Path)
 				if removeErr != nil {
-					return count, missing, removeErr
+					return count, changes, removeErr
 				}
 				if removed {
-					missing = append(missing, file.Path)
+					changes.removed = append(changes.removed, file.Path)
 				}
 				continue
 			}
@@ -168,7 +179,22 @@ func indexInitialSymbols(ctx context.Context, idx *indexer.Indexer, scanner *ind
 			continue
 		}
 		if info == nil {
-			continue
+			resolution, err := reconcileEmptySymbolScan(ctx, idx, scanner, symbolStore, file.Path)
+			if err != nil {
+				return count, changes, err
+			}
+			if resolution.uncertain != nil {
+				log.Printf("Warning: failed to classify %s after empty symbol scan: %v", file.Path, resolution.uncertain)
+				continue
+			}
+			if resolution.removed {
+				changes.removed = append(changes.removed, file.Path)
+				continue
+			}
+			changes.reindexed = append(changes.reindexed, *resolution.file)
+			changes.chunksCreated += resolution.chunks
+			delete(verified, file.Path)
+			info = resolution.file
 		}
 		hash, version, hashOK, versionOK = fingerprints.values(info.Path)
 		if hashOK && versionOK && hash == info.Hash && version == extractor.Version() {
@@ -185,11 +211,11 @@ func indexInitialSymbols(ctx context.Context, idx *indexer.Indexer, scanner *ind
 			err = symbolStore.SaveFile(ctx, info.Path, symbols, refs)
 		}
 		if err != nil {
-			return count, missing, fmt.Errorf("save symbols for %s: %w", info.Path, err)
+			return count, changes, fmt.Errorf("save symbols for %s: %w", info.Path, err)
 		}
 		count += len(symbols)
 	}
-	return count, missing, nil
+	return count, changes, nil
 }
 
 func announceInitialScan(background bool) {
