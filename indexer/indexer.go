@@ -22,6 +22,9 @@ type Indexer struct {
 	chunker   *Chunker
 	scanner   *Scanner
 	processor *framework.ProcessorRegistry
+	// allowMetadataFastSkip is an optimization mode selected by a non-zero
+	// legacy constructor cutoff. The cutoff value is not compared to file times.
+	allowMetadataFastSkip bool
 }
 
 type IndexStats struct {
@@ -32,6 +35,7 @@ type IndexStats struct {
 	Duration               time.Duration
 	ScannedFiles           []FileMeta // All files found during scan (for reuse by callers)
 	VerifiedUnchangedFiles map[string]VerifiedFile
+	ExcludedFiles          []string
 }
 
 type VerifiedFile struct {
@@ -73,7 +77,6 @@ func NewIndexer(
 	lastIndexTime time.Time,
 	processors ...*framework.ProcessorRegistry,
 ) *Indexer {
-	_ = lastIndexTime // Deprecated: exact per-file observations govern reconciliation.
 	var processor *framework.ProcessorRegistry
 	if len(processors) > 0 {
 		processor = processors[0]
@@ -81,6 +84,7 @@ func NewIndexer(
 
 	return &Indexer{
 		root: root, store: st, embedder: emb, chunker: chunker, scanner: scanner, processor: processor,
+		allowMetadataFastSkip: !lastIndexTime.IsZero(),
 	}
 }
 
@@ -156,7 +160,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 
 	// Collect results in original scan order for deterministic output.
 	filesToIndex := make([]FileInfo, 0, len(fileMetas))
-	for _, decision := range decisions {
+	for i, decision := range decisions {
 		if decision.countAsSkipped {
 			stats.FilesSkipped++
 		}
@@ -165,6 +169,9 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		}
 		if decision.verified != nil {
 			stats.VerifiedUnchangedFiles[decision.verifiedPath] = *decision.verified
+		}
+		if decision.excluded {
+			stats.ExcludedFiles = append(stats.ExcludedFiles, fileMetas[i].Path)
 		}
 	}
 
@@ -207,11 +214,17 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 	}
 
 	for i, fileMeta := range fileMetas {
-		if !decisions[i].missingAfterWalk {
+		if !decisions[i].missingAfterWalk && !decisions[i].excluded {
 			delete(existingDocs, fileMeta.Path)
 		}
 	}
-	removed, err := idx.removeMissingFilesForScan(ctx, existingDocs, fileMetas)
+	forcedRemovals := make(map[string]string)
+	for i, fileMeta := range fileMetas {
+		if decisions[i].excluded {
+			forcedRemovals[fileMeta.Path] = "scan exclusion"
+		}
+	}
+	removed, err := idx.removeMissingFilesForScan(ctx, existingDocs, fileMetas, forcedRemovals)
 	if err != nil {
 		return nil, err
 	}

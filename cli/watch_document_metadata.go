@@ -9,7 +9,14 @@ import (
 )
 
 func (p *projectPrefixStore) ListDocumentMetadata(ctx context.Context) ([]store.DocumentMetadata, error) {
-	all, err := store.LoadDocumentMetadata(ctx, p.store)
+	source, ok := p.store.(store.DocumentMetadataSource)
+	if !ok {
+		// Hide this wrapper's bulk capability so the generic fallback uses its
+		// prefix-scoped ListDocuments and GetDocument methods.
+		fallback := struct{ store.VectorStore }{VectorStore: p}
+		return store.LoadDocumentMetadata(ctx, &fallback)
+	}
+	all, err := source.ListDocumentMetadata(ctx)
 	if err != nil {
 		return nil, err
 	}

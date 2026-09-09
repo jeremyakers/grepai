@@ -19,6 +19,7 @@ type fileScanDecision struct {
 	verifiedPath     string
 	verified         *VerifiedFile
 	missingAfterWalk bool
+	excluded         bool
 }
 
 func (idx *Indexer) scanMetadataForReconciliation(ctx context.Context) ([]FileMeta, []string, error) {
@@ -47,14 +48,15 @@ func (idx *Indexer) decideFileScanFromMeta(ctx context.Context, fileMeta FileMet
 	if err := ctx.Err(); err != nil {
 		return fileScanDecision{}, err
 	}
-	if existing != nil && existing.HasChunks && existing.Hash != "" && existing.HasExactModTime {
+	if idx.allowMetadataFastSkip && existing != nil && existing.HasChunks && existing.Hash != "" && existing.HasExactModTime {
 		fresh, err := idx.scanner.StatFile(fileMeta.Path)
 		if err != nil {
 			log.Printf("Failed to stat %s: %v", fileMeta.Path, err)
 			return fileScanDecision{countAsSkipped: true, missingAfterWalk: errors.Is(err, fs.ErrNotExist)}, nil
 		}
 		if fresh == nil {
-			return fileScanDecision{countAsSkipped: true}, nil
+			reason, classifyErr := idx.scanner.ExistingPathExclusion(fileMeta.Path)
+			return fileScanDecision{countAsSkipped: true, excluded: classifyErr == nil && reason != ""}, nil
 		}
 		if hasExactTimestamp(fresh.ObservedModTime) && existing.ModTime.Equal(fresh.ObservedModTime) {
 			verified := VerifiedFile{Hash: existing.Hash, Size: fresh.Size, ModTime: fresh.ObservedModTime}
@@ -67,7 +69,8 @@ func (idx *Indexer) decideFileScanFromMeta(ctx context.Context, fileMeta FileMet
 		return fileScanDecision{countAsSkipped: true, missingAfterWalk: errors.Is(err, fs.ErrNotExist)}, nil
 	}
 	if file == nil {
-		return fileScanDecision{countAsSkipped: true}, nil
+		reason, classifyErr := idx.scanner.ExistingPathExclusion(fileMeta.Path)
+		return fileScanDecision{countAsSkipped: true, excluded: classifyErr == nil && reason != ""}, nil
 	}
 	if existing != nil && existing.Hash == file.Hash && existing.HasChunks {
 		return idx.refreshMatchingDocument(ctx, file, existing)
@@ -125,13 +128,27 @@ func (idx *Indexer) refreshMatchingDocument(ctx context.Context, file *FileInfo,
 	return fileScanDecision{}, fmt.Errorf("refresh document timestamp: concurrent updates did not stabilize")
 }
 
-func (idx *Indexer) removeMissingFilesForScan(ctx context.Context, candidates map[string]store.DocumentMetadata, scanned []FileMeta) (int, error) {
+func (idx *Indexer) removeMissingFilesForScan(ctx context.Context, candidates map[string]store.DocumentMetadata, scanned []FileMeta, forcedRemovals map[string]string) (int, error) {
 	paths := make([]string, 0, len(candidates))
 	for path := range candidates {
 		paths = append(paths, path)
 	}
 	witnesses := FindCaseRenameWitnesses(idx.root, paths, scanned)
-	return idx.removeMissingFilesWithWitnesses(ctx, candidates, witnesses, os.Lstat)
+	for path, witness := range witnesses {
+		forcedRemovals[path] = "case rename to " + witness
+	}
+	for path := range candidates {
+		if _, forced := forcedRemovals[path]; forced {
+			continue
+		}
+		reason, err := idx.scanner.ExistingPathExclusion(path)
+		if err == nil && reason != "" {
+			forcedRemovals[path] = string(reason)
+		} else if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			log.Printf("Warning: cannot classify %s (%v); keeping its index entry", path, err)
+		}
+	}
+	return idx.removeMissingFilesWithWitnesses(ctx, candidates, forcedRemovals, os.Lstat)
 }
 
 type lstatFunc func(string) (os.FileInfo, error)
