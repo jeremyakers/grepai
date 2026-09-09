@@ -70,13 +70,17 @@ func withoutPath(paths []string, removed string) []string {
 }
 
 func consumeRetiredAliases(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, symbolStore trace.SymbolStore, fingerprints map[string]trace.FileFingerprint, stats *indexer.IndexStats, aliases []indexer.RetiredAlias) error {
+	return consumeRetiredAliasesWithInspect(ctx, idx, scanner, symbolStore, fingerprints, stats, aliases, scanner.InspectExistingPath)
+}
+
+func consumeRetiredAliasesWithInspect(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, symbolStore trace.SymbolStore, fingerprints map[string]trace.FileFingerprint, stats *indexer.IndexStats, aliases []indexer.RetiredAlias, inspect existingPathInspector) error {
 	for _, alias := range aliases {
 		retire, err := indexer.CanRetireCaseAlias(scanner.Root(), alias.CanonicalPath, alias.Path)
 		if err != nil {
 			return fmt.Errorf("revalidate retired case alias %s: %w", alias.Path, err)
 		}
 		if !retire {
-			file, reason, inspectErr := scanner.InspectExistingPath(alias.Path)
+			file, reason, inspectErr := inspect(alias.Path)
 			if inspectErr != nil {
 				return fmt.Errorf("inspect reappeared case alias %s: %w", alias.Path, inspectErr)
 			}
@@ -85,6 +89,9 @@ func consumeRetiredAliases(ctx context.Context, idx *indexer.Indexer, scanner *i
 			}
 			if file == nil {
 				return fmt.Errorf("retired case alias %s changed state without a stable snapshot", alias.Path)
+			}
+			if err := validateReeligiblePath(file, alias.Path); err != nil {
+				return err
 			}
 			chunks, err := idx.IndexFile(ctx, *file)
 			if err != nil {
@@ -108,6 +115,14 @@ func consumeRetiredAliases(ctx context.Context, idx *indexer.Indexer, scanner *i
 		delete(fingerprints, alias.Path)
 		stats.ScannedFiles = withoutFilePaths(stats.ScannedFiles, []string{alias.Path})
 		stats.ExcludedFiles = withoutPath(stats.ExcludedFiles, alias.Path)
+	}
+	return nil
+}
+
+func validateReeligiblePath(file *indexer.FileInfo, indexedPath string) error {
+	expected := filepath.FromSlash(indexedPath)
+	if file.Path != expected {
+		return fmt.Errorf("indexed path %q changed to unexpected spelling %q during re-eligibility", expected, file.Path)
 	}
 	return nil
 }
