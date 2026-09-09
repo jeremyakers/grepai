@@ -902,7 +902,7 @@ func watchProjectWithEventObserverAndFence(ctx context.Context, projectRoot stri
 	defer finishStartup()
 
 	return runProjectWatchWithWriterLock(projectRoot, func(canonicalRoot string) error {
-		return watchProjectWithEventObserverLocked(startupCtx, canonicalRoot, emb, isBackgroundChild, onReady, onEvent, onScan, onEmbed, onRPG, onActivity, onStats, notifyFatal, mutationFence, finishStartup, startupWiring...)
+		return watchProjectWithEventObserverLocked(ctx, startupCtx, canonicalRoot, emb, isBackgroundChild, onReady, onEvent, onScan, onEmbed, onRPG, onActivity, onStats, notifyFatal, mutationFence, finishStartup, startupWiring...)
 	})
 }
 
@@ -919,8 +919,7 @@ func runProjectWatchWithWriterLock(projectRoot string, run func(canonicalRoot st
 	return run(writerLock.ProjectRoot())
 }
 
-func watchProjectWithEventObserverLocked(startupCtx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver, onFatal func(), mutationFence *watchMutationFence, finishStartup func(), startupWiring ...watchProjectStartupWiring) error {
-	ctx := startupCtx
+func watchProjectWithEventObserverLocked(ctx, startupCtx context.Context, projectRoot string, emb embedder.Embedder, isBackgroundChild bool, onReady func(), onEvent watchEventObserver, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), onRPG func(step string, current, total int), onActivity watchActivityObserver, onStats watchStatsObserver, onFatal func(), mutationFence *watchMutationFence, finishStartup func(), startupWiring ...watchProjectStartupWiring) error {
 	// Load configuration
 	cfg, err := config.Load(projectRoot)
 	if err != nil {
