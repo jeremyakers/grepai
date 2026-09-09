@@ -122,3 +122,55 @@ func TestReconcileDeletedDirectoryRejectsUnavailableProjectRoot(t *testing.T) {
 		})
 	}
 }
+
+func TestHandleFileEventDirectoryReplacementSkipsUnsupportedFiles(t *testing.T) {
+	for _, replacementPath := range []string{"target.xyz", "target"} {
+		t.Run(replacementPath, func(t *testing.T) {
+			ctx := context.Background()
+			h := newAtomicWriteHarness(t)
+			childPath := filepath.Join(replacementPath, "old.go")
+			indexDirectoryHarnessFile(t, h, childPath, "package old\nfunc Old() {}\n")
+
+			if err := os.RemoveAll(filepath.Join(h.projectRoot, replacementPath)); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(h.projectRoot, replacementPath), []byte("unsupported replacement"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			h.dispatch(ctx, watcher.FileEvent{Type: watcher.EventRename, Path: replacementPath, IsDir: true})
+
+			if doc, err := h.vecStore.GetDocument(ctx, childPath); err != nil || doc != nil {
+				t.Fatalf("old child document = %#v, err=%v", doc, err)
+			}
+			if doc, err := h.vecStore.GetDocument(ctx, replacementPath); err != nil || doc != nil {
+				t.Fatalf("unsupported replacement document = %#v, err=%v", doc, err)
+			}
+			if info, err := os.Lstat(filepath.Join(h.projectRoot, replacementPath)); err != nil || !info.Mode().IsRegular() {
+				t.Fatalf("replacement on disk: info=%#v err=%v", info, err)
+			}
+		})
+	}
+}
+
+func TestHandleFileEventDirectoryReplacementHonorsCustomExtension(t *testing.T) {
+	ctx := context.Background()
+	h := newAtomicWriteHarness(t)
+	h.scanner.WithCustomExtensions([]string{".xyz"})
+	replacementPath := "target.xyz"
+	childPath := filepath.Join(replacementPath, "old.go")
+	indexDirectoryHarnessFile(t, h, childPath, "package old\nfunc Old() {}\n")
+	if err := os.RemoveAll(filepath.Join(h.projectRoot, replacementPath)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(h.projectRoot, replacementPath), []byte("custom replacement"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.dispatch(ctx, watcher.FileEvent{Type: watcher.EventRename, Path: replacementPath, IsDir: true})
+
+	if doc, err := h.vecStore.GetDocument(ctx, childPath); err != nil || doc != nil {
+		t.Fatalf("old child document = %#v, err=%v", doc, err)
+	}
+	if doc, err := h.vecStore.GetDocument(ctx, replacementPath); err != nil || doc == nil {
+		t.Fatalf("custom replacement document = %#v, err=%v", doc, err)
+	}
+}
