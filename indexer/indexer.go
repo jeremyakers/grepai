@@ -36,6 +36,12 @@ type IndexStats struct {
 	ScannedFiles           []FileMeta // All files found during scan (for reuse by callers)
 	VerifiedUnchangedFiles map[string]VerifiedFile
 	ExcludedFiles          []string
+	RetiredAliases         []RetiredAlias
+}
+
+type RetiredAlias struct {
+	Path          string
+	CanonicalPath string
 }
 
 type VerifiedFile struct {
@@ -227,34 +233,17 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			forcedRemovals[fileMeta.Path] = "scan exclusion"
 		}
 	}
-	removed, reeligible, err := idx.removeMissingFilesForScan(ctx, existingDocs, fileMetas, forcedRemovals)
+	removed, reconciliation, err := idx.removeMissingFilesForScan(ctx, existingDocs, fileMetas, forcedRemovals)
 	if err != nil {
 		return nil, err
 	}
 	stats.FilesRemoved = removed
-	for _, file := range reeligible {
-		chunks, err := idx.IndexFile(ctx, file)
-		if err != nil {
-			return nil, fmt.Errorf("index re-eligible file %s: %w", file.Path, err)
-		}
-		stats.FilesIndexed++
-		stats.ChunksCreated += chunks
-		stats.ScannedFiles = append(stats.ScannedFiles, FileMeta{Path: file.Path, Size: file.Size, ModTime: file.ModTime, ObservedModTime: file.ObservedModTime})
-		stats.ExcludedFiles = removePath(stats.ExcludedFiles, file.Path)
+	if err := idx.applyRemovalReconciliation(ctx, stats, reconciliation); err != nil {
+		return nil, err
 	}
 
 	stats.Duration = time.Since(start)
 	return stats, nil
-}
-
-func removePath(paths []string, target string) []string {
-	filtered := paths[:0]
-	for _, path := range paths {
-		if path != target {
-			filtered = append(filtered, path)
-		}
-	}
-	return filtered
 }
 
 // scanWorkerLimit returns the number of concurrent workers to use when

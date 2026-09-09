@@ -67,11 +67,18 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 		return nil, err
 	}
 	announceInitialScanComplete(stats, background)
-	reeligibleSymbols, err := removeOfflineSymbolFilesForScan(ctx, scanner, symbolStore, fingerprints.snapshot, stats.ScannedFiles, stats.ExcludedFiles)
+	if err := consumeRetiredAliases(ctx, idx, scanner, symbolStore, fingerprints.snapshot, stats, stats.RetiredAliases); err != nil {
+		return nil, err
+	}
+	stats.RetiredAliases = nil
+	symbolReconciliation, err := removeOfflineSymbolFilesForScan(ctx, scanner, symbolStore, fingerprints.snapshot, stats.ScannedFiles, stats.ExcludedFiles)
 	if err != nil {
 		return nil, err
 	}
-	for _, file := range reeligibleSymbols {
+	if err := consumeRetiredAliases(ctx, idx, scanner, symbolStore, fingerprints.snapshot, stats, symbolReconciliation.retiredAliases); err != nil {
+		return nil, err
+	}
+	for _, file := range symbolReconciliation.reeligible {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}

@@ -122,9 +122,6 @@ func (s *GOBStore) GetDocument(ctx context.Context, filePath string) (*Document,
 }
 
 func (s *GOBStore) SaveDocument(ctx context.Context, doc Document) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
 	s.mutateDocument(doc.Path, func(Document, bool) (Document, bool) {
 		return doc, true
 	})

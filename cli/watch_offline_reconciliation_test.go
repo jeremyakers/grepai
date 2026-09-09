@@ -72,7 +72,16 @@ func TestRemoveOfflineSymbolFilesPreservesSnapshotWhenRootIsMissing(t *testing.T
 func TestRemoveOfflineSymbolFilesAcceptsVerifiedCaseRenameWitness(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, "Foo.go"), []byte("package foo\n"), 0o644); err != nil {
+	oldPath := filepath.Join(root, "Foo.go")
+	currentPath := filepath.Join(root, "foo.go")
+	temporaryPath := filepath.Join(root, "case-rename-temp.go")
+	if err := os.WriteFile(oldPath, []byte("package foo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(oldPath, temporaryPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(temporaryPath, currentPath); err != nil {
 		t.Fatal(err)
 	}
 	ignore, err := indexer.NewIgnoreMatcher(root, nil, "")
@@ -99,6 +108,9 @@ func TestRemoveOfflineSymbolFilesAcceptsVerifiedCaseRenameWitness(t *testing.T) 
 	}
 	if symbols.IsFileIndexed("Foo.go") {
 		t.Fatal("old symbol spelling retained after witnessed case rename")
+	}
+	if _, err := os.Stat(currentPath); err != nil {
+		t.Fatalf("current physical spelling changed during index cleanup: %v", err)
 	}
 }
 
@@ -149,6 +161,35 @@ func TestOfflineCaseRenameWithAncestorSpellingChange(t *testing.T) {
 	}
 	if symbols.IsFileIndexed("Dir/Foo.go") {
 		t.Fatal("ancestor case-rename left old symbol spelling")
+	}
+}
+
+func TestCachedCaseRenameReversalPreservesFinalSymbolSpelling(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "Foo.go"), []byte("package foo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ignore, err := indexer.NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := indexer.NewScanner(root, ignore)
+	symbols := trace.NewGOBSymbolStore(filepath.Join(t.TempDir(), "symbols.gob"))
+	for _, path := range []string{"Foo.go", "foo.go"} {
+		if err := symbols.SaveFileWithSignature(ctx, path, path, "version", nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	finder := func(string, []string, []indexer.FileMeta) map[string]string {
+		return map[string]string{"Foo.go": "foo.go"}
+	}
+	snapshot := map[string]trace.FileFingerprint{"Foo.go": {ContentHash: "old", HasContentHash: true}}
+	if err := removeOfflineSymbolFilesWithCaseRenames(ctx, scanner, symbols, snapshot, []indexer.FileMeta{{Path: "foo.go"}}, nil, finder); err != nil {
+		t.Fatal(err)
+	}
+	if !symbols.IsFileIndexed("Foo.go") || symbols.IsFileIndexed("foo.go") {
+		t.Fatalf("final symbol spellings: Foo=%v foo=%v", symbols.IsFileIndexed("Foo.go"), symbols.IsFileIndexed("foo.go"))
 	}
 }
 

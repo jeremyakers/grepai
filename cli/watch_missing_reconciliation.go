@@ -68,3 +68,58 @@ func withoutPath(paths []string, removed string) []string {
 	}
 	return filtered
 }
+
+func consumeRetiredAliases(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, symbolStore trace.SymbolStore, fingerprints map[string]trace.FileFingerprint, stats *indexer.IndexStats, aliases []indexer.RetiredAlias) error {
+	for _, alias := range aliases {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		retire, err := indexer.CanRetireCaseAlias(scanner.Root(), alias.CanonicalPath, alias.Path)
+		if err != nil {
+			return fmt.Errorf("revalidate retired case alias %s: %w", alias.Path, err)
+		}
+		if !retire {
+			file, reason, inspectErr := scanner.InspectExistingPath(alias.Path)
+			if inspectErr != nil {
+				return fmt.Errorf("inspect reappeared case alias %s: %w", alias.Path, inspectErr)
+			}
+			if reason != "" {
+				return fmt.Errorf("retired case alias %s changed to excluded state %q", alias.Path, reason)
+			}
+			if file == nil {
+				return fmt.Errorf("retired case alias %s changed state without a stable snapshot", alias.Path)
+			}
+			chunks, err := idx.IndexFile(ctx, *file)
+			if err != nil {
+				return fmt.Errorf("index reappeared case alias %s: %w", alias.Path, err)
+			}
+			stats.FilesIndexed++
+			stats.ChunksCreated += chunks
+			stats.ScannedFiles = appendFileMetaIfMissing(stats.ScannedFiles, indexer.FileMeta{Path: file.Path, Size: file.Size, ModTime: file.ModTime, ObservedModTime: file.ObservedModTime})
+			delete(stats.VerifiedUnchangedFiles, file.Path)
+			continue
+		}
+		if err := verifyInitialScanRoot(scanner.Root()); err != nil {
+			return fmt.Errorf("root unavailable before consuming retired alias %s: %w", alias.Path, err)
+		}
+		if err := idx.RemoveFile(ctx, alias.Path); err != nil {
+			return fmt.Errorf("remove retired vector case alias %s: %w", alias.Path, err)
+		}
+		if err := symbolStore.DeleteFile(ctx, alias.Path); err != nil {
+			return fmt.Errorf("remove retired symbol case alias %s: %w", alias.Path, err)
+		}
+		delete(fingerprints, alias.Path)
+		stats.ScannedFiles = withoutFilePaths(stats.ScannedFiles, []string{alias.Path})
+		stats.ExcludedFiles = withoutPath(stats.ExcludedFiles, alias.Path)
+	}
+	return nil
+}
+
+func appendFileMetaIfMissing(files []indexer.FileMeta, candidate indexer.FileMeta) []indexer.FileMeta {
+	for _, file := range files {
+		if file.Path == candidate.Path {
+			return files
+		}
+	}
+	return append(files, candidate)
+}
