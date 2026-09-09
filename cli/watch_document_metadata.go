@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,7 +25,7 @@ func (p *projectPrefixStore) ListDocumentMetadata(ctx context.Context) ([]store.
 	out := make([]store.DocumentMetadata, 0, len(all))
 	for _, metadata := range all {
 		if strings.HasPrefix(metadata.Path, prefix) {
-			metadata.Path = strings.TrimPrefix(metadata.Path, prefix)
+			metadata.Path = filepath.FromSlash(strings.TrimPrefix(metadata.Path, prefix))
 			out = append(out, metadata)
 		}
 	}
