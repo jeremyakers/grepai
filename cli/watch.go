@@ -735,11 +735,16 @@ func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore trace.S
 				log.Printf("Warning: failed to persist symbol index: %v", err)
 			}
 
-		case event := <-w.Events():
+		case event, ok := <-w.Events():
+			if !ok {
+				return ctx.Err()
+			}
 			handleFileEvent(ctx, idx, scanner, extractor, symbolStore, nil, nil, tracedLanguages, projectRoot, cfg, &lastConfigWrite, nil, event, nil, nil, processors...)
 
-		case err := <-w.Errors():
-			_ = persistAndExit()
+		case err, ok := <-w.Errors():
+			if !ok {
+				return ctx.Err()
+			}
 			return fmt.Errorf("filesystem watcher failed for %s: %w", projectRoot, err)
 		}
 	}
@@ -1030,7 +1035,8 @@ func watchProjectWithEventObserverLocked(ctx context.Context, projectRoot string
 	}
 
 	// Initialize watcher
-	w, err := watcher.NewWatcher(projectRoot, ignoreMatcher, cfg.Watch.DebounceMs)
+	w, err := watcher.NewWatcher(projectRoot, ignoreMatcher, cfg.Watch.DebounceMs,
+		watcher.WithFileFilter(scanner.SupportsPath))
 	if err != nil {
 		abortStores = isFatalWatcherError(err)
 		return fmt.Errorf("failed to initialize watcher for %s: %w", projectRoot, err)
@@ -1137,7 +1143,10 @@ func runProjectWatchLoopWithFence(ctx context.Context, st store.VectorStore, sym
 		select {
 		case <-fatalMonitorCtx.Done():
 			return
-		case err := <-w.Errors():
+		case err, ok := <-w.Errors():
+			if !ok {
+				return
+			}
 			primary := fmt.Errorf("filesystem watcher failed for %s: %w", projectRoot, err)
 			mutationFence.failWithCause(primary, w.Abort, onFatal)
 			fatalChan <- primary
@@ -2121,6 +2130,7 @@ func extractSymbolsWithFramework(ctx context.Context, extractor trace.SymbolExtr
 	return symbols, refs, nil
 }
 
+/* Superseded by watch_file_events.go.
 func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore trace.SymbolStore, rpgEncoder *rpg.RPGEncoder, vectorStore store.VectorStore, enabledLanguages []string, projectRoot string, cfg *config.Config, lastConfigWrite *time.Time, rpgManager *rpgRealtimeManager, event watcher.FileEvent, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) {
 	// An atomic write -- write to a temp file, then rename it over the target
 	// -- surfaces on the destination path as RENAME/REMOVE with no follow-up
@@ -2299,6 +2309,7 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 	}
 }
 
+*/
 // isTracedLanguage checks if a file extension is in the enabled languages list.
 func isTracedLanguage(ext string, enabledLanguages []string) bool {
 	for _, lang := range enabledLanguages {
@@ -2921,7 +2932,8 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 		manager = newRPGRealtimeManager(projectCfg.Watch.RPGMaxDirtyFilesPerBatch)
 	}
 
-	w, err := watcher.NewWatcher(project.Path, ignoreMatcher, projectCfg.Watch.DebounceMs)
+	w, err := watcher.NewWatcher(project.Path, ignoreMatcher, projectCfg.Watch.DebounceMs,
+		watcher.WithFileFilter(scanner.SupportsPath))
 	if err != nil {
 		if !isFatalWatcherError(err) {
 			if rpgStore != nil {

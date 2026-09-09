@@ -82,7 +82,10 @@ func forwardWorkspaceWatcher(ctx context.Context, runtime *workspaceProjectRunti
 		select {
 		case <-ctx.Done():
 			return
-		case event := <-runtime.watcher.Events():
+		case event, ok := <-runtime.watcher.Events():
+			if !ok {
+				return
+			}
 			select {
 			case events <- workspaceWatchEvent{projectPath: runtime.project.Path, event: event}:
 			case <-ctx.Done():
@@ -96,7 +99,10 @@ func monitorWorkspaceWatcher(ctx context.Context, runtime *workspaceProjectRunti
 	select {
 	case <-ctx.Done():
 		return
-	case err := <-runtime.watcher.Errors():
+	case err, ok := <-runtime.watcher.Errors():
+		if !ok {
+			return
+		}
 		fatal := &workspaceWatcherError{ProjectName: runtime.project.Name, ProjectPath: runtime.project.Path, Cause: err}
 		fence.failWithCause(fatal, abort, withdraw)
 		select {
