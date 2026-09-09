@@ -253,7 +253,7 @@ func TestProjectPrefixStore_PassThroughAndGetChunks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListDocuments failed: %v", err)
 	}
-	wantDocs := []string{"main.go", "sub/file.go"}
+	wantDocs := []string{"main.go", filepath.Join("sub", "file.go")}
 	if len(docs) != len(wantDocs) {
 		t.Fatalf("ListDocuments: expected %d paths (filtered + stripped), got %d: %v",
 			len(wantDocs), len(docs), docs)

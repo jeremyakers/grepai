@@ -110,7 +110,6 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		return nil, fmt.Errorf("failed to scan files: %w", err)
 	}
 	stats.FilesSkipped = len(skipped)
-	stats.ScannedFiles = fileMetas
 
 	existingDocs, err := idx.loadExistingDocumentMetadata(ctx)
 	if err != nil {
@@ -160,6 +159,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 
 	// Collect results in original scan order for deterministic output.
 	filesToIndex := make([]FileInfo, 0, len(fileMetas))
+	stats.ScannedFiles = make([]FileMeta, 0, len(fileMetas))
 	for i, decision := range decisions {
 		if decision.countAsSkipped {
 			stats.FilesSkipped++
@@ -172,6 +172,9 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		}
 		if decision.excluded {
 			stats.ExcludedFiles = append(stats.ExcludedFiles, fileMetas[i].Path)
+		}
+		if !decision.missingAfterWalk && !decision.excluded {
+			stats.ScannedFiles = append(stats.ScannedFiles, fileMetas[i])
 		}
 	}
 
@@ -224,14 +227,34 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 			forcedRemovals[fileMeta.Path] = "scan exclusion"
 		}
 	}
-	removed, err := idx.removeMissingFilesForScan(ctx, existingDocs, fileMetas, forcedRemovals)
+	removed, reeligible, err := idx.removeMissingFilesForScan(ctx, existingDocs, fileMetas, forcedRemovals)
 	if err != nil {
 		return nil, err
 	}
 	stats.FilesRemoved = removed
+	for _, file := range reeligible {
+		chunks, err := idx.IndexFile(ctx, file)
+		if err != nil {
+			return nil, fmt.Errorf("index re-eligible file %s: %w", file.Path, err)
+		}
+		stats.FilesIndexed++
+		stats.ChunksCreated += chunks
+		stats.ScannedFiles = append(stats.ScannedFiles, FileMeta{Path: file.Path, Size: file.Size, ModTime: file.ModTime, ObservedModTime: file.ObservedModTime})
+		stats.ExcludedFiles = removePath(stats.ExcludedFiles, file.Path)
+	}
 
 	stats.Duration = time.Since(start)
 	return stats, nil
+}
+
+func removePath(paths []string, target string) []string {
+	filtered := paths[:0]
+	for _, path := range paths {
+		if path != target {
+			filtered = append(filtered, path)
+		}
+	}
+	return filtered
 }
 
 // scanWorkerLimit returns the number of concurrent workers to use when

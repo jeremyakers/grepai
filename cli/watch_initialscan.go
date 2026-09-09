@@ -7,7 +7,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -68,16 +67,35 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 		return nil, err
 	}
 	announceInitialScanComplete(stats, background)
-	if err := removeOfflineSymbolFiles(ctx, scanner, symbolStore, fingerprints.snapshot, stats.ScannedFiles, stats.ExcludedFiles); err != nil {
+	reeligibleSymbols, err := removeOfflineSymbolFilesForScan(ctx, scanner, symbolStore, fingerprints.snapshot, stats.ScannedFiles, stats.ExcludedFiles)
+	if err != nil {
 		return nil, err
+	}
+	for _, file := range reeligibleSymbols {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		chunks, err := idx.IndexFile(ctx, file)
+		if err != nil {
+			return nil, fmt.Errorf("index re-eligible file %s: %w", file.Path, err)
+		}
+		stats.FilesIndexed++
+		stats.ChunksCreated += chunks
+		stats.ScannedFiles = append(stats.ScannedFiles, indexer.FileMeta{Path: file.Path, Size: file.Size, ModTime: file.ModTime, ObservedModTime: file.ObservedModTime})
+		stats.ExcludedFiles = withoutPath(stats.ExcludedFiles, file.Path)
 	}
 	if background {
 		log.Println("Building symbol index...")
 	} else {
 		fmt.Println("Building symbol index...")
 	}
-	count, err := indexInitialSymbols(ctx, scanner, extractor, symbolStore, fingerprints, stats.ScannedFiles, stats.VerifiedUnchangedFiles, tracedLanguages, lastIndexTime, processors...)
+	count, missingDuringSymbols, err := indexInitialSymbols(ctx, idx, scanner, extractor, symbolStore, fingerprints, stats.ScannedFiles, stats.VerifiedUnchangedFiles, tracedLanguages, lastIndexTime, processors...)
 	if err != nil {
+		return nil, err
+	}
+	stats.ScannedFiles = withoutFilePaths(stats.ScannedFiles, missingDuringSymbols)
+	stats.FilesRemoved += len(missingDuringSymbols)
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if err := symbolStore.Persist(ctx); err != nil {
@@ -114,12 +132,13 @@ func indexInitialFiles(ctx context.Context, idx *indexer.Indexer, background boo
 	return stats, err
 }
 
-func indexInitialSymbols(ctx context.Context, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore trace.SymbolStore, fingerprints initialSymbolFingerprints, files []indexer.FileMeta, verified map[string]indexer.VerifiedFile, languages []string, lastIndexTime time.Time, processors ...*framework.ProcessorRegistry) (int, error) {
+func indexInitialSymbols(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore trace.SymbolStore, fingerprints initialSymbolFingerprints, files []indexer.FileMeta, verified map[string]indexer.VerifiedFile, languages []string, lastIndexTime time.Time, processors ...*framework.ProcessorRegistry) (int, []string, error) {
 	_ = lastIndexTime // Deprecated: per-file exact observations govern correctness.
 	count := 0
+	var missing []string
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
-			return 0, err
+			return 0, missing, err
 		}
 		if !isTracedLanguage(strings.ToLower(filepath.Ext(file.Path)), languages) {
 			continue
@@ -133,6 +152,16 @@ func indexInitialSymbols(ctx context.Context, scanner *indexer.Scanner, extracto
 		}
 		info, err := scanner.ScanFile(file.Path)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				removed, removeErr := removeFileMissingDuringSymbolScan(ctx, idx, scanner, symbolStore, file.Path)
+				if removeErr != nil {
+					return count, missing, removeErr
+				}
+				if removed {
+					missing = append(missing, file.Path)
+				}
+				continue
+			}
 			log.Printf("Warning: failed to scan %s for symbols: %v", file.Path, err)
 			continue
 		}
@@ -146,91 +175,21 @@ func indexInitialSymbols(ctx context.Context, scanner *indexer.Scanner, extracto
 		symbols, refs, err := extractSymbolsWithFramework(ctx, extractor, info.Path, info.Content, processors...)
 		if err != nil {
 			if ctx.Err() != nil {
-				return count, ctx.Err()
+				return count, missing, ctx.Err()
 			}
 			log.Printf("Warning: failed to extract symbols from %s: %v", info.Path, err)
 			continue
 		}
 		if err := ctx.Err(); err != nil {
-			return count, err
+			return count, missing, err
 		}
 		err = symbolStore.SaveFileWithSignature(ctx, info.Path, info.Hash, extractor.Version(), symbols, refs)
 		if err != nil {
-			return count, fmt.Errorf("save symbols for %s: %w", info.Path, err)
+			return count, missing, fmt.Errorf("save symbols for %s: %w", info.Path, err)
 		}
 		count += len(symbols)
 	}
-	return count, nil
-}
-
-func removeOfflineSymbolFiles(ctx context.Context, scanner *indexer.Scanner, symbolStore trace.SymbolStore, snapshot map[string]trace.FileFingerprint, scanned []indexer.FileMeta, excluded []string) error {
-	return removeOfflineSymbolFilesWithCaseRenames(ctx, scanner, symbolStore, snapshot, scanned, excluded, indexer.FindCaseRenameWitnesses)
-}
-
-type caseRenameFinder func(string, []string, []indexer.FileMeta) map[string]string
-
-func removeOfflineSymbolFilesWithCaseRenames(ctx context.Context, scanner *indexer.Scanner, symbolStore trace.SymbolStore, snapshot map[string]trace.FileFingerprint, scanned []indexer.FileMeta, excluded []string, findCaseRenames caseRenameFinder) error {
-	if snapshot == nil {
-		return nil
-	}
-	root := scanner.Root()
-	if _, err := os.Stat(root); err != nil {
-		return fmt.Errorf("symbol cleanup root unavailable: %w", err)
-	}
-	seen := make(map[string]struct{}, len(scanned))
-	for _, file := range scanned {
-		seen[file.Path] = struct{}{}
-	}
-	excludedSet := make(map[string]struct{}, len(excluded))
-	for _, path := range excluded {
-		excludedSet[path] = struct{}{}
-	}
-	indexedPaths := make([]string, 0, len(snapshot))
-	for path := range snapshot {
-		indexedPaths = append(indexedPaths, path)
-	}
-	caseRenames := findCaseRenames(root, indexedPaths, scanned)
-	var candidates []string
-	for path := range snapshot {
-		_, intentionallyExcluded := excludedSet[path]
-		if _, ok := seen[path]; ok && !intentionallyExcluded {
-			continue
-		}
-		_, caseRenamed := caseRenames[path]
-		_, statErr := os.Lstat(filepath.Join(root, path))
-		remove := os.IsNotExist(statErr) || caseRenamed || intentionallyExcluded
-		if statErr == nil && !remove {
-			reason, err := scanner.ExistingPathExclusion(path)
-			remove = err == nil && reason != ""
-		}
-		if remove {
-			candidates = append(candidates, path)
-		}
-	}
-	sort.Strings(candidates)
-	for _, path := range candidates {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		_, caseRenamed := caseRenames[path]
-		_, intentionallyExcluded := excludedSet[path]
-		_, statErr := os.Lstat(filepath.Join(root, path))
-		forced := caseRenamed || intentionallyExcluded
-		if statErr == nil && !forced {
-			reason, err := scanner.ExistingPathExclusion(path)
-			forced = err == nil && reason != ""
-		}
-		if (statErr == nil || !os.IsNotExist(statErr)) && !forced {
-			continue
-		}
-		if _, err := os.Stat(root); err != nil {
-			return fmt.Errorf("symbol cleanup root lost before removing %s: %w", path, err)
-		}
-		if err := symbolStore.DeleteFile(ctx, path); err != nil {
-			return fmt.Errorf("delete offline symbol file %s: %w", path, err)
-		}
-	}
-	return nil
+	return count, missing, nil
 }
 
 func announceInitialScan(background bool) {
