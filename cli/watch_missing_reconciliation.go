@@ -58,3 +58,13 @@ func withoutFilePaths(files []indexer.FileMeta, removed []string) []indexer.File
 	}
 	return filtered
 }
+
+func withoutPath(paths []string, removed string) []string {
+	filtered := paths[:0]
+	for _, path := range paths {
+		if path != removed {
+			filtered = append(filtered, path)
+		}
+	}
+	return filtered
+}

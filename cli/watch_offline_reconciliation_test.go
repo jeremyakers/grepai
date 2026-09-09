@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -148,5 +149,64 @@ func TestOfflineCaseRenameWithAncestorSpellingChange(t *testing.T) {
 	}
 	if symbols.IsFileIndexed("Dir/Foo.go") {
 		t.Fatal("ancestor case-rename left old symbol spelling")
+	}
+}
+
+func TestCachedSymbolExclusionRevalidatesEligibleFile(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := "eligible.go"
+	if err := os.WriteFile(filepath.Join(root, path), []byte("package eligible\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ignore, err := indexer.NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := indexer.NewScanner(root, ignore)
+	symbols := trace.NewGOBSymbolStore(filepath.Join(t.TempDir(), "symbols.gob"))
+	if err := symbols.SaveFileWithSignature(ctx, path, "stale", "version", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := symbols.ListFileFingerprints(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := removeOfflineSymbolFiles(ctx, scanner, symbols, snapshot, nil, []string{path}); err != nil {
+		t.Fatal(err)
+	}
+	if !symbols.IsFileIndexed(path) {
+		t.Fatal("eligible file was deleted from symbols using cached exclusion")
+	}
+}
+
+func TestCachedSymbolExclusionPreservesInspectionErrors(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := "uncertain.go"
+	if err := os.WriteFile(filepath.Join(root, path), []byte("package uncertain\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ignore, err := indexer.NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := indexer.NewScanner(root, ignore)
+	symbols := trace.NewGOBSymbolStore(filepath.Join(t.TempDir(), "symbols.gob"))
+	if err := symbols.SaveFileWithSignature(ctx, path, "stale", "version", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := symbols.ListFileFingerprints(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspect := func(string) (*indexer.FileInfo, indexer.PathExclusionReason, error) {
+		return nil, "", errors.New("simulated inaccessible path")
+	}
+	if _, err := removeOfflineSymbolFilesForScanWithSeams(ctx, scanner, symbols, snapshot, nil, []string{path}, indexer.FindCaseRenameWitnesses, inspect); err != nil {
+		t.Fatal(err)
+	}
+	if !symbols.IsFileIndexed(path) {
+		t.Fatal("inspection error removed cached symbol ownership")
 	}
 }

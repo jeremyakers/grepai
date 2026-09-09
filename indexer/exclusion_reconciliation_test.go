@@ -68,3 +68,81 @@ func TestIndexAllPurgesPolicyExclusionsButPreservesReadErrors(t *testing.T) {
 		t.Fatalf("read-error document removed: doc=%v err=%v", doc, err)
 	}
 }
+
+func TestExcludedFileBecomingEligibleBeforeCleanupIsReindexed(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "binary.go")
+	if err := os.WriteFile(path, []byte{'p', 'k', 'g', 0}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ignore, err := NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := NewScanner(root, ignore)
+	reads := 0
+	scanner.readSnapshot = func(snapshotPath, relPath string) (*FileInfo, error) {
+		reads++
+		result, err := readFileSnapshot(snapshotPath, relPath)
+		if reads == 2 {
+			if writeErr := os.WriteFile(path, []byte("package current\nfunc Current() {}\n"), 0o644); writeErr != nil {
+				t.Fatal(writeErr)
+			}
+		}
+		return result, err
+	}
+	st := store.NewGOBStore(filepath.Join(root, "index.gob"))
+	if err := st.SaveDocument(ctx, store.Document{Path: "binary.go", Hash: "stale", ChunkIDs: []string{"old-chunk"}}); err != nil {
+		t.Fatal(err)
+	}
+	idx := NewIndexer(root, st, newMockEmbedder(), NewChunker(512, 50), scanner, time.Time{})
+	stats, err := idx.IndexAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.FilesIndexed != 1 || stats.FilesRemoved != 0 {
+		t.Fatalf("indexed=%d removed=%d", stats.FilesIndexed, stats.FilesRemoved)
+	}
+	doc, err := st.GetDocument(ctx, "binary.go")
+	if err != nil || doc == nil || doc.Hash == "stale" {
+		t.Fatalf("re-eligible file not refreshed: doc=%v err=%v", doc, err)
+	}
+}
+
+func TestExcludedFileRevalidationReadErrorPreservesIndex(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := filepath.Join(root, "binary.go")
+	if err := os.WriteFile(path, []byte{'p', 'k', 'g', 0}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ignore, err := NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := NewScanner(root, ignore)
+	reads := 0
+	scanner.readSnapshot = func(snapshotPath, relPath string) (*FileInfo, error) {
+		reads++
+		if reads >= 3 {
+			return nil, errors.New("simulated revalidation read failure")
+		}
+		return readFileSnapshot(snapshotPath, relPath)
+	}
+	st := store.NewGOBStore(filepath.Join(root, "index.gob"))
+	if err := st.SaveDocument(ctx, store.Document{Path: "binary.go", Hash: "stale", ChunkIDs: []string{"old-chunk"}}); err != nil {
+		t.Fatal(err)
+	}
+	idx := NewIndexer(root, st, newMockEmbedder(), NewChunker(512, 50), scanner, time.Time{})
+	stats, err := idx.IndexAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.FilesIndexed != 0 || stats.FilesRemoved != 0 {
+		t.Fatalf("indexed=%d removed=%d", stats.FilesIndexed, stats.FilesRemoved)
+	}
+	if doc, err := st.GetDocument(ctx, "binary.go"); err != nil || doc == nil || doc.Hash != "stale" {
+		t.Fatalf("uncertain file index changed: doc=%v err=%v", doc, err)
+	}
+}
