@@ -87,6 +87,9 @@ func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candid
 				}
 				caseRenamed = false
 				if file != nil && reason == "" {
+					if err := validateReeligibleFilePath(file, path); err != nil {
+						return removed, result, err
+					}
 					retireAlias, retireErr := CanRetireCaseAlias(idx.root, path, caseWitness)
 					if retireErr != nil {
 						return removed, result, fmt.Errorf("verify temporary case alias %s: %w", caseWitness, retireErr)
@@ -130,6 +133,9 @@ func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candid
 				continue
 			}
 			if reason == "" && file != nil {
+				if err := validateReeligibleFilePath(file, path); err != nil {
+					return removed, result, err
+				}
 				result.reeligible = append(result.reeligible, *file)
 				continue
 			}
@@ -152,4 +158,12 @@ func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candid
 		removed++
 	}
 	return removed, result, nil
+}
+
+func validateReeligibleFilePath(file *FileInfo, indexedPath string) error {
+	expected := filepath.FromSlash(indexedPath)
+	if file.Path != expected {
+		return fmt.Errorf("indexed path %q changed to unexpected spelling %q during re-eligibility", expected, file.Path)
+	}
+	return nil
 }

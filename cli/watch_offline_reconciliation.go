@@ -98,6 +98,9 @@ func removeOfflineSymbolFilesForScanWithSeams(ctx context.Context, scanner *inde
 				caseRenamed = false
 				forced = reason != ""
 				if file != nil && reason == "" {
+					if err := validateReeligiblePath(file, path); err != nil {
+						return result, err
+					}
 					retireAlias, retireErr := indexer.CanRetireCaseAlias(root, path, caseWitness)
 					if retireErr != nil {
 						return result, fmt.Errorf("verify temporary symbol case alias %s: %w", caseWitness, retireErr)
@@ -131,6 +134,9 @@ func removeOfflineSymbolFilesForScanWithSeams(ctx context.Context, scanner *inde
 				continue
 			}
 			if reason == "" && file != nil {
+				if err := validateReeligiblePath(file, path); err != nil {
+					return result, err
+				}
 				result.reeligible = append(result.reeligible, *file)
 				continue
 			}
