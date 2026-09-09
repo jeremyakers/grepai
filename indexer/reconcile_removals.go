@@ -82,8 +82,28 @@ func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candid
 			}
 			if !current {
 				file, reason, inspectErr := idx.scanner.InspectExistingPath(path)
-				if inspectErr != nil && !errors.Is(inspectErr, fs.ErrNotExist) {
-					return removed, result, fmt.Errorf("inspect reversed case rename %s: %w", path, inspectErr)
+				if inspectErr != nil {
+					if !errors.Is(inspectErr, fs.ErrNotExist) {
+						return removed, result, fmt.Errorf("inspect reversed case rename %s: %w", path, inspectErr)
+					}
+					if err := idx.confirmInspectionMissing(path); err != nil {
+						return removed, result, err
+					}
+					retireAlias, retireErr := CanRetireCaseAlias(idx.root, path, caseWitness)
+					if retireErr != nil {
+						return removed, result, fmt.Errorf("verify alias after missing inspection %s: %w", caseWitness, retireErr)
+					}
+					if retireAlias {
+						if err := checkScanRoot(idx.root); err != nil {
+							return removed, result, fmt.Errorf("scan root lost before removing alias after missing inspection %s: %w", caseWitness, err)
+						}
+						if err := idx.RemoveFile(ctx, caseWitness); err != nil {
+							return removed, result, fmt.Errorf("remove alias after missing inspection %s: %w", caseWitness, err)
+						}
+						removed++
+						result.retiredAliases = append(result.retiredAliases, RetiredAlias{Path: caseWitness, CanonicalPath: path})
+					}
+					statErr = os.ErrNotExist
 				}
 				caseRenamed = false
 				if file != nil && reason == "" {
@@ -129,8 +149,15 @@ func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candid
 		if statErr == nil && excluded && !caseRenamed {
 			file, reason, err := idx.scanner.InspectExistingPath(path)
 			if err != nil {
-				log.Printf("Warning: cannot revalidate %s (%v); keeping its index entry", path, err)
-				continue
+				if errors.Is(err, fs.ErrNotExist) {
+					if confirmErr := idx.confirmInspectionMissing(path); confirmErr != nil {
+						return removed, result, confirmErr
+					}
+					statErr = os.ErrNotExist
+				} else {
+					log.Printf("Warning: cannot revalidate %s (%v); keeping its index entry", path, err)
+					continue
+				}
 			}
 			if reason == "" && file != nil {
 				if err := validateReeligibleFilePath(file, path); err != nil {
@@ -158,6 +185,18 @@ func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candid
 		removed++
 	}
 	return removed, result, nil
+}
+
+func (idx *Indexer) confirmInspectionMissing(path string) error {
+	if _, err := os.Lstat(filepath.Join(idx.root, path)); err == nil {
+		return fmt.Errorf("path %s reappeared after missing inspection", path)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("recheck missing path %s: %w", path, err)
+	}
+	if err := checkScanRoot(idx.root); err != nil {
+		return fmt.Errorf("scan root unavailable after missing inspection of %s: %w", path, err)
+	}
+	return nil
 }
 
 func validateReeligibleFilePath(file *FileInfo, indexedPath string) error {

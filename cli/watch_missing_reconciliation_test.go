@@ -130,13 +130,13 @@ func TestIndexInitialSymbolsReconcilesObservedENOENT(t *testing.T) {
 		t.Fatal(err)
 	}
 	idx := indexer.NewIndexer(root, vectorStore, &noOpEmbedder{}, indexer.NewChunker(512, 50), scanner, time.Time{})
-	count, missing, err := indexInitialSymbols(ctx, idx, scanner, trace.NewRegexExtractor(), symbolStore,
+	count, changes, err := indexInitialSymbols(ctx, idx, scanner, trace.NewRegexExtractor(), symbolStore,
 		initialSymbolFingerprints{}, []indexer.FileMeta{{Path: path}}, nil, []string{".go"}, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 0 || len(missing) != 1 || missing[0] != path {
-		t.Fatalf("count=%d missing=%v", count, missing)
+	if count != 0 || len(changes.removed) != 1 || changes.removed[0] != path {
+		t.Fatalf("count=%d changes=%v", count, changes)
 	}
 	assertMissingRows(t, ctx, vectorStore, symbolStore, path)
 }
@@ -154,5 +154,59 @@ func assertMissingRows(t *testing.T, ctx context.Context, vectorStore store.Vect
 	}
 	if refs, err := symbolStore.LookupCallers(ctx, "Target"); err != nil || len(refs) != 0 {
 		t.Fatalf("references=%v err=%v", refs, err)
+	}
+}
+
+func TestRemoveMissingDuringSymbolScanRejectsReappearedPath(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := "reappeared.go"
+	if err := os.WriteFile(filepath.Join(root, path), []byte("package reappeared\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ignore, err := indexer.NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := indexer.NewScanner(root, ignore)
+	vectors := store.NewGOBStore(filepath.Join(t.TempDir(), "index.gob"))
+	if err := vectors.SaveDocument(ctx, store.Document{Path: path, Hash: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	symbols := trace.NewGOBSymbolStore(filepath.Join(t.TempDir(), "symbols.gob"))
+	if err := symbols.SaveFileWithSignature(ctx, path, "old", "version", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	idx := indexer.NewIndexer(root, vectors, &noOpEmbedder{}, indexer.NewChunker(512, 50), scanner, time.Time{})
+	removed, err := removeFileMissingDuringSymbolScan(ctx, idx, scanner, symbols, path)
+	if err == nil || removed {
+		t.Fatalf("removed=%v err=%v, want changed-state error", removed, err)
+	}
+	if doc, _ := vectors.GetDocument(ctx, path); doc == nil || !symbols.IsFileIndexed(path) {
+		t.Fatal("reappeared-path error changed ownership")
+	}
+}
+
+func TestEmptySymbolMissingResolutionRejectsReappearedPath(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	path := "reappeared.go"
+	if err := os.WriteFile(filepath.Join(root, path), []byte("package reappeared\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ignore, err := indexer.NewIgnoreMatcher(root, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := indexer.NewScanner(root, ignore)
+	vectors := store.NewGOBStore(filepath.Join(t.TempDir(), "index.gob"))
+	symbols := trace.NewGOBSymbolStore(filepath.Join(t.TempDir(), "symbols.gob"))
+	idx := indexer.NewIndexer(root, vectors, &noOpEmbedder{}, indexer.NewChunker(512, 50), scanner, time.Time{})
+	inspect := func(string) (*indexer.FileInfo, indexer.PathExclusionReason, error) {
+		return nil, "", &os.PathError{Op: "open", Path: path, Err: os.ErrNotExist}
+	}
+	resolution, err := reconcileEmptySymbolScanWithInspect(ctx, idx, scanner, symbols, path, inspect)
+	if err == nil || resolution.file != nil || resolution.removed {
+		t.Fatalf("resolution=%+v err=%v, want changed-state error", resolution, err)
 	}
 }
