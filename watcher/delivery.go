@@ -21,6 +21,13 @@ func (w *Watcher) processDelivery(ctx context.Context) {
 func (w *Watcher) debounceEvent(event FileEvent) {
 	w.pendingMu.Lock()
 	defer w.pendingMu.Unlock()
+	if event.Type == EventReconcile {
+		existing := w.reconcilePending[event.Path]
+		event.IsDir = event.IsDir || existing.IsDir
+		w.reconcilePending[event.Path] = event
+		w.resetDebounceTimerLocked()
+		return
+	}
 
 	// Directory identity is sticky because a replacement file can arrive before
 	// the old directory cleanup event is delivered.
@@ -34,6 +41,10 @@ func (w *Watcher) debounceEvent(event FileEvent) {
 		w.pending[event.Path] = event
 	}
 
+	w.resetDebounceTimerLocked()
+}
+
+func (w *Watcher) resetDebounceTimerLocked() {
 	if w.timer != nil {
 		w.timer.Stop()
 	}
@@ -56,7 +67,11 @@ func (w *Watcher) flushWithContext(ctx context.Context) {
 	for _, event := range w.pending {
 		events = append(events, event)
 	}
+	for _, event := range w.reconcilePending {
+		events = append(events, event)
+	}
 	w.pending = make(map[string]FileEvent)
+	w.reconcilePending = make(map[string]FileEvent)
 	w.pendingMu.Unlock()
 
 	for _, event := range events {

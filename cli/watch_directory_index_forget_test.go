@@ -145,3 +145,77 @@ func TestHandleFileEventDirectorySocketReplacementForgetsDescendantsOnly(t *test
 		t.Fatalf("socket replacement changed: info=%#v err=%v", info, err)
 	}
 }
+
+func TestHandleFileEventRecreatedDirectoryForgetsScannerSkippedFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		path    string
+		content []byte
+	}{
+		{name: "binary", path: filepath.Join("src", "binary.go"), content: []byte("package src\x00binary")},
+		{name: "oversized", path: filepath.Join("src", "large.go"), content: make([]byte, 1024*1024+1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			h := newAtomicWriteHarness(t)
+			indexDirectoryHarnessFile(t, h, tc.path, "package src\nfunc PreviouslyIndexed() { PreviousTarget() }\n")
+			if refs, err := h.symbolStore.LookupCallers(ctx, "PreviousTarget"); err != nil || len(refs) == 0 {
+				t.Fatalf("setup references = %#v, err=%v", refs, err)
+			}
+			if err := os.RemoveAll(filepath.Join(h.projectRoot, "src")); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(h.projectRoot, "src"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(h.projectRoot, tc.path), tc.content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			h.dispatch(ctx, watcher.FileEvent{Type: watcher.EventRename, Path: "src", IsDir: true})
+
+			if doc, err := h.vecStore.GetDocument(ctx, tc.path); err != nil || doc != nil {
+				t.Fatalf("scanner-skipped document = %#v, err=%v", doc, err)
+			}
+			if chunks, err := h.vecStore.GetChunksForFile(ctx, tc.path); err != nil || len(chunks) != 0 {
+				t.Fatalf("scanner-skipped chunks = %#v, err=%v", chunks, err)
+			}
+			if symbols, err := h.symbolStore.LookupSymbol(ctx, "PreviouslyIndexed"); err != nil || len(symbols) != 0 {
+				t.Fatalf("scanner-skipped symbols = %#v, err=%v", symbols, err)
+			}
+			if refs, err := h.symbolStore.LookupCallers(ctx, "PreviousTarget"); err != nil || len(refs) != 0 {
+				t.Fatalf("scanner-skipped references = %#v, err=%v", refs, err)
+			}
+			if _, err := os.Lstat(filepath.Join(h.projectRoot, tc.path)); err != nil {
+				t.Fatalf("physical replacement removed: %v", err)
+			}
+		})
+	}
+}
+
+func TestApplyDirectoryActionPreservesIndexOnScanError(t *testing.T) {
+	ctx := context.Background()
+	h := newAtomicWriteHarness(t)
+	path := filepath.Join("src", "unreadable.go")
+	indexDirectoryHarnessFile(t, h, path, "package src\nfunc Preserved() {}\n")
+	if err := os.Remove(filepath.Join(h.projectRoot, path)); err != nil {
+		t.Fatal(err)
+	}
+
+	forgot, dispatched := false, false
+	err := applyDirectoryAction(
+		directoryAction{kind: directoryActionDispatch, event: watcher.FileEvent{Type: watcher.EventModify, Path: path}},
+		h.scanner,
+		func(string) { forgot = true },
+		func(watcher.FileEvent) { dispatched = true },
+	)
+	if err == nil || forgot || dispatched {
+		t.Fatalf("err=%v forgot=%v dispatched=%v, want scan error with preserved index", err, forgot, dispatched)
+	}
+	if doc, getErr := h.vecStore.GetDocument(ctx, path); getErr != nil || doc == nil {
+		t.Fatalf("document not preserved: %#v, err=%v", doc, getErr)
+	}
+	if symbols, lookupErr := h.symbolStore.LookupSymbol(ctx, "Preserved"); lookupErr != nil || len(symbols) == 0 {
+		t.Fatalf("symbols not preserved: %#v, err=%v", symbols, lookupErr)
+	}
+}

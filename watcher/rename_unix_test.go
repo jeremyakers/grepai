@@ -16,3 +16,7 @@ func renameWatchedTreeOut(t *testing.T, inside, outside string) string {
 	}
 	return renamed
 }
+
+func renameFixtureRelativePath() string {
+	return filepath.Join("nested", "main.go")
+}

@@ -13,10 +13,11 @@ func TestRealFSNotifyPopulatedMoveInAndRenameAway(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
 	staged := filepath.Join(outside, "src")
-	if err := os.MkdirAll(filepath.Join(staged, "nested"), 0o755); err != nil {
+	fixtureFile := renameFixtureRelativePath()
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(staged, fixtureFile)), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(staged, "nested", "main.go"), []byte("package main"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(staged, fixtureFile), []byte("package main"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	w := newDirectoryTestWatcher(t, root)
@@ -28,7 +29,7 @@ func TestRealFSNotifyPopulatedMoveInAndRenameAway(t *testing.T) {
 	if err := os.Rename(staged, inside); err != nil {
 		t.Fatal(err)
 	}
-	wantChild := filepath.Join("src", "nested", "main.go")
+	wantChild := filepath.Join("src", fixtureFile)
 	awaitFileEvent(t, w, func(event FileEvent) bool {
 		return event.Type == EventCreate && event.Path == wantChild
 	})
@@ -42,10 +43,10 @@ func TestRealFSNotifyPopulatedMoveInAndRenameAway(t *testing.T) {
 			t.Fatalf("renamed-out subtree remains watched: %#v", w.watcher.WatchList())
 		}
 	}
-	if err := os.WriteFile(filepath.Join(renamed, "nested", "outside.go"), []byte("package outside"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(renamed, "outside.go"), []byte("package outside"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	assertNoFileEvent(t, w, filepath.Join("src", "nested", "outside.go"), 200*time.Millisecond)
+	assertNoFileEvent(t, w, filepath.Join("src", "outside.go"), 200*time.Millisecond)
 }
 
 func TestRealFSNotifyDirectoryDeletionAndRecreation(t *testing.T) {

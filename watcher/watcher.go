@@ -2,6 +2,7 @@ package watcher
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -20,6 +21,7 @@ const (
 	EventModify
 	EventDelete
 	EventRename
+	EventReconcile
 )
 
 type FileEvent struct {
@@ -37,6 +39,7 @@ type Watcher struct {
 	addWatch      func(string) error
 	removeWatch   func(string) error
 	ignore        *indexer.IgnoreMatcher
+	refreshIgnore func(string) error
 	supportsFile  func(string) bool
 	debounceMs    int
 	events        chan FileEvent
@@ -46,12 +49,13 @@ type Watcher struct {
 	directoriesMu sync.Mutex
 
 	// Debouncing state
-	pending    map[string]FileEvent
-	pendingMu  sync.Mutex
-	timer      *time.Timer
-	flushReady chan struct{}
-	closeOnce  sync.Once
-	workers    sync.WaitGroup
+	pending          map[string]FileEvent
+	reconcilePending map[string]FileEvent
+	pendingMu        sync.Mutex
+	timer            *time.Timer
+	flushReady       chan struct{}
+	closeOnce        sync.Once
+	workers          sync.WaitGroup
 }
 
 // Option customizes watcher file selection.
@@ -79,13 +83,14 @@ func NewWatcher(root string, ignore *indexer.IgnoreMatcher, debounceMs int, opts
 		supportsFile: func(path string) bool {
 			return indexer.SupportedExtensions[strings.ToLower(filepath.Ext(path))]
 		},
-		debounceMs:  debounceMs,
-		events:      make(chan FileEvent, 100),
-		done:        make(chan struct{}),
-		pending:     make(map[string]FileEvent),
-		directories: make(map[string]struct{}),
-		registered:  make(map[string]struct{}),
-		flushReady:  make(chan struct{}, 1),
+		debounceMs:       debounceMs,
+		events:           make(chan FileEvent, 100),
+		done:             make(chan struct{}),
+		pending:          make(map[string]FileEvent),
+		reconcilePending: make(map[string]FileEvent),
+		directories:      make(map[string]struct{}),
+		registered:       make(map[string]struct{}),
+		flushReady:       make(chan struct{}, 1),
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -94,6 +99,12 @@ func NewWatcher(root string, ignore *indexer.IgnoreMatcher, debounceMs int, opts
 	w.removeWatch = fsw.Remove
 	w.backendEvents = fsw.Events
 	w.backendErrors = fsw.Errors
+	w.refreshIgnore = func(scope string) error {
+		if scope == "." {
+			return ignore.Refresh()
+		}
+		return ignore.RefreshSubtree(scope)
+	}
 	return w, nil
 }
 
@@ -170,10 +181,18 @@ func (w *Watcher) handleEvent(event fsnotify.Event) error {
 	base := filepath.Base(relPath)
 	if base == ".gitignore" || base == ".grepaiignore" {
 		scope := filepath.Dir(relPath)
-		if scope == "." {
-			return w.ignore.Refresh()
+		if err := w.refreshIgnore(scope); err != nil {
+			return err
 		}
-		return w.ignore.RefreshSubtree(scope)
+		root := w.root
+		if scope != "." {
+			root = filepath.Join(w.root, scope)
+		}
+		if err := w.addRecursive(root); err != nil {
+			return fmt.Errorf("register refreshed ignore scope: %w", err)
+		}
+		w.debounceEvent(FileEvent{Type: EventReconcile, Path: scope, IsDir: true})
+		return nil
 	}
 
 	if event.Has(fsnotify.Create) {
@@ -247,6 +266,8 @@ func (e EventType) String() string {
 		return "DELETE"
 	case EventRename:
 		return "RENAME"
+	case EventReconcile:
+		return "RECONCILE"
 	default:
 		return "UNKNOWN"
 	}

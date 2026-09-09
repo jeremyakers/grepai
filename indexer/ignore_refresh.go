@@ -35,10 +35,6 @@ func (m *IgnoreMatcher) RefreshSubtree(relRoot string) error {
 	m.mu.Lock()
 	m.nestedMatchers = replaceNestedMatchers(m.nestedMatchers, relRoot, gitMatchers)
 	m.grepaiMatchers = replaceGrepaiMatchers(m.grepaiMatchers, relRoot, grepaiMatchers)
-	m.hasGrepaiNegations = false
-	for _, matcher := range m.grepaiMatchers {
-		m.hasGrepaiNegations = m.hasGrepaiNegations || matcher.hasNegations
-	}
 	m.mu.Unlock()
 	return nil
 }
@@ -78,7 +74,6 @@ func (m *IgnoreMatcher) Refresh() error {
 	m.mu.Lock()
 	m.nestedMatchers = gitMatchers
 	m.grepaiMatchers = grepaiMatchers
-	m.hasGrepaiNegations = hasNegations(grepaiMatchers)
 	m.mu.Unlock()
 	return nil
 }
@@ -138,15 +133,6 @@ func loadScopedIgnoreMatchers(projectRoot, scanRoot string, extraDirs []string, 
 		return nil
 	})
 	return gitMatchers, grepaiMatchers, err
-}
-
-func hasNegations(matchers []grepaiMatcher) bool {
-	for _, matcher := range matchers {
-		if matcher.hasNegations {
-			return true
-		}
-	}
-	return false
 }
 
 func replaceNestedMatchers(current []nestedMatcher, relRoot string, replacements []nestedMatcher) []nestedMatcher {

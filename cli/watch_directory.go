@@ -141,6 +141,9 @@ func addIndexedPaths(candidates map[string]struct{}, paths []string, directory s
 func pathInDirectory(path, directory string) bool {
 	path = filepath.ToSlash(filepath.Clean(path))
 	directory = strings.TrimSuffix(filepath.ToSlash(filepath.Clean(directory)), "/")
+	if directory == "." {
+		return path != "." && path != ".." && !strings.HasPrefix(path, "../")
+	}
 	return path == directory || strings.HasPrefix(path, directory+"/")
 }
 

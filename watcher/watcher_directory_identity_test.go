@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -173,5 +174,38 @@ func TestImportedMetadataDirectoryRemainsHardExcluded(t *testing.T) {
 	}
 	if _, tracked := w.directories[metadata]; tracked {
 		t.Fatal("metadata directory was tracked")
+	}
+}
+
+func TestNegationScopeDoesNotWatchUnrelatedIgnoredTree(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".gitignore"), []byte("node_modules/\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".grepaiignore"), []byte("vendor/\n!vendor/keep.go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "node_modules", "large", "tree"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "vendor"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	w := newDirectoryTestWatcher(t, root)
+	added := make(map[string]bool)
+	w.addWatch = func(path string) error {
+		added[path] = true
+		return nil
+	}
+	if err := w.addRecursive(root); err != nil {
+		t.Fatal(err)
+	}
+	if !added[filepath.Join(root, "vendor")] {
+		t.Fatal("relevant negation directory was not watched")
+	}
+	for path := range added {
+		if path == filepath.Join(root, "node_modules") || strings.HasPrefix(path, filepath.Join(root, "node_modules")+string(filepath.Separator)) {
+			t.Fatalf("unrelated ignored tree was watched: %s", path)
+		}
 	}
 }

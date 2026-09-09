@@ -39,24 +39,30 @@ type nestedMatcher struct {
 // "full" uses original patterns (with negations) for the actual decision.
 // "any" uses all patterns converted to positive for detecting if the file has an opinion.
 type grepaiMatcher struct {
-	full         *ignore.GitIgnore // Matcher with original patterns (including negations)
-	any          *ignore.GitIgnore // Matcher with all patterns as positive (for detection)
-	baseDir      string            // relative path from project root
-	hasNegations bool
+	full      *ignore.GitIgnore // Matcher with original patterns (including negations)
+	any       *ignore.GitIgnore // Matcher with all patterns as positive (for detection)
+	baseDir   string            // relative path from project root
+	negations []negationRule
+}
+
+type negationRule struct {
+	literalPrefix string
+	hasWildcard   bool
+	directoryOnly bool
+	broad         bool
 }
 
 type IgnoreMatcher struct {
-	mu                 sync.RWMutex
-	projectRoot        string
-	externalGitignore  string
-	nestedMatchers     []nestedMatcher // .gitignore matchers
-	extraDirs          []string        // patterns from config
-	grepaiMatchers     []grepaiMatcher // .grepaiignore matchers
-	hasGrepaiNegations bool            // true if any .grepaiignore has ! patterns
-	walkIgnoreFiles    func(string, filepath.WalkFunc) error
-	readIgnoreFile     func(string) ([]byte, error)
-	hardExcludeGit     bool
-	hardExcludeGrepai  bool
+	mu                sync.RWMutex
+	projectRoot       string
+	externalGitignore string
+	nestedMatchers    []nestedMatcher // .gitignore matchers
+	extraDirs         []string        // patterns from config
+	grepaiMatchers    []grepaiMatcher // .grepaiignore matchers
+	walkIgnoreFiles   func(string, filepath.WalkFunc) error
+	readIgnoreFile    func(string) ([]byte, error)
+	hardExcludeGit    bool
+	hardExcludeGrepai bool
 }
 
 func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignore string) (*IgnoreMatcher, error) {
@@ -136,7 +142,7 @@ func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignor
 
 		// Process .grepaiignore files
 		if baseName == ".grepaiignore" {
-			gm, hasNegations, err := compileGrepaiIgnoreFile(path)
+			gm, _, err := compileGrepaiIgnoreFile(path)
 			if err != nil {
 				return nil // Skip invalid .grepaiignore files
 			}
@@ -151,9 +157,6 @@ func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignor
 
 			gm.baseDir = relPath
 			m.grepaiMatchers = append(m.grepaiMatchers, gm)
-			if hasNegations {
-				m.hasGrepaiNegations = true
-			}
 		}
 
 		return nil
@@ -214,8 +217,6 @@ func (m *IgnoreMatcher) shouldIgnore(path string) bool {
 }
 
 // ShouldSkipDir determines if a directory can be skipped entirely via filepath.SkipDir.
-// If .grepaiignore has negation patterns, we must descend into ignored directories
-// because individual files inside may be re-included.
 func (m *IgnoreMatcher) ShouldSkipDir(path string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -227,21 +228,12 @@ func (m *IgnoreMatcher) ShouldSkipDir(path string) bool {
 	}
 
 	normalizedPath := filepath.ToSlash(path)
+	mayReinclude := m.mayReincludeDescendant(normalizedPath)
 
-	// If .grepaiignore explicitly says to ignore this dir → safe to skip
 	if result, hasOpinion, _ := m.evalGrepaiIgnore(normalizedPath); hasOpinion {
-		// A positive directory rule in a .grepaiignore can be followed by a
-		// negation in that same file. Descend so the allowed child is reachable.
-		return result && !m.hasGrepaiNegations
+		return result && !mayReinclude
 	}
-
-	// Ignored by gitignore/extra patterns. If no negations in any .grepaiignore → safe to skip
-	if !m.hasGrepaiNegations {
-		return true
-	}
-
-	// There are negation patterns: files inside might be re-included, don't skip
-	return false
+	return !mayReinclude
 }
 
 // evalGrepaiIgnore checks .grepaiignore matchers for the path.
@@ -355,6 +347,7 @@ func compileGrepaiIgnoreContent(content []byte) (grepaiMatcher, bool, error) {
 	lines := strings.Split(string(content), "\n")
 	fullLines := make([]string, 0, len(lines))
 	anyLines := make([]string, 0, len(lines))
+	negations := make([]negationRule, 0)
 	hasNegations := false
 
 	for _, line := range lines {
@@ -366,6 +359,9 @@ func compileGrepaiIgnoreContent(content []byte) (grepaiMatcher, bool, error) {
 
 		if strings.HasPrefix(trimmed, "!") {
 			hasNegations = true
+			if rule, ok := parseNegationRule(strings.TrimPrefix(trimmed, "!")); ok {
+				negations = append(negations, rule)
+			}
 			// Strip the ! to make it a positive match for detection
 			anyLines = append(anyLines, strings.TrimPrefix(trimmed, "!"))
 		} else {
@@ -377,9 +373,9 @@ func compileGrepaiIgnoreContent(content []byte) (grepaiMatcher, bool, error) {
 	anyMatcher := ignore.CompileIgnoreLines(anyLines...)
 
 	return grepaiMatcher{
-		full:         fullMatcher,
-		any:          anyMatcher,
-		hasNegations: hasNegations,
+		full:      fullMatcher,
+		any:       anyMatcher,
+		negations: negations,
 	}, hasNegations, nil
 }
 

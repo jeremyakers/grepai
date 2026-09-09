@@ -21,9 +21,11 @@ import (
 func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore *trace.GOBSymbolStore, rpgEncoder *rpg.RPGEncoder, vectorStore store.VectorStore, enabledLanguages []string, projectRoot string, cfg *config.Config, lastConfigWrite *time.Time, rpgManager *rpgRealtimeManager, event watcher.FileEvent, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) {
 	forgetIndex := func(path string, eventType watcher.EventType) {
 		var oldChunkCount, oldSymbolCount int
+		fileExisted := false
 		if vectorStore != nil {
 			if doc, err := vectorStore.GetDocument(ctx, path); err == nil && doc != nil {
 				oldChunkCount = len(doc.ChunkIDs)
+				fileExisted = true
 			}
 		}
 		if symbolStore != nil {
@@ -44,7 +46,13 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			log.Printf("Failed to remove symbols for %s: %v", path, err)
 		}
 		if onStats != nil {
-			onStats(projectRoot, watchStatsDelta{FilesRemoved: 1, ChunksRemoved: oldChunkCount, SymbolsLost: oldSymbolCount})
+			delta := watchStatsDelta{ChunksRemoved: oldChunkCount, SymbolsLost: oldSymbolCount}
+			if fileExisted {
+				delta.FilesRemoved = 1
+			}
+			if delta.FilesRemoved > 0 || delta.ChunksRemoved > 0 || delta.SymbolsLost > 0 {
+				onStats(projectRoot, delta)
+			}
 		}
 		if rpgEncoder != nil {
 			if err := rpgEncoder.HandleFileEvent(ctx, "delete", path, nil); err != nil {
@@ -60,15 +68,23 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 
 	if event.IsDir {
 		dispatch := func(action directoryAction) {
-			fileEvent := action.event
-			if action.kind == directoryActionForgetIndex || ((fileEvent.Type == watcher.EventCreate || fileEvent.Type == watcher.EventModify) && !scanner.ShouldIndexPath(fileEvent.Path)) {
-				forgetIndex(fileEvent.Path, watcher.EventDelete)
-				return
+			err := applyDirectoryAction(action, scanner, func(path string) {
+				forgetIndex(path, watcher.EventDelete)
+			}, func(fileEvent watcher.FileEvent) {
+				handleFileEvent(ctx, idx, scanner, extractor, symbolStore, rpgEncoder, vectorStore, enabledLanguages, projectRoot, cfg, lastConfigWrite, rpgManager, fileEvent, onActivity, onStats, processors...)
+			})
+			if err != nil {
+				log.Printf("Preserving %s after failed reconciliation scan: %v", action.event.Path, err)
 			}
-			handleFileEvent(ctx, idx, scanner, extractor, symbolStore, rpgEncoder, vectorStore, enabledLanguages, projectRoot, cfg, lastConfigWrite, rpgManager, fileEvent, onActivity, onStats, processors...)
 		}
-		if err := reconcileDeletedDirectory(ctx, projectRoot, event.Path, vectorStore, symbolStore, dispatch); err != nil {
-			log.Printf("Failed to reconcile deleted directory %s: %v", event.Path, err)
+		var err error
+		if event.Type == watcher.EventReconcile {
+			err = reconcilePolicyDirectory(ctx, projectRoot, event.Path, scanner, vectorStore, symbolStore, dispatch)
+		} else {
+			err = reconcileDeletedDirectory(ctx, projectRoot, event.Path, vectorStore, symbolStore, dispatch)
+		}
+		if err != nil {
+			log.Printf("Failed to reconcile directory %s: %v", event.Path, err)
 		}
 		return
 	}
