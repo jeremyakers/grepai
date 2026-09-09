@@ -110,7 +110,6 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		return nil, fmt.Errorf("failed to scan files: %w", err)
 	}
 	stats.FilesSkipped = len(skipped)
-	stats.ScannedFiles = fileMetas
 
 	existingDocs, err := idx.loadExistingDocumentMetadata(ctx)
 	if err != nil {
@@ -160,6 +159,7 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 
 	// Collect results in original scan order for deterministic output.
 	filesToIndex := make([]FileInfo, 0, len(fileMetas))
+	stats.ScannedFiles = make([]FileMeta, 0, len(fileMetas))
 	for i, decision := range decisions {
 		if decision.countAsSkipped {
 			stats.FilesSkipped++
@@ -172,6 +172,9 @@ func (idx *Indexer) IndexAllWithBatchProgress(ctx context.Context, onProgress Pr
 		}
 		if decision.excluded {
 			stats.ExcludedFiles = append(stats.ExcludedFiles, fileMetas[i].Path)
+		}
+		if !decision.missingAfterWalk && !decision.excluded {
+			stats.ScannedFiles = append(stats.ScannedFiles, fileMetas[i])
 		}
 	}
 
