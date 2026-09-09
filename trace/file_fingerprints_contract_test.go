@@ -13,9 +13,7 @@ type fakeBareStore struct {
 	callEdgesCalls int
 }
 
-func (fakeBareStore) SaveFile(context.Context, string, []Symbol, []Reference) error {
-	return nil
-}
+func (fakeBareStore) SaveFile(context.Context, string, []Symbol, []Reference) error { return nil }
 func (fakeBareStore) SaveFileWithContentHash(context.Context, string, string, []Symbol, []Reference) error {
 	return nil
 }
@@ -42,15 +40,12 @@ func (fakeBareStore) LookupReaders(context.Context, string) ([]Reference, error)
 func (fakeBareStore) LookupWriters(context.Context, string) ([]Reference, error) {
 	return []Reference{}, nil
 }
-func (fakeBareStore) GetCallGraph(context.Context, string, int) (*CallGraph, error) {
-	return nil, nil
-}
-func (fakeBareStore) Load(context.Context) error    { return nil }
-func (fakeBareStore) Persist(context.Context) error { return nil }
+func (fakeBareStore) GetCallGraph(context.Context, string, int) (*CallGraph, error) { return nil, nil }
+func (fakeBareStore) Load(context.Context) error                                    { return nil }
+func (fakeBareStore) Persist(context.Context) error                                 { return nil }
 func (fakeBareStore) GetSymbolsForFile(context.Context, string) ([]Symbol, error) {
 	return []Symbol{}, nil
 }
-
 func (f *fakeBareStore) GetCallEdges(context.Context) ([]CallEdge, error) {
 	f.callEdgesCalls++
 	return []CallEdge{}, nil
@@ -62,8 +57,6 @@ func (fakeBareStore) GetStats(context.Context) (*SymbolStats, error) {
 
 var _ SymbolStore = (*fakeBareStore)(nil)
 
-// fakeEdgeStore implements SymbolStore by embedding the required interface and
-// overriding GetCallEdges to control fallback enumeration.
 type fakeEdgeStore struct {
 	SymbolStore
 	edges []CallEdge
@@ -73,8 +66,6 @@ func (f *fakeEdgeStore) GetCallEdges(context.Context) ([]CallEdge, error) {
 	return append([]CallEdge(nil), f.edges...), nil
 }
 
-// fakeSourceStore implements the optional FileFingerprintSource directly,
-// on top of a call-edge enumerated store.
 type fakeSourceStore struct {
 	fakeEdgeStore
 	mu        sync.Mutex
@@ -100,8 +91,6 @@ func (f *fakeSourceStore) ListFileFingerprints(ctx context.Context) (map[string]
 }
 
 func TestLoadFileFingerprintsUsesOptionalSourceWithoutFallback(t *testing.T) {
-	// Given a store whose FileFingerprintSource succeeds while its call
-	// edges describe a different, unrelated file.
 	bare := &fakeBareStore{}
 	source := &fakeSourceStore{
 		fakeEdgeStore: fakeEdgeStore{SymbolStore: bare, edges: []CallEdge{{Caller: "A", Callee: "B", File: "unrelated.go"}}},
@@ -109,9 +98,6 @@ func TestLoadFileFingerprintsUsesOptionalSourceWithoutFallback(t *testing.T) {
 			"orphan.go": {ContentHash: "hash-orphan", ExtractorVersion: "v2", HasContentHash: true, HasExtractorVersion: true},
 		},
 	}
-
-	// When fingerprints load, the optional source wins and fallback
-	// enumeration never runs.
 	got, err := LoadFileFingerprints(context.Background(), source)
 	if err != nil {
 		t.Fatal(err)
@@ -131,12 +117,8 @@ func TestLoadFileFingerprintsUsesOptionalSourceWithoutFallback(t *testing.T) {
 }
 
 func TestLoadFileFingerprintsPreservesSourceErrors(t *testing.T) {
-	// Given a source that fails.
 	wantErr := errors.New("source failed")
 	source := &fakeSourceStore{err: wantErr}
-
-	// When fingerprints load, the error passes through without silent
-	// fallback to enumeration.
 	_, err := LoadFileFingerprints(context.Background(), source)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want %v", err, wantErr)
@@ -147,12 +129,9 @@ func TestLoadFileFingerprintsPreservesSourceErrors(t *testing.T) {
 }
 
 func TestLoadFileFingerprintsPassesContextToSource(t *testing.T) {
-	// Given a canceled context.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	source := &fakeSourceStore{snapshot: map[string]FileFingerprint{}}
-
-	// When fingerprints load, the caller context reaches the source.
 	_, _ = LoadFileFingerprints(ctx, source)
 	if source.ctxPassed != ctx {
 		t.Fatal("caller context was not passed to ListFileFingerprints")
@@ -161,7 +140,6 @@ func TestLoadFileFingerprintsPassesContextToSource(t *testing.T) {
 
 func TestLoadFileFingerprintsUnsupportedDoesNotInspectCallGraph(t *testing.T) {
 	store := &fakeBareStore{}
-
 	got, err := LoadFileFingerprints(context.Background(), store)
 	if got != nil || !errors.Is(err, ErrFileFingerprintsUnsupported) {
 		t.Fatalf("snapshot = %#v, error = %v", got, err)
