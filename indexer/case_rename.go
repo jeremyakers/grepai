@@ -22,8 +22,11 @@ func RevalidateCaseRenameWitness(root, candidate, witness string) (bool, error) 
 	if err != nil {
 		return false, err
 	}
-	if actual == oldPath || actual != newPath {
+	if actual == oldPath {
 		return false, nil
+	}
+	if actual != newPath {
+		return false, fmt.Errorf("case rename %q to %q changed to third spelling %q", oldPath, newPath, actual)
 	}
 	oldInfo, err := os.Stat(filepath.Join(root, filepath.FromSlash(oldPath)))
 	if err != nil {
@@ -56,8 +59,14 @@ func CanRetireCaseAlias(root, candidate, witness string) (bool, error) {
 		return false, err
 	}
 	actual, err := actualPathSpellingWithError(root, newPath, os.ReadDir, make(map[string][]os.DirEntry))
-	if err != nil || actual != oldPath {
+	if err != nil {
 		return false, err
+	}
+	if actual == newPath {
+		return false, nil
+	}
+	if actual != oldPath {
+		return false, fmt.Errorf("case alias %q for %q changed to third spelling %q", newPath, oldPath, actual)
 	}
 	oldInfo, err := os.Stat(filepath.Join(root, filepath.FromSlash(oldPath)))
 	if err != nil {

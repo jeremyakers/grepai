@@ -1,10 +1,17 @@
 package indexer
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+type pathInspectionFS struct {
+	lstat        func(string) (os.FileInfo, error)
+	readDir      func(string) ([]os.DirEntry, error)
+	readSnapshot func(string, string) (*FileInfo, error)
+}
 
 // PathExclusionReason identifies an intentional scanner policy exclusion.
 // An empty reason means the path is eligible or could not be classified safely.
@@ -31,15 +38,33 @@ func (s *Scanner) ExistingPathExclusion(relPath string) (PathExclusionReason, er
 // authoritative exclusion. It uses Lstat so a replacement symlink or directory
 // retires the old file's index ownership without reading through the link.
 func (s *Scanner) InspectExistingPath(relPath string) (*FileInfo, PathExclusionReason, error) {
+	return s.inspectExistingPathWith(relPath, pathInspectionFS{lstat: os.Lstat, readDir: os.ReadDir, readSnapshot: s.readSnapshot})
+}
+
+func (s *Scanner) inspectExistingPathWith(relPath string, filesystem pathInspectionFS) (*FileInfo, PathExclusionReason, error) {
 	relPath = filepath.FromSlash(relPath)
 	absPath := filepath.Join(s.root, relPath)
-	info, err := os.Lstat(absPath)
+	info, err := filesystem.lstat(absPath)
 	if err != nil {
 		return nil, "", err
 	}
 	if !info.Mode().IsRegular() {
 		return nil, PathExcludedNonRegular, nil
 	}
+	actual, err := actualPathSpellingWithError(s.root, filepath.ToSlash(relPath), filesystem.readDir, make(map[string][]os.DirEntry))
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve actual spelling of %s: %w", relPath, err)
+	}
+	relPath = filepath.FromSlash(actual)
+	absPath = filepath.Join(s.root, relPath)
+	actualInfo, err := filesystem.lstat(absPath)
+	if err != nil {
+		return nil, "", err
+	}
+	if !os.SameFile(info, actualInfo) {
+		return nil, "", fmt.Errorf("path identity changed while resolving actual spelling of %s", relPath)
+	}
+	info = actualInfo
 	if s.ignore.ShouldIgnore(relPath) {
 		return nil, PathExcludedIgnored, nil
 	}
@@ -52,12 +77,12 @@ func (s *Scanner) InspectExistingPath(relPath string) (*FileInfo, PathExclusionR
 	if info.Size() > maxFileSize {
 		return nil, PathExcludedTooLarge, nil
 	}
-	snapshot, err := s.readSnapshot(absPath, relPath)
+	snapshot, err := filesystem.readSnapshot(absPath, relPath)
 	if err != nil {
 		return nil, "", err
 	}
 	// A stable regular in-range file can only be rejected here as binary.
-	current, err := os.Lstat(absPath)
+	current, err := filesystem.lstat(absPath)
 	if err != nil {
 		return nil, "", err
 	}
