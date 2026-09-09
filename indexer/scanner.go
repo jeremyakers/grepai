@@ -156,6 +156,27 @@ func (s *Scanner) SupportsPath(path string) bool {
 	return s.isSupported(strings.ToLower(filepath.Ext(path)))
 }
 
+// ShouldIndexPath reports whether path passes the scanner's configured
+// extension and ignore policies. Both project-relative and absolute paths are
+// accepted; ignore matching always uses a project-relative path.
+func (s *Scanner) ShouldIndexPath(path string) bool {
+	if !s.SupportsPath(path) {
+		return false
+	}
+	relPath := filepath.Clean(path)
+	if filepath.IsAbs(path) {
+		var err error
+		relPath, err = filepath.Rel(s.root, path)
+		if err != nil {
+			return false
+		}
+	}
+	if relPath == ".." || strings.HasPrefix(relPath, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return s.ignore == nil || !s.ignore.ShouldIgnore(relPath)
+}
+
 // ScanMetadata scans indexable files and returns only file metadata.
 // It avoids reading file contents and hash computation for a faster first pass.
 func (s *Scanner) ScanMetadata() ([]FileMeta, []string, error) {

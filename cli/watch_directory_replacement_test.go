@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/yoanbernabeu/grepai/indexer"
 	"github.com/yoanbernabeu/grepai/store"
 	"github.com/yoanbernabeu/grepai/trace"
 	"github.com/yoanbernabeu/grepai/watcher"
@@ -172,5 +173,42 @@ func TestHandleFileEventDirectoryReplacementHonorsCustomExtension(t *testing.T) 
 	}
 	if doc, err := h.vecStore.GetDocument(ctx, replacementPath); err != nil || doc == nil {
 		t.Fatalf("custom replacement document = %#v, err=%v", doc, err)
+	}
+}
+
+func TestHandleFileEventDirectoryReplacementHonorsIgnorePolicy(t *testing.T) {
+	ctx := context.Background()
+	h := newAtomicWriteHarness(t)
+	replacementPath := "target.go"
+	childPath := filepath.Join(replacementPath, "keep.go")
+	indexDirectoryHarnessFile(t, h, childPath, "package keep\nfunc Keep() {}\n")
+	if err := os.WriteFile(filepath.Join(h.projectRoot, ".grepaiignore"), []byte("target.go\n!target.go/keep.go\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ignore, err := indexer.NewIgnoreMatcher(h.projectRoot, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ignore.ShouldIgnore(replacementPath) || ignore.ShouldIgnore(childPath) {
+		t.Fatal("invalid ignore-policy test setup")
+	}
+	h.scanner = indexer.NewScanner(h.projectRoot, ignore)
+
+	if err := os.RemoveAll(filepath.Join(h.projectRoot, replacementPath)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(h.projectRoot, replacementPath), []byte("package ignored"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.dispatch(ctx, watcher.FileEvent{Type: watcher.EventRename, Path: replacementPath, IsDir: true})
+
+	if doc, err := h.vecStore.GetDocument(ctx, childPath); err != nil || doc != nil {
+		t.Fatalf("old re-included child document = %#v, err=%v", doc, err)
+	}
+	if doc, err := h.vecStore.GetDocument(ctx, replacementPath); err != nil || doc != nil {
+		t.Fatalf("ignored replacement document = %#v, err=%v", doc, err)
+	}
+	if info, err := os.Lstat(filepath.Join(h.projectRoot, replacementPath)); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("replacement on disk: info=%#v err=%v", info, err)
 	}
 }

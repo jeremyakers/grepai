@@ -2082,7 +2082,7 @@ func extractSymbolsWithFramework(ctx context.Context, extractor trace.SymbolExtr
 func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore *trace.GOBSymbolStore, rpgEncoder *rpg.RPGEncoder, vectorStore store.VectorStore, enabledLanguages []string, projectRoot string, cfg *config.Config, lastConfigWrite *time.Time, rpgManager *rpgRealtimeManager, event watcher.FileEvent, onActivity watchActivityObserver, onStats watchStatsObserver, processors ...*framework.ProcessorRegistry) {
 	if event.IsDir {
 		dispatch := func(fileEvent watcher.FileEvent) {
-			if (fileEvent.Type == watcher.EventCreate || fileEvent.Type == watcher.EventModify) && !scanner.SupportsPath(fileEvent.Path) {
+			if (fileEvent.Type == watcher.EventCreate || fileEvent.Type == watcher.EventModify) && !scanner.ShouldIndexPath(fileEvent.Path) {
 				return
 			}
 			handleFileEvent(ctx, idx, scanner, extractor, symbolStore, rpgEncoder, vectorStore, enabledLanguages, projectRoot, cfg, lastConfigWrite, rpgManager, fileEvent, onActivity, onStats, processors...)
