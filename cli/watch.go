@@ -746,12 +746,9 @@ func runWatchLoop(ctx context.Context, st store.VectorStore, symbolStore trace.S
 }
 
 func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.Scanner, extractor *trace.RegexExtractor, symbolStore trace.SymbolStore, tracedLanguages []string, lastIndexTime time.Time, isBackgroundChild bool, onScan func(current, total int, file string), onEmbed func(info indexer.BatchProgressInfo), processors ...*framework.ProcessorRegistry) (*indexer.IndexStats, error) {
-	fingerprints, ok := symbolStore.(interface {
-		GetFileContentHash(string) (string, bool)
-		GetFileExtractorVersion(string) (string, bool)
-	})
-	if !ok {
-		return nil, fmt.Errorf("symbol store does not support file fingerprints")
+	fingerprints, err := loadWatchSymbolFingerprints(ctx, symbolStore)
+	if err != nil {
+		return nil, err
 	}
 	// Initial scan with progress
 	if !isBackgroundChild {
@@ -761,7 +758,6 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	}
 
 	var stats *indexer.IndexStats
-	var err error
 	if !isBackgroundChild {
 		stats, err = idx.IndexAllWithBatchProgress(ctx,
 			func(info indexer.ProgressInfo) {
@@ -827,7 +823,7 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 		// re-processes files whose source didn't change.
 		if !lastIndexTime.IsZero() {
 			fileModTime := time.Unix(file.ModTime, 0)
-			if (fileModTime.Before(lastIndexTime) || fileModTime.Equal(lastIndexTime)) && symbolStore.IsFileIndexed(file.Path) {
+			if (fileModTime.Before(lastIndexTime) || fileModTime.Equal(lastIndexTime)) && fingerprints.IsFileIndexed(file.Path) {
 				if v, ok := fingerprints.GetFileExtractorVersion(file.Path); ok && v == extractor.Version() {
 					continue
 				}
@@ -860,7 +856,7 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 			continue
 		}
 		if err := symbolStore.SaveFileWithSignature(ctx, fileInfo.Path, fileInfo.Hash, extractor.Version(), symbols, refs); err != nil {
-			log.Printf("Warning: failed to save symbols for %s: %v", fileInfo.Path, err)
+			return nil, fmt.Errorf("failed to save symbols for %s: %w", fileInfo.Path, err)
 		}
 		symbolCount += len(symbols)
 	}
@@ -2321,7 +2317,7 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			log.Printf("Failed to index %s: %v", event.Path, err)
 			return
 		}
-		log.Printf("Indexed %s (%d chunks)", event.Path, chunks)
+		log.Printf("Indexed %q (%d chunks)", event.Path, chunks) //nolint:gosec // G706: %q escapes the path; the remaining argument is an integer.
 
 		// Report stats (files/chunks)
 		if onStats != nil {
@@ -2354,7 +2350,7 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			} else if err := symbolStore.SaveFileWithSignature(ctx, fileInfo.Path, fileInfo.Hash, extractor.Version(), symbols, refs); err != nil {
 				log.Printf("Failed to save symbols for %s: %v", event.Path, err)
 			} else {
-				log.Printf("Extracted %d symbols from %s", len(symbols), event.Path)
+				log.Printf("Extracted %d symbols from %q", len(symbols), event.Path) //nolint:gosec // G706: %q escapes the path; the remaining argument is an integer.
 
 				if onStats != nil {
 					onStats(projectRoot, watchStatsDelta{
@@ -2382,7 +2378,7 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 					if rpgManager != nil {
 						rpgManager.MarkFileDirty(fileInfo.Path)
 						dirtyCount, _, _, _ := rpgManager.Snapshot()
-						log.Printf("rpg_event_applied_ms=%d file=%s event=%s rpg_dirty_files_count=%d",
+						log.Printf("rpg_event_applied_ms=%d file=%q event=%s rpg_dirty_files_count=%d", //nolint:gosec // G706: path is quoted; other values are integers and fixed EventType labels.
 							time.Since(start).Milliseconds(),
 							fileInfo.Path,
 							eventType.String(),
@@ -2418,7 +2414,7 @@ func handleFileEvent(ctx context.Context, idx *indexer.Indexer, scanner *indexer
 			} else if rpgManager != nil {
 				rpgManager.MarkFileDirty(event.Path)
 				dirtyCount, _, _, _ := rpgManager.Snapshot()
-				log.Printf("rpg_event_applied_ms=%d file=%s event=%s rpg_dirty_files_count=%d",
+				log.Printf("rpg_event_applied_ms=%d file=%q event=%s rpg_dirty_files_count=%d", //nolint:gosec // G706: path is quoted; other values are integers and fixed EventType labels.
 					time.Since(start).Milliseconds(),
 					event.Path,
 					eventType.String(),
@@ -2888,7 +2884,7 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 	if !isBackgroundChild {
 		fmt.Printf("\nWatching %d projects for changes... (Press Ctrl+C to stop)\n", len(runtimes))
 	} else {
-		log.Printf("Watching %d projects for changes...", len(runtimes))
+		log.Printf("Watching %d projects for changes...", len(runtimes)) //nolint:gosec // G706: only an integer length is formatted; it cannot inject log lines.
 	}
 
 	persistTicker := time.NewTicker(30 * time.Second)

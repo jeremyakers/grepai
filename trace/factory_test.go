@@ -2,12 +2,92 @@ package trace
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/yoanbernabeu/grepai/config"
 )
+
+func TestCanonicalSymbolPostgresRootResolvesSymlink(t *testing.T) {
+	parent := t.TempDir()
+	realRoot := filepath.Join(parent, "real")
+	if err := os.Mkdir(realRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(parent, "alias")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		t.Fatal(err)
+	}
+
+	realID, err := canonicalSymbolPostgresRoot(realRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasID, err := canonicalSymbolPostgresRoot(aliasRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aliasID != realID {
+		t.Fatalf("alias project ID = %q, want canonical ID %q", aliasID, realID)
+	}
+}
+
+func TestCanonicalSymbolPostgresRootRejectsMissingPath(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	got, err := canonicalSymbolPostgresRoot(missing)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("canonicalSymbolPostgresRoot(%q) = %q, %v; want not-exist error", missing, got, err)
+	}
+	if got != "" {
+		t.Fatalf("missing path produced project ID %q", got)
+	}
+}
+
+func TestPostgresSymbolStoreFactoryUsesCanonicalRootNamespace(t *testing.T) {
+	dsn := os.Getenv("GREPAI_POSTGRES_TEST_DSN")
+	if dsn == "" {
+		t.Skip("GREPAI_POSTGRES_TEST_DSN is not set")
+	}
+
+	parent := t.TempDir()
+	realRoot := filepath.Join(parent, "real")
+	if err := os.Mkdir(realRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(parent, "alias")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.DefaultConfig()
+	cfg.Trace.StoreBackend = "postgres"
+	cfg.Trace.Postgres.DSN = dsn
+
+	realStore, err := NewSymbolStore(context.Background(), cfg, realRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer realStore.Close()
+	aliasStore, err := NewSymbolStore(context.Background(), cfg, aliasRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer aliasStore.Close()
+
+	const file = "factory-canonical.go"
+	const symbol = "FactoryCanonicalSymbol"
+	if err := realStore.SaveFile(context.Background(), file, []Symbol{{Name: symbol, File: file, Line: 1}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = realStore.DeleteFile(context.Background(), file) }()
+	got, err := aliasStore.LookupSymbol(context.Background(), symbol)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("lookup through symlink factory = %#v, %v; want one symbol", got, err)
+	}
+}
 
 func TestResolveSymbolPostgresDSNOrder(t *testing.T) {
 	cfg := config.DefaultConfig()

@@ -119,16 +119,17 @@ func initializeWorkspaceRuntimes(ctx context.Context, ws *config.Workspace, emb 
 		}
 		runtime, w, err := initialize(ctx, ws, project, emb, sharedStore, isBackgroundChild)
 		if err != nil {
-			var registrationErr *watcher.RegistrationError
-			if errors.As(err, &registrationErr) {
+			if isFatalWatcherError(err) {
 				abortWatchSources(watchers)
 				return nil, nil, fmt.Errorf("failed to initialize watcher for project %s (%s): %w", project.Name, project.Path, err)
 			}
-			log.Printf("Warning: failed to initialize runtime for %s: %v", project.Name, err)
-			continue
+			closeWorkspaceRuntimes(runtimes, watchers)
+			return nil, nil, fmt.Errorf("failed to initialize workspace project %s (%s): %w", project.Name, project.Path, err)
 		}
 		runtimes[canonicalPath(project.Path)] = runtime
-		watchers = append(watchers, w)
+		if w != nil {
+			watchers = append(watchers, w)
+		}
 	}
 	return runtimes, watchers, nil
 }

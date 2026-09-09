@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -183,25 +184,26 @@ func TestInitializeWorkspaceRuntimesRegistrationFailureCleansPriorRuntime(t *tes
 	}
 }
 
-func TestInitializeWorkspaceRuntimesKeepsOptionalInitializationWarningBehavior(t *testing.T) {
+func TestInitializeWorkspaceRuntimesRequiresEveryProject(t *testing.T) {
 	ws := &config.Workspace{Projects: []config.ProjectEntry{
 		{Name: "optional-failure", Path: "/optional"},
 		{Name: "healthy", Path: "/healthy"},
 	}}
-	healthy := newFakeWatchSource()
+	initCalls := 0
 	initFn := func(_ context.Context, _ *config.Workspace, project config.ProjectEntry, _ embedder.Embedder, _ store.VectorStore, _ bool) (*workspaceProjectRuntime, watchSource, error) {
+		initCalls++
 		if project.Name == "optional-failure" {
-			return nil, nil, errors.New("optional index initialization failed")
+			return nil, nil, errors.New("required index initialization failed")
 		}
-		return &workspaceProjectRuntime{project: project, watcher: healthy}, healthy, nil
+		t.Fatal("initialized a later project after a required runtime failed")
+		return nil, nil, nil
 	}
 
 	runtimes, watchers, err := initializeWorkspaceRuntimes(context.Background(), ws, nil, nil, true, initFn)
-	if err != nil {
-		t.Fatalf("initializeWorkspaceRuntimes() error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "optional-failure") {
+		t.Fatalf("initializeWorkspaceRuntimes() error = %v, want required project failure", err)
 	}
-	if len(runtimes) != 1 || len(watchers) != 1 {
-		t.Fatalf("initialized %d runtimes and %d watchers, want 1 each", len(runtimes), len(watchers))
+	if runtimes != nil || watchers != nil || initCalls != 1 {
+		t.Fatalf("runtimes=%v watchers=%v initCalls=%d, want nil/nil/1", runtimes, watchers, initCalls)
 	}
-	closeWorkspaceRuntimes(runtimes, watchers)
 }

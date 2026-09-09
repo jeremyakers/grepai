@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"path/filepath"
 
 	"github.com/yoanbernabeu/grepai/config"
 )
@@ -26,7 +27,27 @@ func NewSymbolStoreWithWorkspace(ctx context.Context, cfg *config.Config, projec
 
 	dsn, source := resolveSymbolPostgresDSN(cfg, workspaceStore)
 	log.Printf("trace: using Postgres DSN from %s", source)
-	return NewPostgresSymbolStore(ctx, dsn, projectRoot, projectRoot)
+	canonicalRoot, err := canonicalSymbolPostgresRoot(projectRoot)
+	if err != nil {
+		return nil, err
+	}
+	return NewPostgresSymbolStore(ctx, dsn, canonicalRoot, canonicalRoot)
+}
+
+// canonicalSymbolPostgresRoot matches the canonical project identity used by
+// workspace writers. Existing rows written under a legacy symlink alias are
+// not migrated automatically; selecting an alias migration policy remains an
+// explicit owner operation rather than risking an unexpected namespace merge.
+func canonicalSymbolPostgresRoot(projectRoot string) (string, error) {
+	absRoot, err := filepath.Abs(projectRoot)
+	if err != nil {
+		return "", fmt.Errorf("failed to make trace postgres project root absolute: %w", err)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve trace postgres project root: %w", err)
+	}
+	return filepath.Clean(canonicalRoot), nil
 }
 
 func symbolStoreBackend(backend string) (string, error) {
