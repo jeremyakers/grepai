@@ -143,6 +143,18 @@ func (s *PostgresSymbolStore) GetCallEdges(ctx context.Context) ([]CallEdge, err
 	return edges, rows.Err()
 }
 
+// CountSymbols returns the exact number of symbols for this store's project.
+func (s *PostgresSymbolStore) CountSymbols(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	var total int
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM symbols WHERE project_id=$1`, identityBytes(s.projectID)).Scan(&total); err != nil {
+		return 0, fmt.Errorf("failed to count symbols: %w", err)
+	}
+	return total, nil
+}
+
 func (s *PostgresSymbolStore) GetStats(ctx context.Context) (*SymbolStats, error) {
 	var stats SymbolStats
 	projectID := identityBytes(s.projectID)
