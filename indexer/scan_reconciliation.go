@@ -55,8 +55,7 @@ func (idx *Indexer) decideFileScanFromMeta(ctx context.Context, fileMeta FileMet
 			return fileScanDecision{countAsSkipped: true, missingAfterWalk: errors.Is(err, fs.ErrNotExist)}, nil
 		}
 		if fresh == nil {
-			reason, classifyErr := idx.scanner.ExistingPathExclusion(fileMeta.Path)
-			return fileScanDecision{countAsSkipped: true, excluded: classifyErr == nil && reason != ""}, nil
+			return idx.nilSnapshotDecision(fileMeta.Path), nil
 		}
 		if hasExactTimestamp(fresh.ObservedModTime) && existing.ModTime.Equal(fresh.ObservedModTime) {
 			verified := VerifiedFile{Hash: existing.Hash, Size: fresh.Size, ModTime: fresh.ObservedModTime}
@@ -69,8 +68,7 @@ func (idx *Indexer) decideFileScanFromMeta(ctx context.Context, fileMeta FileMet
 		return fileScanDecision{countAsSkipped: true, missingAfterWalk: errors.Is(err, fs.ErrNotExist)}, nil
 	}
 	if file == nil {
-		reason, classifyErr := idx.scanner.ExistingPathExclusion(fileMeta.Path)
-		return fileScanDecision{countAsSkipped: true, excluded: classifyErr == nil && reason != ""}, nil
+		return idx.nilSnapshotDecision(fileMeta.Path), nil
 	}
 	if existing != nil && existing.Hash == file.Hash && existing.HasChunks {
 		return idx.refreshMatchingDocument(ctx, file, existing)
@@ -81,6 +79,15 @@ func (idx *Indexer) decideFileScanFromMeta(ctx context.Context, fileMeta FileMet
 func verifiedFileDecision(file *FileInfo) fileScanDecision {
 	verified := VerifiedFile{Hash: file.Hash, Size: file.Size, ModTime: file.ObservedModTime}
 	return fileScanDecision{verifiedPath: file.Path, verified: &verified}
+}
+
+func (idx *Indexer) nilSnapshotDecision(path string) fileScanDecision {
+	reason, err := idx.scanner.ExistingPathExclusion(path)
+	return fileScanDecision{
+		countAsSkipped:   true,
+		missingAfterWalk: errors.Is(err, fs.ErrNotExist),
+		excluded:         err == nil && reason != "",
+	}
 }
 
 func (idx *Indexer) refreshMatchingDocument(ctx context.Context, file *FileInfo, existing *store.DocumentMetadata) (fileScanDecision, error) {
@@ -108,7 +115,7 @@ func (idx *Indexer) refreshMatchingDocument(ctx context.Context, file *FileInfo,
 			return fileScanDecision{countAsSkipped: true, missingAfterWalk: errors.Is(err, fs.ErrNotExist)}, nil
 		}
 		if fresh == nil {
-			return fileScanDecision{countAsSkipped: true}, nil
+			return idx.nilSnapshotDecision(file.Path), nil
 		}
 		file = fresh
 		if doc == nil || len(doc.ChunkIDs) == 0 || doc.Hash != fresh.Hash {

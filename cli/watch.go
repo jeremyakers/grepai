@@ -3079,7 +3079,7 @@ func (p *projectPrefixStore) ListDocuments(ctx context.Context) ([]string, error
 	out := make([]string, 0, len(all))
 	for _, path := range all {
 		if strings.HasPrefix(path, prefix) {
-			out = append(out, strings.TrimPrefix(path, prefix))
+			out = append(out, filepath.FromSlash(strings.TrimPrefix(path, prefix)))
 		}
 	}
 	return out, nil
