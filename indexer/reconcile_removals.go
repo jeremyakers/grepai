@@ -163,7 +163,27 @@ func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candid
 			excluded = reason != ""
 		}
 		if statErr == nil && !excluded && !caseRenamed {
-			continue
+			file, reason, err := idx.scanner.InspectExistingPath(path)
+			if err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					if confirmErr := idx.confirmInspectionMissing(path); confirmErr != nil {
+						return removed, result, confirmErr
+					}
+					statErr = os.ErrNotExist
+				} else {
+					log.Printf("Warning: cannot verify remaining candidate %s (%v); keeping its index entry", path, err)
+					continue
+				}
+			} else if reason == "" {
+				if file == nil {
+					return removed, result, fmt.Errorf("remaining candidate %s has no stable classification", path)
+				}
+				if err := validateReeligibleFilePath(file, path); err != nil {
+					return removed, result, err
+				}
+				result.reeligible = append(result.reeligible, *file)
+				continue
+			}
 		}
 		if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
 			log.Printf("Warning: cannot verify %s (%v); keeping its index entry", path, statErr)

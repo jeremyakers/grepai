@@ -67,12 +67,7 @@ func removeOfflineSymbolFilesForScanWithSeams(ctx context.Context, scanner *inde
 		}
 		_, caseRenamed := caseRenames[path]
 		_, statErr := os.Lstat(filepath.Join(root, path))
-		remove := os.IsNotExist(statErr) || caseRenamed || intentionallyExcluded
-		if statErr == nil && !remove {
-			reason, err := scanner.ExistingPathExclusion(path)
-			remove = err == nil && reason != ""
-		}
-		if remove {
+		if statErr == nil || os.IsNotExist(statErr) || caseRenamed || intentionallyExcluded {
 			candidates = append(candidates, path)
 		}
 	}
