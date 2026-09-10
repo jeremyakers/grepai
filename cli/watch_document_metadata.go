@@ -40,5 +40,35 @@ func (p *projectPrefixStore) RefreshDocumentModTime(ctx context.Context, path, e
 	return refresher.RefreshDocumentModTime(ctx, p.getPrefix()+"/"+p.toRelSlash(path), expectedHash, modTime)
 }
 
+func (p *projectPrefixStore) GetCompleteDocument(ctx context.Context, path string) (*store.Document, error) {
+	relPath := p.toRelSlash(path)
+	prefixedPath := p.getPrefix() + "/" + relPath
+
+	var doc *store.Document
+	var err error
+	if source, ok := p.store.(store.PrefixedCompleteDocumentSource); ok {
+		// The backend may store chunks under prefixed IDs while documents keep
+		// referencing the raw relative IDs, so hand it this wrapper's fixed
+		// prefix (no trailing slash) for reference resolution.
+		doc, err = source.GetCompleteDocumentWithPrefix(ctx, prefixedPath, p.getPrefix())
+	} else if source, ok := p.store.(store.CompleteDocumentSource); ok {
+		doc, err = source.GetCompleteDocument(ctx, prefixedPath)
+	} else {
+		return nil, store.ErrCompleteDocumentUnsupported
+	}
+	if err != nil || doc == nil {
+		return nil, err
+	}
+	if doc.Path != prefixedPath {
+		return nil, nil
+	}
+
+	detached := *doc
+	detached.Path = filepath.FromSlash(relPath)
+	detached.ChunkIDs = append([]string(nil), doc.ChunkIDs...)
+	return &detached, nil
+}
+
 var _ store.DocumentMetadataSource = (*projectPrefixStore)(nil)
 var _ store.DocumentModTimeRefresher = (*projectPrefixStore)(nil)
+var _ store.CompleteDocumentSource = (*projectPrefixStore)(nil)
