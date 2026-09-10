@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GOB Mutable Aliases**: Vector GOB stores now own deep copies of mutable inputs, and symbol lookups return detached slices, preventing caller mutations from changing clean in-memory snapshots
 - **Worktree Auto-Init Rollback**: Seed and configuration files are now atomically published from synced temporary files, failed copy stages remove partial destinations, and only a parseable configuration counts as initialization completion
 - **Incomplete or Stale File Watching**: File, worktree, and workspace watchers now fail closed when a directory watch cannot be registered, fsnotify closes or reports an error, or the internal event queue cannot keep up. Fatal coverage shutdown withdraws daemon readiness and synchronously aborts event handling without flushing potentially untrustworthy derived state; the CLI then exits immediately and lets the OS reclaim watcher descriptors. Library callers that remain alive after receiving a fatal error may call `Close` to release the backend explicitly. The next startup's full scan repairs the indexes. Ready markers are PID-validated, write failures stop startup, timed-out children are stopped and cleaned up, and stale PID cleanup removes the matching marker. On Linux, registration `ENOSPC` means the per-user inotify watch quota is exhausted, not that the filesystem is out of disk space (#304)
+### Added
+
+- **Per-Request Project Root for MCP Tools**: Project-scoped MCP tools (`grepai_search`, `grepai_trace_callers`, `grepai_trace_callees`, `grepai_trace_graph`, `grepai_refs_readers`, `grepai_refs_writers`, `grepai_refs_graph`, `grepai_index_status`) accept an optional `root` parameter with an absolute project path; configuration, vector store and symbol index are loaded from that path instead of the server startup project, enabling per-launch project detection across multiple projects without restarting `mcp-serve`
+  - Specifying both `workspace` and `root` in one request is rejected; an explicit `root` also takes precedence over a server started with `--workspace`
+  - The server now advertises tool capabilities during MCP initialization (`server.WithToolCapabilities(true)`), which some MCP clients require before discovering server features/roots
 
 ## [0.36.1] - 2026-09-01
 
