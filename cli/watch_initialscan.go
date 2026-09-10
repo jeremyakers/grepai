@@ -67,6 +67,9 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	if err != nil {
 		return nil, fmt.Errorf("initial indexing failed: %w", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	announceInitialScanComplete(stats, background)
 	if err := consumeRetiredAliases(ctx, idx, scanner, symbolStore, fingerprints.snapshot, stats, stats.RetiredAliases); err != nil {
 		return nil, err
@@ -80,6 +83,9 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 		return nil, err
 	}
 	for _, file := range symbolReconciliation.reeligible {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		chunks, err := idx.IndexFile(ctx, file)
 		if err != nil {
 			return nil, fmt.Errorf("index re-eligible file %s: %w", file.Path, err)
@@ -104,6 +110,9 @@ func runInitialScan(ctx context.Context, idx *indexer.Indexer, scanner *indexer.
 	stats.ChunksCreated += symbolChanges.chunksCreated
 	for _, file := range symbolChanges.reindexed {
 		stats.ScannedFiles = replaceFileMeta(stats.ScannedFiles, indexer.FileMeta{Path: file.Path, Size: file.Size, ModTime: file.ModTime, ObservedModTime: file.ObservedModTime})
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if err := symbolStore.Persist(ctx); err != nil {
 		return nil, fmt.Errorf("persist symbol index: %w", err)
@@ -202,8 +211,14 @@ func indexInitialSymbols(ctx context.Context, idx *indexer.Indexer, scanner *ind
 		}
 		symbols, refs, err := extractSymbolsWithFramework(ctx, extractor, info.Path, info.Content, processors...)
 		if err != nil {
+			if ctx.Err() != nil {
+				return count, changes, ctx.Err()
+			}
 			log.Printf("Warning: failed to extract symbols from %s: %v", info.Path, err)
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return count, changes, err
 		}
 		if saver, ok := symbolStore.(signatureSaver); ok {
 			err = saver.SaveFileWithSignature(ctx, info.Path, info.Hash, extractor.Version(), symbols, refs)
@@ -214,6 +229,9 @@ func indexInitialSymbols(ctx context.Context, idx *indexer.Indexer, scanner *ind
 			return count, changes, fmt.Errorf("save symbols for %s: %w", info.Path, err)
 		}
 		count += len(symbols)
+	}
+	if err := ctx.Err(); err != nil {
+		return count, changes, err
 	}
 	return count, changes, nil
 }
