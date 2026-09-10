@@ -46,9 +46,26 @@ func (idx *Indexer) applyRemovalReconciliation(ctx context.Context, stats *Index
 
 func (idx *Indexer) reconcileRecoveredCandidate(ctx context.Context, file *FileInfo, metadata store.DocumentMetadata) (fileScanDecision, error) {
 	if metadata.HasChunks && metadata.Hash != "" && metadata.Hash == file.Hash {
-		if metadata.HasExactModTime && metadata.ModTime.Equal(file.ObservedModTime) {
-			return verifiedFileDecision(file), nil
+		current, err := idx.store.GetDocument(ctx, file.Path)
+		if err != nil {
+			return fileScanDecision{}, fmt.Errorf("reload recovered document: %w", err)
 		}
+		if current != nil && len(current.ChunkIDs) > 0 && current.Hash == file.Hash {
+			currentMetadata := store.DocumentMetadata{
+				Path:            file.Path,
+				Hash:            current.Hash,
+				HasChunks:       true,
+				ModTime:         current.ModTime,
+				HasExactModTime: current.HasExactModTime,
+			}
+			if currentMetadata.HasExactModTime && currentMetadata.ModTime.Equal(file.ObservedModTime) {
+				return verifiedFileDecision(file), nil
+			}
+			return idx.refreshMatchingDocument(ctx, file, &currentMetadata)
+		}
+		// The bulk snapshot lost a race with another indexer. Use the existing
+		// CAS conflict path so source and document state are observed together
+		// again before deciding whether to verify or index.
 		return idx.refreshMatchingDocument(ctx, file, &metadata)
 	}
 	return fileScanDecision{file: file}, nil
