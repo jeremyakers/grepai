@@ -11,16 +11,9 @@ func EnsureParentDir(filePath string) error {
 	return os.MkdirAll(dir, 0755)
 }
 
-// ReplaceFileAtomically renames tempPath to targetPath. On systems where
-// cross-device rename fails, it falls back to remove-then-rename.
+// ReplaceFileAtomically replaces targetPath with tempPath using one filesystem
+// namespace operation. Callers create tempPath beside targetPath, so a
+// cross-device fallback is neither necessary nor safe.
 func ReplaceFileAtomically(tempPath, targetPath string) error {
-	if err := os.Rename(tempPath, targetPath); err == nil {
-		return nil
-	}
-
-	if err := os.Remove(targetPath); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-
-	return os.Rename(tempPath, targetPath)
+	return replaceFileAtomically(tempPath, targetPath)
 }
