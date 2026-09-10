@@ -28,6 +28,15 @@ func (s *mutatingRecoveryStore) GetDocument(ctx context.Context, path string) (*
 	return s.GOBStore.GetDocument(ctx, path)
 }
 
+func (s *mutatingRecoveryStore) GetCompleteDocument(ctx context.Context, path string) (*store.Document, error) {
+	s.getCalls++
+	s.once.Do(func() { s.mutationErr = s.mutate() })
+	if s.mutationErr != nil {
+		return nil, s.mutationErr
+	}
+	return s.GOBStore.GetCompleteDocument(ctx, path)
+}
+
 func setupMutatingRecovery(t *testing.T) (context.Context, string, string, *Scanner, *store.GOBStore, *FileInfo) {
 	t.Helper()
 	ctx := context.Background()
@@ -51,7 +60,7 @@ func setupMutatingRecovery(t *testing.T) (context.Context, string, string, *Scan
 		t.Fatalf("initial=%v err=%v", initial, err)
 	}
 	base := store.NewGOBStore(filepath.Join(t.TempDir(), "index.gob"))
-	if err := base.SaveChunks(ctx, []store.Chunk{{ID: "old", FilePath: relative}}); err != nil {
+	if err := base.SaveChunks(ctx, []store.Chunk{{ID: "old", FilePath: relative, Vector: []float32{1, 2, 3}}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := base.SaveDocument(ctx, store.Document{Path: relative, Hash: initial.Hash, ModTime: initial.ObservedModTime, HasExactModTime: true, ChunkIDs: []string{"old"}}); err != nil {
@@ -84,6 +93,26 @@ func TestRecoveredExactMetadataRecreatesDeletedCurrentRecord(t *testing.T) {
 	}
 }
 
+func TestRecoveredExactMetadataRecreatesChunkOnlyDeletedRecord(t *testing.T) {
+	ctx, root, _, scanner, base, _ := setupMutatingRecovery(t)
+	relative := filepath.Join("linked", "a.go")
+	st := &mutatingRecoveryStore{GOBStore: base, mutate: func() error {
+		return base.DeleteByFile(ctx, relative)
+	}}
+	embedder := newMockEmbedder()
+	stats, err := NewIndexer(root, st, embedder, NewChunker(512, 50), scanner, time.Now()).IndexAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.FilesIndexed != 1 || !embedder.embedCalled {
+		t.Fatalf("indexed=%d embedCalled=%v", stats.FilesIndexed, embedder.embedCalled)
+	}
+	doc, err := base.GetCompleteDocument(ctx, relative)
+	if err != nil || doc == nil || len(doc.ChunkIDs) == 0 {
+		t.Fatalf("complete document=%+v err=%v", doc, err)
+	}
+}
+
 func TestRecoveredExactMetadataUsesConcurrentRecordAndLatestSource(t *testing.T) {
 	ctx, root, absolute, scanner, base, _ := setupMutatingRecovery(t)
 	relative := filepath.Join("linked", "a.go")
@@ -99,7 +128,7 @@ func TestRecoveredExactMetadataUsesConcurrentRecordAndLatestSource(t *testing.T)
 		if err := base.DeleteByFile(ctx, relative); err != nil {
 			return err
 		}
-		if err := base.SaveChunks(ctx, []store.Chunk{{ID: "latest", FilePath: relative}}); err != nil {
+		if err := base.SaveChunks(ctx, []store.Chunk{{ID: "latest", FilePath: relative, Vector: []float32{4, 5, 6}}}); err != nil {
 			return err
 		}
 		return base.SaveDocument(ctx, store.Document{Path: relative, Hash: latest.Hash, ModTime: latest.ObservedModTime, HasExactModTime: true, ChunkIDs: []string{"latest"}})

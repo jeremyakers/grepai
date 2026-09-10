@@ -60,60 +60,106 @@ func (idx *Indexer) reconcileRecoveredCandidate(ctx context.Context, file *FileI
 		return fileScanDecision{}, err
 	}
 	if metadata.HasChunks && metadata.Hash != "" && metadata.Hash == file.Hash {
-		current, err := idx.store.GetDocument(ctx, file.Path)
+		source, ok := idx.store.(store.CompleteDocumentSource)
+		if !ok {
+			return idx.inspectRecoveredForIndex(ctx, file.Path)
+		}
+		current, err := source.GetCompleteDocument(ctx, file.Path)
+		if errors.Is(err, store.ErrCompleteDocumentUnsupported) {
+			return idx.inspectRecoveredForIndex(ctx, file.Path)
+		}
 		if err != nil {
-			return fileScanDecision{}, fmt.Errorf("reload recovered document: %w", err)
+			return fileScanDecision{}, fmt.Errorf("load complete recovered document: %w", err)
 		}
-		if current != nil && len(current.ChunkIDs) > 0 && current.Hash == file.Hash {
-			currentMetadata := store.DocumentMetadata{
-				Path:            file.Path,
-				Hash:            current.Hash,
-				HasChunks:       true,
-				ModTime:         current.ModTime,
-				HasExactModTime: current.HasExactModTime,
-			}
-			if currentMetadata.HasExactModTime && currentMetadata.ModTime.Equal(file.ObservedModTime) {
-				return verifiedFileDecision(file), nil
-			}
-			return idx.refreshMatchingDocument(ctx, file, &currentMetadata)
+		if current != nil && current.Hash == file.Hash {
+			return idx.refreshRecoveredComplete(ctx, source, file, current)
 		}
-		return idx.reconcileInvalidRecoveredRecord(ctx, file.Path)
+		return idx.reconcileInvalidRecoveredRecord(ctx, source, file.Path)
 	}
 	return fileScanDecision{file: file}, nil
 }
 
-func (idx *Indexer) reconcileInvalidRecoveredRecord(ctx context.Context, path string) (fileScanDecision, error) {
+func (idx *Indexer) inspectRecoveredForIndex(ctx context.Context, path string) (fileScanDecision, error) {
 	if err := ctx.Err(); err != nil {
 		return fileScanDecision{}, err
 	}
-	fresh, err := idx.scanner.ScanFile(path)
+	fresh, reason, err := idx.scanner.InspectExistingPath(path)
 	if err != nil {
-		return fileScanDecision{countAsSkipped: true, missingAfterWalk: errors.Is(err, fs.ErrNotExist)}, nil
+		if errors.Is(err, fs.ErrNotExist) {
+			return fileScanDecision{countAsSkipped: true, missingAfterWalk: true}, nil
+		}
+		return fileScanDecision{}, err
+	}
+	if reason != "" {
+		return fileScanDecision{countAsSkipped: true, excluded: true}, nil
 	}
 	if fresh == nil {
-		return idx.nilSnapshotDecision(path), nil
+		return fileScanDecision{}, fmt.Errorf("recovered path %s has no stable inspection result", path)
 	}
 	if err := validateReeligibleFilePath(fresh, path); err != nil {
 		return fileScanDecision{}, err
 	}
-	current, err := idx.store.GetDocument(ctx, path)
+	return fileScanDecision{file: fresh}, nil
+}
+
+func (idx *Indexer) reconcileInvalidRecoveredRecord(ctx context.Context, source store.CompleteDocumentSource, path string) (fileScanDecision, error) {
+	decision, err := idx.inspectRecoveredForIndex(ctx, path)
+	if err != nil || decision.file == nil {
+		return decision, err
+	}
+	fresh := decision.file
+	current, err := source.GetCompleteDocument(ctx, path)
+	if errors.Is(err, store.ErrCompleteDocumentUnsupported) {
+		return decision, nil
+	}
 	if err != nil {
-		return fileScanDecision{}, fmt.Errorf("re-observe recovered document: %w", err)
+		return fileScanDecision{}, fmt.Errorf("re-observe complete recovered document: %w", err)
 	}
-	if current == nil || len(current.ChunkIDs) == 0 || current.Hash != fresh.Hash {
-		return fileScanDecision{file: fresh}, nil
+	if current == nil || current.Hash != fresh.Hash {
+		return decision, nil
 	}
-	metadata := store.DocumentMetadata{
-		Path:            path,
-		Hash:            current.Hash,
-		HasChunks:       true,
-		ModTime:         current.ModTime,
-		HasExactModTime: current.HasExactModTime,
+	return idx.refreshRecoveredComplete(ctx, source, fresh, current)
+}
+
+func (idx *Indexer) refreshRecoveredComplete(ctx context.Context, source store.CompleteDocumentSource, file *FileInfo, doc *store.Document) (fileScanDecision, error) {
+	for range 2 {
+		if err := ctx.Err(); err != nil {
+			return fileScanDecision{}, err
+		}
+		if doc == nil || doc.Hash != file.Hash {
+			return fileScanDecision{file: file}, nil
+		}
+		if doc.HasExactModTime && doc.ModTime.Equal(file.ObservedModTime) {
+			return verifiedFileDecision(file), nil
+		}
+		refresher, ok := idx.store.(store.DocumentModTimeRefresher)
+		if !ok || !hasExactTimestamp(file.ObservedModTime) {
+			return verifiedFileDecision(file), nil
+		}
+		_, err := refresher.RefreshDocumentModTime(ctx, file.Path, doc.Hash, file.ObservedModTime)
+		if errors.Is(err, store.ErrRefreshUnsupported) {
+			return verifiedFileDecision(file), nil
+		}
+		if err != nil {
+			return fileScanDecision{}, fmt.Errorf("refresh recovered document timestamp: %w", err)
+		}
+		decision, err := idx.inspectRecoveredForIndex(ctx, file.Path)
+		if err != nil || decision.file == nil {
+			return decision, err
+		}
+		file = decision.file
+		doc, err = source.GetCompleteDocument(ctx, file.Path)
+		if errors.Is(err, store.ErrCompleteDocumentUnsupported) {
+			return fileScanDecision{file: file}, nil
+		}
+		if err != nil {
+			return fileScanDecision{}, fmt.Errorf("revalidate complete recovered document: %w", err)
+		}
 	}
-	if metadata.HasExactModTime && metadata.ModTime.Equal(fresh.ObservedModTime) {
-		return verifiedFileDecision(fresh), nil
+	if doc != nil && doc.Hash == file.Hash && doc.HasExactModTime && doc.ModTime.Equal(file.ObservedModTime) {
+		return verifiedFileDecision(file), nil
 	}
-	return idx.refreshMatchingDocument(ctx, fresh, &metadata)
+	return fileScanDecision{}, fmt.Errorf("recovered document %s did not stabilize", file.Path)
 }
 
 func validateReeligibleFilePath(file *FileInfo, indexedPath string) error {
