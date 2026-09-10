@@ -2,7 +2,9 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 
 	"github.com/yoanbernabeu/grepai/store"
@@ -58,12 +60,60 @@ func (idx *Indexer) reconcileRecoveredCandidate(ctx context.Context, file *FileI
 		return fileScanDecision{}, err
 	}
 	if metadata.HasChunks && metadata.Hash != "" && metadata.Hash == file.Hash {
-		if metadata.HasExactModTime && metadata.ModTime.Equal(file.ObservedModTime) {
-			return verifiedFileDecision(file), nil
+		current, err := idx.store.GetDocument(ctx, file.Path)
+		if err != nil {
+			return fileScanDecision{}, fmt.Errorf("reload recovered document: %w", err)
 		}
-		return idx.refreshMatchingDocument(ctx, file, &metadata)
+		if current != nil && len(current.ChunkIDs) > 0 && current.Hash == file.Hash {
+			currentMetadata := store.DocumentMetadata{
+				Path:            file.Path,
+				Hash:            current.Hash,
+				HasChunks:       true,
+				ModTime:         current.ModTime,
+				HasExactModTime: current.HasExactModTime,
+			}
+			if currentMetadata.HasExactModTime && currentMetadata.ModTime.Equal(file.ObservedModTime) {
+				return verifiedFileDecision(file), nil
+			}
+			return idx.refreshMatchingDocument(ctx, file, &currentMetadata)
+		}
+		return idx.reconcileInvalidRecoveredRecord(ctx, file.Path)
 	}
 	return fileScanDecision{file: file}, nil
+}
+
+func (idx *Indexer) reconcileInvalidRecoveredRecord(ctx context.Context, path string) (fileScanDecision, error) {
+	if err := ctx.Err(); err != nil {
+		return fileScanDecision{}, err
+	}
+	fresh, err := idx.scanner.ScanFile(path)
+	if err != nil {
+		return fileScanDecision{countAsSkipped: true, missingAfterWalk: errors.Is(err, fs.ErrNotExist)}, nil
+	}
+	if fresh == nil {
+		return idx.nilSnapshotDecision(path), nil
+	}
+	if err := validateReeligibleFilePath(fresh, path); err != nil {
+		return fileScanDecision{}, err
+	}
+	current, err := idx.store.GetDocument(ctx, path)
+	if err != nil {
+		return fileScanDecision{}, fmt.Errorf("re-observe recovered document: %w", err)
+	}
+	if current == nil || len(current.ChunkIDs) == 0 || current.Hash != fresh.Hash {
+		return fileScanDecision{file: fresh}, nil
+	}
+	metadata := store.DocumentMetadata{
+		Path:            path,
+		Hash:            current.Hash,
+		HasChunks:       true,
+		ModTime:         current.ModTime,
+		HasExactModTime: current.HasExactModTime,
+	}
+	if metadata.HasExactModTime && metadata.ModTime.Equal(fresh.ObservedModTime) {
+		return verifiedFileDecision(fresh), nil
+	}
+	return idx.refreshMatchingDocument(ctx, fresh, &metadata)
 }
 
 func validateReeligibleFilePath(file *FileInfo, indexedPath string) error {
