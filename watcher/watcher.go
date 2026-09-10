@@ -143,12 +143,6 @@ func (w *Watcher) Start(ctx context.Context) error {
 		defer w.workers.Done()
 		w.processDelivery(ctx)
 	}()
-	// Close output channels only after every sender has finished.
-	go func() {
-		w.workers.Wait()
-		w.eventSenders.Wait()
-		w.closeOutputs()
-	}()
 
 	return nil
 }
