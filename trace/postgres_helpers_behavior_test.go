@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
 )
 
 type schemaExecutorStub struct {
@@ -140,5 +141,35 @@ func TestLoadLockedGOBSnapshotNormalizesNilCollections(t *testing.T) {
 	}
 	if store.index.Symbols == nil || store.index.References == nil || store.index.CallGraph == nil || store.fileIndex == nil || store.fileContentHashes == nil || store.fileExtractorVersions == nil {
 		t.Fatal("legacy nil collections were not normalized")
+	}
+}
+
+func TestWaitForMigrationWriterCanceledContextWrapsActiveError(t *testing.T) {
+	// Given a project whose writer lock is contended by a second handle.
+	root := t.TempDir()
+	held, err := fileutil.AcquireProjectWriterLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, busyErr := fileutil.AcquireProjectWriterLock(root)
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var activeErr *fileutil.ProjectWriterActiveError
+	if !errors.As(busyErr, &activeErr) {
+		t.Fatalf("second acquire error = %T %v, want *ProjectWriterActiveError", busyErr, busyErr)
+	}
+
+	// When the wait observes an already-canceled context.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = waitForMigrationWriter(ctx, activeErr)
+
+	// Then both the context cause and the typed busy cause are retained.
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForMigrationWriter() error = %v, want errors.Is(context.Canceled)", err)
+	}
+	if !errors.As(err, &activeErr) {
+		t.Fatalf("waitForMigrationWriter() error = %v, want typed writer-active cause", err)
 	}
 }

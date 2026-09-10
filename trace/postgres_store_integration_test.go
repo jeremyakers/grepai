@@ -662,13 +662,13 @@ func TestPostgresMigrationLoadWaitCancellation(t *testing.T) {
 	t.Cleanup(func() { _ = held.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
+	// Cancellation may surface from either the migration-state read or the
+	// lock wait; both are valid phases, so assert only the ctx cause and the
+	// no-side-effects contract (typed-cause wrapping is covered by the
+	// deterministic waitForMigrationWriter unit test).
 	err = store.Load(ctx)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Load wait error = %v, want context deadline exceeded", err)
-	}
-	var activeErr *fileutil.ProjectWriterActiveError
-	if !errors.As(err, &activeErr) {
-		t.Fatalf("Load wait error = %v, want typed writer-active cause", err)
 	}
 	var rows int
 	if err := store.pool.QueryRow(context.Background(), `SELECT (SELECT COUNT(*) FROM symbols WHERE project_id=$1)+(SELECT COUNT(*) FROM symbol_files WHERE project_id=$1)`, identityBytes(store.projectID)).Scan(&rows); err != nil || rows != 0 {
