@@ -12,50 +12,6 @@ import (
 	"github.com/yoanbernabeu/grepai/store"
 )
 
-type removalReconciliation struct {
-	reeligible     []FileInfo
-	retiredAliases []RetiredAlias
-}
-
-func (idx *Indexer) applyRemovalReconciliation(ctx context.Context, stats *IndexStats, result removalReconciliation) error {
-	for _, alias := range result.retiredAliases {
-		stats.ScannedFiles = removeFileMetaPath(stats.ScannedFiles, alias.Path)
-		stats.ExcludedFiles = removeStringPath(stats.ExcludedFiles, alias.Path)
-		stats.RetiredAliases = append(stats.RetiredAliases, alias)
-	}
-	for _, file := range result.reeligible {
-		chunks, err := idx.IndexFile(ctx, file)
-		if err != nil {
-			return fmt.Errorf("index re-eligible file %s: %w", file.Path, err)
-		}
-		stats.FilesIndexed++
-		stats.ChunksCreated += chunks
-		stats.ScannedFiles = append(stats.ScannedFiles, FileMeta{Path: file.Path, Size: file.Size, ModTime: file.ModTime, ObservedModTime: file.ObservedModTime})
-		stats.ExcludedFiles = removeStringPath(stats.ExcludedFiles, file.Path)
-	}
-	return nil
-}
-
-func removeFileMetaPath(files []FileMeta, target string) []FileMeta {
-	filtered := files[:0]
-	for _, file := range files {
-		if file.Path != target {
-			filtered = append(filtered, file)
-		}
-	}
-	return filtered
-}
-
-func removeStringPath(paths []string, target string) []string {
-	filtered := paths[:0]
-	for _, path := range paths {
-		if path != target {
-			filtered = append(filtered, path)
-		}
-	}
-	return filtered
-}
-
 func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candidates map[string]store.DocumentMetadata, exclusions, caseRenames map[string]string) (int, removalReconciliation, error) {
 	if err := checkScanRoot(idx.root); err != nil {
 		return 0, removalReconciliation{}, fmt.Errorf("scan root unavailable while reconciling removals: %w", err)
@@ -181,8 +137,33 @@ func (idx *Indexer) removeCandidatesWithRevalidation(ctx context.Context, candid
 				if err := validateReeligibleFilePath(file, path); err != nil {
 					return removed, result, err
 				}
-				result.reeligible = append(result.reeligible, *file)
-				continue
+				decision, err := idx.reconcileRecoveredCandidate(ctx, file, candidates[path])
+				if err != nil {
+					return removed, result, fmt.Errorf("reconcile remaining candidate %s: %w", path, err)
+				}
+				if decision.file != nil {
+					if err := validateReeligibleFilePath(decision.file, path); err != nil {
+						return removed, result, err
+					}
+					result.reeligible = append(result.reeligible, *decision.file)
+					continue
+				}
+				if decision.verified != nil {
+					expectedPath := filepath.FromSlash(path)
+					if decision.verifiedPath != expectedPath {
+						return removed, result, fmt.Errorf("verified path %q changed to unexpected spelling %q during recovery", expectedPath, decision.verifiedPath)
+					}
+					result.reused = append(result.reused, recoveredVerification{path: decision.verifiedPath, verified: *decision.verified})
+					continue
+				}
+				if decision.missingAfterWalk {
+					if confirmErr := idx.confirmInspectionMissing(path); confirmErr != nil {
+						return removed, result, confirmErr
+					}
+					statErr = os.ErrNotExist
+				} else if !decision.excluded {
+					return removed, result, fmt.Errorf("remaining candidate %s produced no reconciliation decision", path)
+				}
 			}
 		}
 		if statErr != nil && !errors.Is(statErr, fs.ErrNotExist) {
@@ -209,14 +190,6 @@ func (idx *Indexer) confirmInspectionMissing(path string) error {
 	}
 	if err := checkScanRoot(idx.root); err != nil {
 		return fmt.Errorf("scan root unavailable after missing inspection of %s: %w", path, err)
-	}
-	return nil
-}
-
-func validateReeligibleFilePath(file *FileInfo, indexedPath string) error {
-	expected := filepath.FromSlash(indexedPath)
-	if file.Path != expected {
-		return fmt.Errorf("indexed path %q changed to unexpected spelling %q during re-eligibility", expected, file.Path)
 	}
 	return nil
 }
