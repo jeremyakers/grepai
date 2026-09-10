@@ -1142,7 +1142,7 @@ func runWatchUIWorker(ctx context.Context, p *tea.Program) (err error) {
 		withWatchSupervisorScopeObserver(func(totalProjects int) {
 			p.Send(watchUIScopeMsg{totalProjects: totalProjects})
 		}),
-		withWatchSupervisorInitialReadyObserver(func(totalProjects int) {
+		withWatchSupervisorInitialReadyObserver(func(totalProjects int) error {
 			sendWatchUILedger(
 				p,
 				projectRoot,
@@ -1150,6 +1150,7 @@ func runWatchUIWorker(ctx context.Context, p *tea.Program) (err error) {
 				fmt.Sprintf("Watching %d project(s) for changes", totalProjects),
 			)
 			p.Send(watchUIPhaseMsg{current: 4})
+			return nil
 		}),
 		withWatchSupervisorLifecycleObserver(func(root, state, note string) {
 			registerLogSource(root)

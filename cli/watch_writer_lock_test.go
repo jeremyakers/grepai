@@ -36,7 +36,7 @@ func TestProjectWatchWriterLockContendsAcrossModesAndLogDirs(t *testing.T) {
 			name: "background different log directory",
 			run: func() error {
 				watchLogDir = backgroundLogDir
-				return watchProjectWithEventObserver(context.Background(), projectRoot, nil, true, nil, nil, nil, nil, nil, nil, nil)
+				return watchProjectWithEventObserver(context.Background(), projectRoot, nil, true, nil, nil, nil, nil, nil, nil, nil, nil)
 			},
 		},
 	}

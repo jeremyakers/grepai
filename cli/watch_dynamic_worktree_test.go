@@ -288,8 +288,9 @@ func TestDynamicWatch_LinkedFailureIsIsolatedWithRetry(t *testing.T) {
 			withWatchSupervisorRetryBackoff(func(attempt int) time.Duration {
 				return time.Duration(attempt) * 20 * time.Millisecond
 			}),
-			withWatchSupervisorInitialReadyObserver(func(totalProjects int) {
+			withWatchSupervisorInitialReadyObserver(func(totalProjects int) error {
 				initialReadyCh <- totalProjects
+				return nil
 			}),
 			withWatchSupervisorLifecycleObserver(func(projectRoot, state, note string) {
 				lifecycleCh <- watchLifecycleEvent{projectRoot: projectRoot, state: state, note: note}
@@ -431,8 +432,9 @@ func TestDynamicWatch_InitialReadySelector_MainOnly(t *testing.T) {
 			withWatchSupervisorInitialReadySelector(func(main, project string) bool {
 				return main == project
 			}),
-			withWatchSupervisorInitialReadyObserver(func(totalProjects int) {
+			withWatchSupervisorInitialReadyObserver(func(totalProjects int) error {
 				initialReadyCh <- totalProjects
+				return nil
 			}),
 		)
 	}()
