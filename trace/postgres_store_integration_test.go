@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/yoanbernabeu/grepai/config"
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
 )
 
 var schemaIntegrationCounter atomic.Uint64
@@ -609,6 +610,72 @@ func TestPostgresMigrationConcurrentLoadsSerialize(t *testing.T) {
 	}
 	if stats, err := one.GetStats(ctx); err != nil || stats.TotalFiles != 2 || stats.TotalSymbols != 2 || stats.TotalReferences != 2 {
 		t.Fatalf("concurrent migration data = %#v, %v", stats, err)
+	}
+}
+
+func TestPostgresMigrationLoadWaitsForActiveWriter(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	writeMigrationGOB(t, root, 2)
+	store := newIntegrationSymbolStore(t, "migration-wait", root)
+	truncateSymbolTables(t, store)
+	var batches atomic.Int32
+	store.migrationBatchHook = func(int) error { batches.Add(1); return nil }
+
+	// Hold the project writer lock as a concurrent initial writer would.
+	held, err := fileutil.AcquireProjectWriterLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	errCh := make(chan error, 1)
+	go func() { errCh <- store.Load(ctx) }()
+	// Load must wait for the active writer, not fail fast.
+	select {
+	case err := <-errCh:
+		t.Fatalf("Load returned while writer lock held: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := held.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("Load after writer release: %v", err)
+	}
+	if batches.Load() != 1 {
+		t.Fatalf("expected exactly one import, got %d batches", batches.Load())
+	}
+	if stats, err := store.GetStats(ctx); err != nil || stats.TotalFiles != 2 || stats.TotalSymbols != 2 {
+		t.Fatalf("post-wait migration data = %#v, %v", stats, err)
+	}
+}
+
+func TestPostgresMigrationLoadWaitCancellation(t *testing.T) {
+	root := t.TempDir()
+	writeMigrationGOB(t, root, 1)
+	store := newIntegrationSymbolStore(t, "migration-wait-cancel", root)
+	truncateSymbolTables(t, store)
+
+	held, err := fileutil.AcquireProjectWriterLock(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err = store.Load(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Load wait error = %v, want context deadline exceeded", err)
+	}
+	var activeErr *fileutil.ProjectWriterActiveError
+	if !errors.As(err, &activeErr) {
+		t.Fatalf("Load wait error = %v, want typed writer-active cause", err)
+	}
+	var rows int
+	if err := store.pool.QueryRow(context.Background(), `SELECT (SELECT COUNT(*) FROM symbols WHERE project_id=$1)+(SELECT COUNT(*) FROM symbol_files WHERE project_id=$1)`, identityBytes(store.projectID)).Scan(&rows); err != nil || rows != 0 {
+		t.Fatalf("canceled wait imported %d rows: %v", rows, err)
+	}
+	if _, err := os.Stat(config.GetSymbolIndexPath(root)); err != nil {
+		t.Fatalf("source GOB missing after canceled wait: %v", err)
 	}
 }
 

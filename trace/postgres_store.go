@@ -158,23 +158,52 @@ func (s *PostgresSymbolStore) GetFileExtractorVersion(filePath string) (string, 
 	return value, err == nil
 }
 
+const migrationWriterWaitInterval = 10 * time.Millisecond
+
 func (s *PostgresSymbolStore) Load(ctx context.Context) (retErr error) {
 	if err := s.ensureSchema(ctx); err != nil {
 		return err
 	}
-	completed, err := s.migrationCompletedWithoutGOB(ctx)
-	if err != nil {
-		return err
+	for {
+		completed, err := s.migrationCompletedWithoutGOB(ctx)
+		if err != nil {
+			return err
+		}
+		if completed {
+			return nil
+		}
+		writerLock, err := fileutil.AcquireProjectWriterLock(s.projectRoot)
+		if err == nil {
+			defer func() { retErr = errors.Join(retErr, writerLock.Close()) }()
+			return s.migrateGOBIfNeeded(ctx)
+		}
+		var activeErr *fileutil.ProjectWriterActiveError
+		if !errors.As(err, &activeErr) {
+			return fmt.Errorf("failed to acquire project writer lock for Postgres symbol migration: %w", err)
+		}
+		// Another writer holds the project lock: a concurrent initial
+		// migration or a live watcher. Wait — bounded by ctx — for it to
+		// finish the migration or release the lock, then re-check completion
+		// so readers never queue behind a lifelong watcher once migration is
+		// done, and concurrent Loads serialize instead of failing fast.
+		if err := waitForMigrationWriter(ctx, activeErr); err != nil {
+			return err
+		}
 	}
-	if completed {
+}
+
+// waitForMigrationWriter blocks one retry interval, mirroring the bounded
+// wait in fileutil.AcquireProjectWriterLockContext, so the caller can
+// re-observe migration completion between lock attempts.
+func waitForMigrationWriter(ctx context.Context, activeErr *fileutil.ProjectWriterActiveError) error {
+	timer := time.NewTimer(migrationWriterWaitInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %w", activeErr, ctx.Err())
+	case <-timer.C:
 		return nil
 	}
-	writerLock, err := fileutil.AcquireProjectWriterLock(s.projectRoot)
-	if err != nil {
-		return fmt.Errorf("failed to acquire project writer lock for Postgres symbol migration: %w", err)
-	}
-	defer func() { retErr = errors.Join(retErr, writerLock.Close()) }()
-	return s.migrateGOBIfNeeded(ctx)
 }
 
 // LoadWithProjectWriterLockHeld loads migration state while the caller holds
