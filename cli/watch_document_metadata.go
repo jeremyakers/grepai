@@ -40,5 +40,27 @@ func (p *projectPrefixStore) RefreshDocumentModTime(ctx context.Context, path, e
 	return refresher.RefreshDocumentModTime(ctx, p.getPrefix()+"/"+p.toRelSlash(path), expectedHash, modTime)
 }
 
+func (p *projectPrefixStore) GetCompleteDocument(ctx context.Context, path string) (*store.Document, error) {
+	source, ok := p.store.(store.CompleteDocumentSource)
+	if !ok {
+		return nil, store.ErrCompleteDocumentUnsupported
+	}
+	relPath := p.toRelSlash(path)
+	prefixedPath := p.getPrefix() + "/" + relPath
+	doc, err := source.GetCompleteDocument(ctx, prefixedPath)
+	if err != nil || doc == nil {
+		return nil, err
+	}
+	if doc.Path != prefixedPath {
+		return nil, nil
+	}
+
+	detached := *doc
+	detached.Path = filepath.FromSlash(relPath)
+	detached.ChunkIDs = append([]string(nil), doc.ChunkIDs...)
+	return &detached, nil
+}
+
 var _ store.DocumentMetadataSource = (*projectPrefixStore)(nil)
 var _ store.DocumentModTimeRefresher = (*projectPrefixStore)(nil)
+var _ store.CompleteDocumentSource = (*projectPrefixStore)(nil)
