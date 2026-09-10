@@ -136,8 +136,32 @@ func TestPostgresGetCompleteDocumentWithPrefixValidation(t *testing.T) {
 	// Empty prefix matches exact IDs only.
 	saveChunk(st, "ws/proj/i.go_0", "ws/proj/i.go")
 	saveDoc("ws/proj/i.go", "i.go_0")
+	// Empty prefix keeps backslash references literal (no normalization).
+	saveChunk(st, "sub/o.go_0", "sub/o.go")
+	saveDoc("sub/o.go", `sub\o.go_0`)
+	// Complete: a legacy Windows raw reference (native backslashes) resolves
+	// to the slash-normalized prefixed chunk the writer stored.
+	saveChunk(st, "ws/proj/src/j.go_0", "ws/proj/src/j.go")
+	saveDoc("ws/proj/src/j.go", `src\j.go_0`)
+	// Complete: mixed raw and already-prefixed Windows references; the full
+	// reference normalizes without adding the prefix a second time.
+	saveChunk(st, "ws/proj/src/p.go_0", "ws/proj/src/p.go")
+	saveChunk(st, "ws/proj/src/p.go_1", "ws/proj/src/p.go")
+	saveDoc("ws/proj/src/p.go", `src\p.go_0`, `ws\proj\src\p.go_1`)
+	// Incomplete: a normalized full reference owned by another file is
+	// rejected; namespace widening never relaxes the same-file check.
+	saveChunk(st, "ws/proj/q.go_0", "ws/proj/q.go")
+	saveDoc("ws/proj/r.go", `ws\proj\q.go_0`)
+	// Complete: a host whose name literally contains backslashes resolves
+	// through the literal prefixed candidate.
+	saveChunk(st, `ws/proj/l\m.go_0`, `ws/proj/l\m.go`)
+	saveDoc(`ws/proj/l\m.go`, `l\m.go_0`)
+	// Incomplete: the normalized candidate matches an ID owned by another
+	// file; namespace widening never relaxes the same-file check.
+	saveChunk(st, "ws/proj/sub/k.go_0", "ws/proj/sub/k.go")
+	saveDoc("ws/proj/k.go", `sub\k.go_0`)
 
-	for _, path := range []string{"ws/proj/a.go", "ws/proj/b.go", "ws/proj/c.go", "ws/proj/d.go"} {
+	for _, path := range []string{"ws/proj/a.go", "ws/proj/b.go", "ws/proj/c.go", "ws/proj/d.go", "ws/proj/src/j.go", `ws/proj/l\m.go`, "ws/proj/src/p.go"} {
 		t.Run("complete/"+path, func(t *testing.T) {
 			got, err := st.GetCompleteDocumentWithPrefix(ctx, path, prefix)
 			if err != nil || got == nil || got.Path != path {
@@ -145,7 +169,7 @@ func TestPostgresGetCompleteDocumentWithPrefixValidation(t *testing.T) {
 			}
 		})
 	}
-	for _, path := range []string{"ws/proj/e.go", "ws/proj/f.go", "ws/proj/g.go", "ws/proj/h.go"} {
+	for _, path := range []string{"ws/proj/e.go", "ws/proj/f.go", "ws/proj/g.go", "ws/proj/h.go", "ws/proj/k.go", "ws/proj/r.go"} {
 		t.Run("incomplete/"+path, func(t *testing.T) {
 			got, err := st.GetCompleteDocumentWithPrefix(ctx, path, prefix)
 			if err != nil || got != nil {
@@ -155,6 +179,12 @@ func TestPostgresGetCompleteDocumentWithPrefixValidation(t *testing.T) {
 	}
 	t.Run("empty prefix exact only", func(t *testing.T) {
 		got, err := st.GetCompleteDocumentWithPrefix(ctx, "ws/proj/i.go", "")
+		if err != nil || got != nil {
+			t.Fatalf("GetCompleteDocumentWithPrefix(empty prefix) = %+v, %v; want nil, nil", got, err)
+		}
+	})
+	t.Run("empty prefix literal backslash", func(t *testing.T) {
+		got, err := st.GetCompleteDocumentWithPrefix(ctx, "sub/o.go", "")
 		if err != nil || got != nil {
 			t.Fatalf("GetCompleteDocumentWithPrefix(empty prefix) = %+v, %v; want nil, nil", got, err)
 		}

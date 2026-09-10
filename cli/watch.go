@@ -3081,11 +3081,12 @@ func (p *projectPrefixStore) SaveChunks(ctx context.Context, chunks []store.Chun
 		relPath := p.toRelSlash(c.FilePath)
 		prefixedPath := p.getPrefix() + "/" + relPath
 		prefixedChunks[i].FilePath = prefixedPath
-		// Also update the chunk ID to include project prefix
-		// Original ID format is "filePath_index", we need to replace the filePath part
-		if idx := strings.LastIndex(c.ID, "_"); idx >= 0 {
-			prefixedChunks[i].ID = prefixedPath + c.ID[idx:]
-		}
+		// Preserve the entire generated chunk ID under the fixed project
+		// prefix. Suffix-truncating rewrites (e.g. keeping only the text
+		// after the last underscore) collapse ReChunk sub-chunk IDs such as
+		// "src/a.go_0_0" and "src/a.go_0_1" onto "src/a.go_0"-style keys,
+		// breaking reference resolution and colliding distinct chunks.
+		prefixedChunks[i].ID = p.getPrefix() + "/" + filepath.ToSlash(c.ID)
 	}
 	return p.store.SaveChunks(ctx, prefixedChunks)
 }
