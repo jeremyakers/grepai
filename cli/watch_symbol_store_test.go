@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/yoanbernabeu/grepai/trace"
+	"github.com/yoanbernabeu/grepai/watcher"
 )
 
 type failingWatchSymbolStore struct {
@@ -52,6 +53,37 @@ func TestPostgresLoadPolicyStopsCallbackBeforeScan(t *testing.T) {
 	err := runAfterWatcherSymbolLoad(context.Background(), "postgres", "project", store, func() error { scans++; return nil })
 	if err == nil || scans != 0 || store.closes != 0 {
 		t.Fatalf("err=%v scans=%d closes=%d", err, scans, store.closes)
+	}
+}
+
+func TestPostgresLoadFailureMarkedRequiredInit(t *testing.T) {
+	loadErr := errors.New("migration failed")
+	store := &failingWatchSymbolStore{loadErr: loadErr}
+
+	err := runAfterWatcherSymbolLoad(context.Background(), "postgres", "project", store, nil)
+
+	if !isRequiredSymbolStoreInitError(err) {
+		t.Fatalf("postgres load error = %v, want required symbol store init error", err)
+	}
+	if !errors.Is(err, loadErr) {
+		t.Fatalf("postgres load error = %v, want errors.Is(%v)", err, loadErr)
+	}
+	var registrationErr *watcher.RegistrationError
+	if errors.As(err, &registrationErr) {
+		t.Fatalf("postgres load error = %v, must not be mislabeled as RegistrationError", err)
+	}
+}
+
+func TestGOBLoadWarningRemainsOptional(t *testing.T) {
+	store := &failingWatchSymbolStore{loadErr: errors.New("legacy snapshot damaged")}
+
+	err := runAfterWatcherSymbolLoad(context.Background(), "gob", "project", store, nil)
+
+	if err != nil {
+		t.Fatalf("gob load error = %v, want warning-only nil", err)
+	}
+	if isRequiredSymbolStoreInitError(err) {
+		t.Fatal("gob load warning must not become a required init error")
 	}
 }
 

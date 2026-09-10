@@ -2861,10 +2861,9 @@ func runWorkspaceWatchForeground(logDir string, ws *config.Workspace) error {
 
 	runtimes, watchers, err := initializeWorkspaceRuntimes(ctx, ws, emb, st, isBackgroundChild, initializeWorkspaceRuntime)
 	if err != nil {
-		abortStores = isFatalWatcherError(err)
+		abortStores = isFatalWatcherError(err) || isRequiredSymbolStoreInitError(err)
 		return err
 	}
-	defer closeWorkspaceRuntimes(runtimes, watchers)
 
 	var closeWatchersOnce sync.Once
 	closeWatchers := func() { closeWatchersOnce.Do(func() { closeWatchSources(watchers) }) }
@@ -3050,7 +3049,9 @@ func initializeWorkspaceRuntime(ctx context.Context, ws *config.Workspace, proje
 	extractor := trace.NewRegexExtractor()
 	symbolStore, err := trace.NewSymbolStoreWithWorkspace(ctx, projectCfg, project.Path, &ws.Store)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, &requiredSymbolStoreInitError{
+			cause: fmt.Errorf("failed to create symbol store for %s: %w", project.Path, err),
+		}
 	}
 	tracedLanguages := projectCfg.Trace.EnabledLanguages
 	if len(tracedLanguages) == 0 {
