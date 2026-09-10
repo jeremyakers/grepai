@@ -1,0 +1,95 @@
+package indexer
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+
+	"github.com/yoanbernabeu/grepai/store"
+)
+
+type removalReconciliation struct {
+	reeligible     []FileInfo
+	reused         []recoveredVerification
+	retiredAliases []RetiredAlias
+}
+
+type recoveredVerification struct {
+	path     string
+	verified VerifiedFile
+}
+
+func (idx *Indexer) applyRemovalReconciliation(ctx context.Context, stats *IndexStats, result removalReconciliation) error {
+	for _, alias := range result.retiredAliases {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		stats.ScannedFiles = removeFileMetaPath(stats.ScannedFiles, alias.Path)
+		stats.ExcludedFiles = removeStringPath(stats.ExcludedFiles, alias.Path)
+		stats.RetiredAliases = append(stats.RetiredAliases, alias)
+	}
+	for _, file := range result.reeligible {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunks, err := idx.IndexFile(ctx, file)
+		if err != nil {
+			return fmt.Errorf("index re-eligible file %s: %w", file.Path, err)
+		}
+		stats.FilesIndexed++
+		stats.ChunksCreated += chunks
+		stats.ScannedFiles = append(stats.ScannedFiles, FileMeta{Path: file.Path, Size: file.Size, ModTime: file.ModTime, ObservedModTime: file.ObservedModTime})
+		stats.ExcludedFiles = removeStringPath(stats.ExcludedFiles, file.Path)
+	}
+	for _, recovered := range result.reused {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		verified := recovered.verified
+		stats.ScannedFiles = append(stats.ScannedFiles, FileMeta{Path: recovered.path, Size: verified.Size, ModTime: verified.ModTime.Unix(), ObservedModTime: verified.ModTime})
+		stats.VerifiedUnchangedFiles[recovered.path] = verified
+		stats.ExcludedFiles = removeStringPath(stats.ExcludedFiles, recovered.path)
+	}
+	return nil
+}
+
+func (idx *Indexer) reconcileRecoveredCandidate(ctx context.Context, file *FileInfo, metadata store.DocumentMetadata) (fileScanDecision, error) {
+	if err := ctx.Err(); err != nil {
+		return fileScanDecision{}, err
+	}
+	if metadata.HasChunks && metadata.Hash != "" && metadata.Hash == file.Hash {
+		if metadata.HasExactModTime && metadata.ModTime.Equal(file.ObservedModTime) {
+			return verifiedFileDecision(file), nil
+		}
+		return idx.refreshMatchingDocument(ctx, file, &metadata)
+	}
+	return fileScanDecision{file: file}, nil
+}
+
+func validateReeligibleFilePath(file *FileInfo, indexedPath string) error {
+	expected := filepath.FromSlash(indexedPath)
+	if file.Path != expected {
+		return fmt.Errorf("indexed path %q changed to unexpected spelling %q during re-eligibility", expected, file.Path)
+	}
+	return nil
+}
+
+func removeFileMetaPath(files []FileMeta, target string) []FileMeta {
+	filtered := files[:0]
+	for _, file := range files {
+		if file.Path != target {
+			filtered = append(filtered, file)
+		}
+	}
+	return filtered
+}
+
+func removeStringPath(paths []string, target string) []string {
+	filtered := paths[:0]
+	for _, path := range paths {
+		if path != target {
+			filtered = append(filtered, path)
+		}
+	}
+	return filtered
+}
