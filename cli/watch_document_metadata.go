@@ -41,13 +41,21 @@ func (p *projectPrefixStore) RefreshDocumentModTime(ctx context.Context, path, e
 }
 
 func (p *projectPrefixStore) GetCompleteDocument(ctx context.Context, path string) (*store.Document, error) {
-	source, ok := p.store.(store.CompleteDocumentSource)
-	if !ok {
-		return nil, store.ErrCompleteDocumentUnsupported
-	}
 	relPath := p.toRelSlash(path)
 	prefixedPath := p.getPrefix() + "/" + relPath
-	doc, err := source.GetCompleteDocument(ctx, prefixedPath)
+
+	var doc *store.Document
+	var err error
+	if source, ok := p.store.(store.PrefixedCompleteDocumentSource); ok {
+		// The backend may store chunks under prefixed IDs while documents keep
+		// referencing the raw relative IDs, so hand it this wrapper's fixed
+		// prefix (no trailing slash) for reference resolution.
+		doc, err = source.GetCompleteDocumentWithPrefix(ctx, prefixedPath, p.getPrefix())
+	} else if source, ok := p.store.(store.CompleteDocumentSource); ok {
+		doc, err = source.GetCompleteDocument(ctx, prefixedPath)
+	} else {
+		return nil, store.ErrCompleteDocumentUnsupported
+	}
 	if err != nil || doc == nil {
 		return nil, err
 	}

@@ -8,6 +8,11 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// Each referenced chunk ID must have at least one valid matching chunk: same
+// project and file, non-null vector, and an ID equal to the reference or, when
+// a non-empty prefix is given, prefix+"/"+reference. The per-reference nested
+// NOT EXISTS keeps a bad exact-ID row (wrong file or NULL vector) from
+// rejecting a reference that a valid prefixed row satisfies.
 const getCompleteDocumentSQL = `
 SELECT d.path, d.hash, d.mod_time, d.mod_time_ns, d.chunk_ids
 FROM documents d
@@ -17,18 +22,25 @@ WHERE d.project_id = $1
   AND NOT EXISTS (
     SELECT 1
     FROM unnest(d.chunk_ids) AS referenced(id)
-    LEFT JOIN chunks c
-      ON c.project_id = d.project_id
-     AND c.id = referenced.id
-     AND c.file_path = d.path
-    WHERE c.id IS NULL OR c.vector IS NULL
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM chunks c
+      WHERE c.project_id = d.project_id
+        AND c.file_path = d.path
+        AND c.vector IS NOT NULL
+        AND (c.id = referenced.id OR ($3 <> '' AND c.id = $3 || '/' || referenced.id))
+    )
   )`
 
 func (s *PostgresStore) GetCompleteDocument(ctx context.Context, filePath string) (*Document, error) {
+	return s.GetCompleteDocumentWithPrefix(ctx, filePath, "")
+}
+
+func (s *PostgresStore) GetCompleteDocumentWithPrefix(ctx context.Context, filePath, chunkIDPrefix string) (*Document, error) {
 	var doc Document
 	var modTime time.Time
 	var modTimeNS *int64
-	err := s.pool.QueryRow(ctx, getCompleteDocumentSQL, s.projectID, filePath).Scan(
+	err := s.pool.QueryRow(ctx, getCompleteDocumentSQL, s.projectID, filePath, chunkIDPrefix).Scan(
 		&doc.Path, &doc.Hash, &modTime, &modTimeNS, &doc.ChunkIDs,
 	)
 	if err == pgx.ErrNoRows {
@@ -44,3 +56,4 @@ func (s *PostgresStore) GetCompleteDocument(ctx context.Context, filePath string
 }
 
 var _ CompleteDocumentSource = (*PostgresStore)(nil)
+var _ PrefixedCompleteDocumentSource = (*PostgresStore)(nil)
