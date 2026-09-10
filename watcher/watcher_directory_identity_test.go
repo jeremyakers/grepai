@@ -32,8 +32,8 @@ func TestFailedChildWatchStillEmitsDirectoryCleanup(t *testing.T) {
 		removed[path] = true
 		return nil
 	}
-	if err := w.addRecursive(parent); err != nil {
-		t.Fatal(err)
+	if err := w.addRecursive(parent); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("addRecursive error = %v, want fail-closed EIO", err)
 	}
 	if err := os.Remove(child); err != nil {
 		t.Fatal(err)

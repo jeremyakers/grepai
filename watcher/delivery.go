@@ -21,6 +21,9 @@ func (w *Watcher) processDelivery(ctx context.Context) {
 func (w *Watcher) debounceEvent(event FileEvent) {
 	w.pendingMu.Lock()
 	defer w.pendingMu.Unlock()
+	if w.stopped() {
+		return
+	}
 	if event.Type == EventReconcile {
 		existing := w.reconcilePending[event.Path]
 		event.IsDir = event.IsDir || existing.IsDir
@@ -62,6 +65,8 @@ func (w *Watcher) flush() {
 }
 
 func (w *Watcher) flushWithContext(ctx context.Context) {
+	w.eventSenders.Add(1)
+	defer w.eventSenders.Done()
 	w.pendingMu.Lock()
 	events := make([]FileEvent, 0, len(w.pending))
 	for _, event := range w.pending {

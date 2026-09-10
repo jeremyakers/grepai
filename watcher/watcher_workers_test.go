@@ -35,37 +35,28 @@ func TestBackendDrainsWhileOutputDeliveryIsStalled(t *testing.T) {
 	if err := os.WriteFile(changed, []byte("package changed"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	errorDrained := make(chan struct{})
 	eventDrained := make(chan struct{})
-	go func() {
-		backendErrors <- errors.New("backend overflow")
-		close(errorDrained)
-	}()
 	go func() {
 		backendEvents <- fsnotify.Event{Name: changed, Op: fsnotify.Write}
 		close(eventDrained)
 	}()
-	for errorDrained != nil || eventDrained != nil {
-		select {
-		case <-errorDrained:
-			errorDrained = nil
-		case <-eventDrained:
-			eventDrained = nil
-		case <-deadline.C:
-			t.Fatal("backend was not drained while output delivery was stalled")
-		}
+	select {
+	case <-eventDrained:
+	case <-deadline.C:
+		t.Fatal("backend event was not drained while output delivery was stalled")
 	}
+	backendErr := errors.New("backend overflow")
+	backendErrors <- backendErr
 
-	// Resume the consumer and prove the stalled batch can complete normally.
-	for {
-		select {
-		case event := <-w.Events():
-			if event.Path == "initial.go" {
-				return
-			}
-		case <-deadline.C:
-			t.Fatal("stalled delivery did not resume")
+	// A real backend error remains fatal even while lossless delivery is
+	// backpressured; it aborts the queued output rather than hanging shutdown.
+	select {
+	case err := <-w.Errors():
+		if !errors.Is(err, backendErr) {
+			t.Fatalf("backend fatal = %v, want %v", err, backendErr)
 		}
+	case <-deadline.C:
+		t.Fatal("backend fatal was not published promptly")
 	}
 }
 
