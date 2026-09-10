@@ -79,6 +79,121 @@ func TestGOBStoreGetCompleteDocument(t *testing.T) {
 	}
 }
 
+func TestGOBStoreGetCompleteDocumentWithPrefix(t *testing.T) {
+	ctx := context.Background()
+	const (
+		docPath = "ws/proj/src/a.go"
+		prefix  = "ws/proj"
+		rawID   = "src/a.go_0"
+		fullID  = "ws/proj/src/a.go_0"
+	)
+	validPrefixed := Chunk{ID: fullID, FilePath: docPath, Vector: []float32{1}}
+	tests := []struct {
+		name   string
+		ids    []string
+		prefix string
+		chunks []Chunk
+		want   bool
+	}{
+		{
+			name:   "raw references match prefixed chunks",
+			ids:    []string{rawID},
+			prefix: prefix,
+			chunks: []Chunk{validPrefixed},
+			want:   true,
+		},
+		{
+			name:   "mixed raw and full references",
+			ids:    []string{rawID, "ws/proj/src/a.go_1"},
+			prefix: prefix,
+			chunks: []Chunk{
+				validPrefixed,
+				{ID: "ws/proj/src/a.go_1", FilePath: docPath, Vector: []float32{2}},
+			},
+			want: true,
+		},
+		{
+			name:   "exact collision wrong file still uses valid prefixed",
+			ids:    []string{rawID},
+			prefix: prefix,
+			chunks: []Chunk{
+				validPrefixed,
+				{ID: rawID, FilePath: "src/other.go", Vector: []float32{9}},
+			},
+			want: true,
+		},
+		{
+			name:   "exact collision empty vector still uses valid prefixed",
+			ids:    []string{rawID},
+			prefix: prefix,
+			chunks: []Chunk{
+				validPrefixed,
+				{ID: rawID, FilePath: docPath},
+			},
+			want: true,
+		},
+		{
+			name:   "prefixed chunk wrong file",
+			ids:    []string{rawID},
+			prefix: prefix,
+			chunks: []Chunk{{ID: fullID, FilePath: "ws/proj/src/other.go", Vector: []float32{1}}},
+		},
+		{
+			name:   "prefixed chunk empty vector",
+			ids:    []string{rawID},
+			prefix: prefix,
+			chunks: []Chunk{{ID: fullID, FilePath: docPath}},
+		},
+		{
+			name:   "other prefix suffix tail not accepted",
+			ids:    []string{rawID},
+			prefix: prefix,
+			chunks: []Chunk{{ID: "tail-" + fullID, FilePath: docPath, Vector: []float32{1}}},
+		},
+		{
+			name:   "empty prefix matches exact only",
+			ids:    []string{rawID},
+			chunks: []Chunk{validPrefixed},
+		},
+		{
+			name:   "exact match without prefix",
+			ids:    []string{rawID},
+			chunks: []Chunk{{ID: rawID, FilePath: docPath, Vector: []float32{1}}},
+			want:   true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := NewGOBStore(t.TempDir() + "/index.gob")
+			if err := st.SaveChunks(ctx, tt.chunks); err != nil {
+				t.Fatal(err)
+			}
+			doc := Document{Path: docPath, Hash: "hash", ChunkIDs: tt.ids}
+			if err := st.SaveDocument(ctx, doc); err != nil {
+				t.Fatal(err)
+			}
+			got, err := st.GetCompleteDocumentWithPrefix(ctx, docPath, tt.prefix)
+			if err != nil || (got != nil) != tt.want {
+				t.Fatalf("GetCompleteDocumentWithPrefix() = %+v, %v; want present=%v", got, err, tt.want)
+			}
+			metadata, err := st.GetDocument(ctx, docPath)
+			if err != nil || metadata == nil || metadata.Hash != "hash" {
+				t.Fatalf("GetDocument metadata changed: %+v, %v", metadata, err)
+			}
+			if got != nil {
+				if got.Path != docPath {
+					t.Fatalf("document path = %q", got.Path)
+				}
+				got.ChunkIDs[0] = "mutated"
+				again, _ := st.GetCompleteDocumentWithPrefix(ctx, docPath, tt.prefix)
+				if again.ChunkIDs[0] != tt.ids[0] {
+					t.Fatalf("returned chunk IDs alias store: %v", again.ChunkIDs)
+				}
+			}
+		})
+	}
+}
+
 func TestGOBStoreGetCompleteDocumentAfterReload(t *testing.T) {
 	ctx := context.Background()
 	path := t.TempDir() + "/index.gob"
