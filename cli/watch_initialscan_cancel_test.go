@@ -15,8 +15,8 @@ import (
 
 // cancelAfterSymbolSaveStore cancels the run context as soon as the final
 // expected symbol save completes, then records whether Persist was still
-// invoked. GOB Persist does not itself honor a cancelled context, so only an
-// explicit cancellation guard in runInitialScan can keep a cancelled startup
+// invoked. GOB Persist does not itself honor a canceled context, so only an
+// explicit cancellation guard in runInitialScan can keep a canceled startup
 // from flushing symbols that were saved moments before shutdown.
 type cancelAfterSymbolSaveStore struct {
 	trace.SymbolStore
