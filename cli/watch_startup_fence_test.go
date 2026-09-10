@@ -139,6 +139,11 @@ func TestDynamicLinkedWatcherRegistrationHandoffFencesFatalCleanup(t *testing.T)
 	if err := cfg.Save(linkedRoot); err != nil {
 		t.Fatalf("save linked config: %v", err)
 	}
+	// Startup persistence writes only when the initial scan produced content,
+	// so the linked project needs an indexable source file.
+	if err := os.WriteFile(filepath.Join(linkedRoot, "linked.go"), []byte("package linked\n\nfunc Linked() {}\n"), 0o644); err != nil {
+		t.Fatalf("write linked source: %v", err)
+	}
 
 	fence := newWatchMutationFence()
 	fatal := &watcher.FatalError{Operation: "watch", Path: mainRoot, Cause: syscall.ENOSPC}

@@ -1,10 +1,14 @@
 package config
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+
+	"github.com/yoanbernabeu/grepai/internal/fileutil"
 )
 
 func TestCopyFileIfExists(t *testing.T) {
@@ -143,6 +147,161 @@ func TestAutoInitFromMainWorktree(t *testing.T) {
 			t.Error("expected error when config.yaml missing")
 		}
 	})
+}
+
+func TestAutoInitWorktreeSerializesCompleteSeedCopy(t *testing.T) {
+	mainDir := t.TempDir()
+	worktreeDir := t.TempDir()
+	mainGrepai := filepath.Join(mainDir, ".grepai")
+	if err := os.MkdirAll(mainGrepai, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	indexData := []byte("complete-vector-index")
+	symbolData := []byte("complete-symbol-index")
+	if err := os.WriteFile(filepath.Join(mainGrepai, "config.yaml"), []byte("version: 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mainGrepai, "index.gob"), indexData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mainGrepai, "symbols.gob"), symbolData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	partialWritten := make(chan struct{})
+	finishCopy := make(chan struct{})
+	var blocked atomic.Bool
+	barrierCopy := func(src, dst string) error {
+		if filepath.Base(dst) == "index.gob" && blocked.CompareAndSwap(false, true) {
+			if err := os.WriteFile(dst, indexData[:5], 0o600); err != nil {
+				return err
+			}
+			close(partialWritten)
+			<-finishCopy
+		}
+		return copyFileIfExists(src, dst)
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- autoInitFromMainWorktreeWithCopy(worktreeDir, mainDir, barrierCopy)
+	}()
+	<-partialWritten
+
+	secondDone := make(chan error, 1)
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		secondDone <- autoInitFromMainWorktree(worktreeDir, mainDir)
+	}()
+	<-secondStarted
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second initializer did not serialize with active copy: %v", err)
+	default:
+	}
+
+	watcherLock, err := fileutil.AcquireProjectWriterLock(worktreeDir)
+	if watcherLock != nil {
+		watcherLock.Close()
+		t.Fatal("competing watcher acquired lock while seed index was partial")
+	}
+	var activeErr *fileutil.ProjectWriterActiveError
+	if !errors.As(err, &activeErr) {
+		t.Fatalf("competing watcher error = %T %v, want *ProjectWriterActiveError", err, err)
+	}
+	if Exists(worktreeDir) {
+		t.Fatal("auto-init exposed config completion marker while seed index was partial")
+	}
+
+	close(finishCopy)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first initializer failed: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second initializer failed: %v", err)
+	}
+	for name, want := range map[string][]byte{"index.gob": indexData, "symbols.gob": symbolData} {
+		got, err := os.ReadFile(filepath.Join(worktreeDir, ".grepai", name))
+		if err != nil || string(got) != string(want) {
+			t.Fatalf("%s seed is partial: got=%q err=%v", name, got, err)
+		}
+	}
+}
+
+func TestAutoInitWorktreeRollsBackEveryFailedCopyStage(t *testing.T) {
+	for _, stage := range []string{"index.gob", "symbols.gob", "config.yaml"} {
+		t.Run(stage, func(t *testing.T) {
+			mainDir := t.TempDir()
+			worktreeDir := t.TempDir()
+			mainGrepai := filepath.Join(mainDir, ".grepai")
+			if err := os.MkdirAll(mainGrepai, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for name, data := range map[string]string{"index.gob": "index", "symbols.gob": "symbols", "config.yaml": "version: 1\n"} {
+				if err := os.WriteFile(filepath.Join(mainGrepai, name), []byte(data), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fault := func(src, dst string) error {
+				if filepath.Base(dst) == stage {
+					if err := os.WriteFile(dst, []byte("partial"), 0o600); err != nil {
+						return err
+					}
+					return errors.New("injected copy failure")
+				}
+				return copyFileIfExists(src, dst)
+			}
+			if err := autoInitFromMainWorktreeWithCopy(worktreeDir, mainDir, fault); err == nil {
+				t.Fatal("auto-init succeeded despite injected failure")
+			}
+			if projectConfigIsValid(worktreeDir) {
+				t.Fatal("failed auto-init published a valid completion marker")
+			}
+			for _, name := range []string{"index.gob", "symbols.gob", "config.yaml"} {
+				if _, err := os.Stat(filepath.Join(worktreeDir, ".grepai", name)); !os.IsNotExist(err) {
+					t.Fatalf("failed auto-init left %s: %v", name, err)
+				}
+			}
+			entries, err := os.ReadDir(filepath.Join(worktreeDir, ".grepai"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if strings.Contains(entry.Name(), ".tmp-") {
+					t.Fatalf("failed auto-init left temporary file %s", entry.Name())
+				}
+			}
+			if err := autoInitFromMainWorktree(worktreeDir, mainDir); err != nil {
+				t.Fatalf("retry failed: %v", err)
+			}
+			if !projectConfigIsValid(worktreeDir) {
+				t.Fatal("retry did not publish valid config")
+			}
+		})
+	}
+}
+
+func TestAutoInitWorktreeDoesNotTreatInvalidConfigAsComplete(t *testing.T) {
+	mainDir := t.TempDir()
+	worktreeDir := t.TempDir()
+	for _, root := range []string{mainDir, worktreeDir} {
+		if err := os.MkdirAll(filepath.Join(root, ".grepai"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(mainDir, ".grepai", "config.yaml"), []byte("version: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktreeDir, ".grepai", "config.yaml"), []byte("watch: [broken\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := autoInitFromMainWorktree(worktreeDir, mainDir); err != nil {
+		t.Fatalf("auto-init failed: %v", err)
+	}
+	if !projectConfigIsValid(worktreeDir) {
+		t.Fatal("invalid completion marker was not replaced")
+	}
 }
 
 func TestWatchConfig_WorktreeDiscoveryEnabled(t *testing.T) {
