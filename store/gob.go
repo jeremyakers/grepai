@@ -8,7 +8,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +20,11 @@ type GOBStore struct {
 	lockPath  string
 	chunks    map[string]Chunk    // id -> chunk
 	documents map[string]Document // path -> document
-	mu        sync.RWMutex
+	// Constructors retain the historical first-Persist behavior independently
+	// from mutations made before Load.
+	constructorPersistPending bool
+	mutationGeneration        uint64
+	mu                        sync.RWMutex
 }
 
 type gobData struct {
@@ -31,19 +34,21 @@ type gobData struct {
 
 func NewGOBStore(indexPath string) *GOBStore {
 	return &GOBStore{
-		indexPath: indexPath,
-		lockPath:  indexPath + ".lock",
-		chunks:    make(map[string]Chunk),
-		documents: make(map[string]Document),
+		indexPath:                 indexPath,
+		lockPath:                  indexPath + ".lock",
+		chunks:                    make(map[string]Chunk),
+		documents:                 make(map[string]Document),
+		constructorPersistPending: true,
 	}
 }
 
 func (s *GOBStore) SaveChunks(ctx context.Context, chunks []Chunk) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.mutationGeneration++
 
 	for _, chunk := range chunks {
-		s.chunks[chunk.ID] = chunk
+		s.chunks[chunk.ID] = cloneChunk(chunk)
 	}
 
 	return nil
@@ -58,8 +63,15 @@ func (s *GOBStore) DeleteByFile(ctx context.Context, filePath string) error {
 		return nil
 	}
 
+	removed := false
 	for _, chunkID := range doc.ChunkIDs {
-		delete(s.chunks, chunkID)
+		if _, ok := s.chunks[chunkID]; ok {
+			delete(s.chunks, chunkID)
+			removed = true
+		}
+	}
+	if removed {
+		s.mutationGeneration++
 	}
 
 	return nil
@@ -78,15 +90,14 @@ func (s *GOBStore) Search(ctx context.Context, queryVector []float32, limit int,
 		}
 		score := cosineSimilarity(queryVector, chunk.Vector)
 		results = append(results, SearchResult{
-			Chunk: chunk,
+			Chunk: cloneChunk(chunk),
 			Score: score,
 		})
 	}
 
-	// Sort by score descending
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
-	})
+	// Sort by score descending. The tiebreak in SortResultsByScore is what
+	// keeps the ranking independent of the map iteration order above.
+	SortResultsByScore(results)
 
 	if limit > 0 && len(results) > limit {
 		results = results[:limit]
@@ -104,7 +115,8 @@ func (s *GOBStore) GetDocument(ctx context.Context, filePath string) (*Document,
 		return nil, nil
 	}
 
-	return &doc, nil
+	cloned := cloneDocument(doc)
+	return &cloned, nil
 }
 
 func (s *GOBStore) SaveDocument(ctx context.Context, doc Document) error {
@@ -125,8 +137,8 @@ func (s *GOBStore) mutateDocument(path string, mutate func(Document, bool) (Docu
 	if !changed {
 		return false
 	}
-	next.ChunkIDs = append([]string(nil), next.ChunkIDs...)
-	s.documents[path] = next
+	s.documents[path] = cloneDocument(next)
+	s.mutationGeneration++
 	return true
 }
 
@@ -134,7 +146,10 @@ func (s *GOBStore) DeleteDocument(ctx context.Context, filePath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	delete(s.documents, filePath)
+	if _, ok := s.documents[filePath]; ok {
+		delete(s.documents, filePath)
+		s.mutationGeneration++
+	}
 	return nil
 }
 
@@ -150,37 +165,49 @@ func (s *GOBStore) ListDocuments(ctx context.Context) ([]string, error) {
 	return paths, nil
 }
 
-func (s *GOBStore) Load(ctx context.Context) error {
+func (s *GOBStore) Load(ctx context.Context) (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	loaded := false
+	defer func() {
+		if err == nil {
+			s.constructorPersistPending = false
+			if loaded {
+				s.mutationGeneration = 0
+			}
+		}
+	}()
 
 	// Acquire shared (read) file lock for cross-process safety
 	lockFile, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		// If we can't create lock file, proceed without locking (backward compat)
-		return s.loadUnlocked()
+		loaded, err = s.loadUnlocked()
+		return err
 	}
 	defer lockFile.Close()
 
 	if err := fileutil.FlockShared(lockFile, false); err != nil {
 		// If locking fails, proceed without locking (backward compat)
-		return s.loadUnlocked()
+		loaded, err = s.loadUnlocked()
+		return err
 	}
 	defer func() {
 		_ = fileutil.Funlock(lockFile)
 	}()
 
-	return s.loadUnlocked()
+	loaded, err = s.loadUnlocked()
+	return err
 }
 
 // loadUnlocked performs the actual load without any locking.
-func (s *GOBStore) loadUnlocked() error {
+func (s *GOBStore) loadUnlocked() (bool, error) {
 	file, err := os.Open(s.indexPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("failed to open index file: %w", err)
+		return false, fmt.Errorf("failed to open index file: %w", err)
 	}
 	defer file.Close()
 
@@ -215,11 +242,11 @@ func (s *GOBStore) loadUnlocked() error {
 		default:
 			// Self-heal failed (e.g. read-only directory): keep the fatal
 			// behavior but surface the failed quarantine so it is diagnosable.
-			return fmt.Errorf("failed to decode index: %w (quarantine to %s failed: %v)", err, corruptPath, renameErr)
+			return false, fmt.Errorf("failed to decode index: %w (quarantine to %s failed: %v)", err, corruptPath, renameErr)
 		}
 		s.chunks = make(map[string]Chunk)
 		s.documents = make(map[string]Document)
-		return nil
+		return false, nil
 	}
 
 	s.chunks = data.Chunks
@@ -232,12 +259,15 @@ func (s *GOBStore) loadUnlocked() error {
 		s.documents = make(map[string]Document)
 	}
 
-	return nil
+	return true, nil
 }
 
 func (s *GOBStore) Persist(ctx context.Context) error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.constructorPersistPending && s.mutationGeneration == 0 {
+		return nil
+	}
 
 	if err := fileutil.EnsureParentDir(s.indexPath); err != nil {
 		return fmt.Errorf("failed to prepare index directory: %w", err)
@@ -299,6 +329,8 @@ func (s *GOBStore) persistUnlocked() error {
 		return fmt.Errorf("failed to replace index file: %w", err)
 	}
 	cleanupTemp = false
+	s.constructorPersistPending = false
+	s.mutationGeneration = 0
 
 	return nil
 }
@@ -365,7 +397,7 @@ func (s *GOBStore) GetChunksForFile(ctx context.Context, filePath string) ([]Chu
 	chunks := make([]Chunk, 0, len(doc.ChunkIDs))
 	for _, id := range doc.ChunkIDs {
 		if chunk, ok := s.chunks[id]; ok {
-			chunks = append(chunks, chunk)
+			chunks = append(chunks, cloneChunk(chunk))
 		}
 	}
 	return chunks, nil
@@ -377,7 +409,7 @@ func (s *GOBStore) GetAllChunks(ctx context.Context) ([]Chunk, error) {
 
 	chunks := make([]Chunk, 0, len(s.chunks))
 	for _, chunk := range s.chunks {
-		chunks = append(chunks, chunk)
+		chunks = append(chunks, cloneChunk(chunk))
 	}
 	return chunks, nil
 }

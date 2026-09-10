@@ -22,6 +22,7 @@ func (s *GOBSymbolStore) SaveFileWithContentHash(ctx context.Context, filePath s
 func (s *GOBSymbolStore) saveFile(ctx context.Context, filePath, contentHash string, extractorVersion *string, symbols []Symbol, refs []Reference, beforeVersion func()) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.mutationGeneration++
 	return s.saveFileLocked(ctx, filePath, contentHash, extractorVersion, symbols, refs, beforeVersion)
 }
 

@@ -73,4 +73,4 @@ nix-hash:
 	@echo "Computing vendorHash (requires Docker)..."
 	@docker run --rm -v $(PWD):/src -w /src nixos/nix:latest sh -c \
 		'echo "experimental-features = nix-command flakes" >> /etc/nix/nix.conf && \
-		nix build .#grepai 2>&1 | grep "got:" | sed "s/.*got:\s*//"'
+		nix build .#grepai' 2>&1 | grep "got:" | sed 's/.*got:[[:space:]]*//'
