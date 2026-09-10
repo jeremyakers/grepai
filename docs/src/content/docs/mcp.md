@@ -26,19 +26,21 @@ grepai includes a built-in MCP (Model Context Protocol) server that allows AI ag
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `grepai_search` | Semantic code search | `query` (required), `limit` (default: 10), `compact` (default: false) |
-| `grepai_trace_callers` | Find callers of a symbol | `symbol` (required), `workspace`, `project`, `compact` (default: false) |
-| `grepai_trace_callees` | Find callees of a symbol | `symbol` (required), `workspace`, `project`, `compact` (default: false) |
-| `grepai_trace_graph` | Build complete call graph | `symbol` (required), `workspace`, `project`, `depth` (default: 2) |
-| `grepai_refs_readers` | Find property/state readers | `symbol` (required), `workspace`, `project`, `compact` (default: false), `format` (`json` or `toon`) |
-| `grepai_refs_writers` | Find property/state writers | `symbol` (required), `workspace`, `project`, `compact` (default: false), `format` (`json` or `toon`) |
-| `grepai_refs_graph` | Build property usage graph | `symbol` (required), `workspace`, `project`, `compact` (default: false), `format` (`json` or `toon`) |
+| `grepai_search` | Semantic code search | `query` (required), `limit` (default: 10), `compact` (default: false), `root` |
+| `grepai_trace_callers` | Find callers of a symbol | `symbol` (required), `workspace`, `project`, `root`, `compact` (default: false) |
+| `grepai_trace_callees` | Find callees of a symbol | `symbol` (required), `workspace`, `project`, `root`, `compact` (default: false) |
+| `grepai_trace_graph` | Build complete call graph | `symbol` (required), `workspace`, `project`, `root`, `depth` (default: 2) |
+| `grepai_refs_readers` | Find property/state readers | `symbol` (required), `workspace`, `project`, `root`, `compact` (default: false), `format` (`json` or `toon`) |
+| `grepai_refs_writers` | Find property/state writers | `symbol` (required), `workspace`, `project`, `root`, `compact` (default: false), `format` (`json` or `toon`) |
+| `grepai_refs_graph` | Build property usage graph | `symbol` (required), `workspace`, `project`, `root`, `compact` (default: false), `format` (`json` or `toon`) |
 | `grepai_rpg_search` | Search Repository Planning Graph nodes | `query` (required), `scope`, `kinds`, `limit` (default: 10), `format` (`json` or `toon`) |
 | `grepai_rpg_fetch` | Fetch context for an RPG node | `node_id` (required), `format` (`json` or `toon`) |
 | `grepai_rpg_explore` | Traverse an RPG graph neighborhood | `start_node_id` (required), `direction`, `depth`, `edge_types`, `limit`, `format` (`json` or `toon`) |
-| `grepai_index_status` | Check index health | `verbose` (optional, default: false), `workspace` |
+| `grepai_index_status` | Check index health | `verbose` (optional, default: false), `workspace`, `root` |
 | `grepai_list_workspaces` | List available workspace names | `format` (optional: `json` or `toon`) |
 | `grepai_list_projects` | List projects for a workspace | `workspace` (required), `format` (optional: `json` or `toon`) |
+
+The project-scoped tools (`grepai_search`, `grepai_trace_*`, `grepai_refs_*`, `grepai_index_status`) also accept an optional `root` parameter: an absolute project directory to load the configuration and index from, overriding the project the server was started in. This supports per-launch project detection — an MCP client that spans multiple projects can point each request at the directory it is currently working in, without restarting `mcp-serve`. `root` cannot be combined with `workspace`.
 
 ## Configuration
 

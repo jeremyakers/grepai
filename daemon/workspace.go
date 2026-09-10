@@ -122,6 +122,7 @@ func GetRunningWorkspacePID(logDir, workspaceName string) (int, error) {
 	// Check if process is actually running
 	if !IsProcessRunning(pid) {
 		_ = RemoveWorkspacePIDFile(logDir, workspaceName)
+		_ = RemoveWorkspaceReadyFile(logDir, workspaceName)
 		return 0, nil
 	}
 

@@ -36,16 +36,16 @@ type Server struct {
 	recorder      *stats.Recorder
 }
 
-func (s *Server) loadProjectSymbolStore(ctx context.Context) (trace.SymbolStore, error) {
+func (s *Server) loadProjectSymbolStore(ctx context.Context, projectRoot string) (trace.SymbolStore, error) {
 	cfg := config.DefaultConfig()
-	if config.Exists(s.projectRoot) {
+	if config.Exists(projectRoot) {
 		var err error
-		cfg, err = config.Load(s.projectRoot)
+		cfg, err = config.Load(projectRoot)
 		if err != nil {
 			return nil, fmt.Errorf("failed to load configuration: %w", err)
 		}
 	}
-	store, err := trace.NewSymbolStore(ctx, cfg, s.projectRoot)
+	store, err := trace.NewSymbolStore(ctx, cfg, projectRoot)
 	if err != nil {
 		return nil, err
 	}
@@ -154,7 +154,7 @@ func NewServer(projectRoot string) (*Server, error) {
 	s.mcpServer = server.NewMCPServer(
 		"grepai",
 		"1.0.0",
-		server.WithToolCapabilities(false),
+		server.WithToolCapabilities(true),
 	)
 
 	// Register tools
@@ -175,12 +175,22 @@ func NewServerWithWorkspace(projectRoot, workspaceName string) (*Server, error) 
 	s.mcpServer = server.NewMCPServer(
 		"grepai",
 		"1.0.0",
-		server.WithToolCapabilities(false),
+		server.WithToolCapabilities(true),
 	)
 
 	s.registerTools()
 
 	return s, nil
+}
+
+// rootToolOption is the shared "root" parameter description for tools that can
+// operate on an explicit project instead of the one the server was started in.
+// It enables per-launch project detection: MCP clients pass the directory they
+// are working in without restarting mcp-serve.
+func rootToolOption() mcp.ToolOption {
+	return mcp.WithString("root",
+		mcp.Description("Absolute project root path. When provided, the server will load configuration/index from this path (overrides server startup project). Optional."),
+	)
 }
 
 // registerTools registers all grepai tools with the MCP server.
@@ -210,6 +220,7 @@ func (s *Server) registerTools() {
 		mcp.WithString("projects",
 			mcp.Description("Comma-separated list of project names to search within workspace (requires workspace)"),
 		),
+		rootToolOption(),
 	)
 	s.mcpServer.AddTool(searchTool, s.handleSearch)
 
@@ -232,6 +243,7 @@ func (s *Server) registerTools() {
 		mcp.WithString("project",
 			mcp.Description("Project name within workspace (requires workspace)"),
 		),
+		rootToolOption(),
 	)
 	s.mcpServer.AddTool(traceCallersTool, s.handleTraceCallers)
 
@@ -254,6 +266,7 @@ func (s *Server) registerTools() {
 		mcp.WithString("project",
 			mcp.Description("Project name within workspace (requires workspace)"),
 		),
+		rootToolOption(),
 	)
 	s.mcpServer.AddTool(traceCalleesTool, s.handleTraceCallees)
 
@@ -276,6 +289,7 @@ func (s *Server) registerTools() {
 		mcp.WithString("project",
 			mcp.Description("Project name within workspace (requires workspace)"),
 		),
+		rootToolOption(),
 	)
 	s.mcpServer.AddTool(traceGraphTool, s.handleTraceGraph)
 
@@ -297,6 +311,7 @@ func (s *Server) registerTools() {
 		mcp.WithString("project",
 			mcp.Description("Project name within workspace (requires workspace)"),
 		),
+		rootToolOption(),
 	)
 	s.mcpServer.AddTool(refsReadersTool, s.handleRefsReaders)
 
@@ -318,6 +333,7 @@ func (s *Server) registerTools() {
 		mcp.WithString("project",
 			mcp.Description("Project name within workspace (requires workspace)"),
 		),
+		rootToolOption(),
 	)
 	s.mcpServer.AddTool(refsWritersTool, s.handleRefsWriters)
 
@@ -339,6 +355,7 @@ func (s *Server) registerTools() {
 		mcp.WithString("project",
 			mcp.Description("Project name within workspace (requires workspace)"),
 		),
+		rootToolOption(),
 	)
 	s.mcpServer.AddTool(refsGraphTool, s.handleRefsGraph)
 
@@ -352,6 +369,7 @@ func (s *Server) registerTools() {
 		mcp.WithString("workspace",
 			mcp.Description("Workspace name to check status for (optional)"),
 		),
+		rootToolOption(),
 	)
 	s.mcpServer.AddTool(indexStatusTool, s.handleIndexStatus)
 
@@ -464,17 +482,17 @@ func (s *Server) handleSearch(ctx context.Context, request mcp.CallToolRequest) 
 	compact := request.GetBool("compact", false)
 	format := request.GetString("format", "json")
 	path := request.GetString("path", "")
-	workspace := request.GetString("workspace", "")
 	projects := request.GetString("projects", "")
-
-	// Auto-inject workspace when server is in workspace mode
-	if workspace == "" && s.workspaceName != "" {
-		workspace = s.workspaceName
-	}
 
 	// Validate format
 	if format != "json" && format != "toon" {
 		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	// Resolve workspace/root context (root enables per-launch project override)
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	// Workspace mode
@@ -482,10 +500,13 @@ func (s *Server) handleSearch(ctx context.Context, request mcp.CallToolRequest) 
 		return s.handleWorkspaceSearch(ctx, query, limit, compact, format, path, workspace, projects)
 	}
 
-	// Load configuration
-	cfg, err := config.Load(s.projectRoot)
+	// Single-project mode (with possible root override)
+	projectPathToUse := effectiveProjectRoot(s.projectRoot, root)
+
+	// Load configuration for single-project mode
+	cfg, err := config.Load(projectPathToUse)
 	if err != nil {
-		if s.projectRoot == "" {
+		if projectPathToUse == "" {
 			wsCfg, wsErr := config.LoadWorkspaceConfig()
 			if wsErr == nil && wsCfg != nil && len(wsCfg.Workspaces) > 0 {
 				return mcp.NewToolResultError(
@@ -503,8 +524,13 @@ func (s *Server) handleSearch(ctx context.Context, request mcp.CallToolRequest) 
 	}
 	defer emb.Close()
 
-	// Initialize store
-	st, err := s.createStore(ctx, cfg)
+	// Initialize store (respect root override)
+	var st store.VectorStore
+	if root != "" {
+		st, err = s.createStoreForRoot(ctx, cfg, root)
+	} else {
+		st, err = s.createStore(ctx, cfg)
+	}
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to initialize store: %v", err)), nil
 	}
@@ -512,7 +538,7 @@ func (s *Server) handleSearch(ctx context.Context, request mcp.CallToolRequest) 
 
 	// Create searcher and search
 	searcher := search.NewSearcher(st, emb, cfg.Search)
-	normalizedPath, err := search.NormalizeProjectPathPrefix(path, s.projectRoot)
+	normalizedPath, err := search.NormalizeProjectPathPrefix(path, projectPathToUse)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("invalid path parameter: %v", err)), nil
 	}
@@ -527,7 +553,7 @@ func (s *Server) handleSearch(ctx context.Context, request mcp.CallToolRequest) 
 		symbolName  string
 	}
 	rpgData := make(map[int]rpgInfo)
-	rpgSt, qe, rpgErr := s.tryLoadRPG(ctx)
+	rpgSt, qe, rpgErr := s.tryLoadRPGForRoot(ctx, projectPathToUse)
 	if rpgErr != nil {
 		log.Printf("Warning: RPG enrichment unavailable: %v", rpgErr)
 	}
@@ -1090,12 +1116,16 @@ func (s *Server) handleTraceCallers(ctx context.Context, request mcp.CallToolReq
 
 	compact := request.GetBool("compact", false)
 	format := request.GetString("format", "json")
-	workspace := s.resolveWorkspace(request.GetString("workspace", ""))
 	project := request.GetString("project", "")
 
 	// Validate format
 	if format != "json" && format != "toon" {
 		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	// Workspace mode
@@ -1109,12 +1139,13 @@ func (s *Server) handleTraceCallers(ctx context.Context, request mcp.CallToolReq
 		return s.handleTraceCallersFromStores(ctx, symbolName, compact, format, stores)
 	}
 
-	// Single-project mode
-	if s.projectRoot == "" {
-		return mcp.NewToolResultError("trace requires a project context; use --workspace parameter or start mcp-serve from a project directory"), nil
+	// Single-project mode (allow explicit root override)
+	projectRootToUse := effectiveProjectRoot(s.projectRoot, root)
+	if projectRootToUse == "" {
+		return mcp.NewToolResultError("trace requires a project context; use --workspace parameter, start mcp-serve from a project directory, or pass root"), nil
 	}
 
-	symbolStore, err := s.loadProjectSymbolStore(ctx)
+	symbolStore, err := s.loadProjectSymbolStore(ctx, projectRootToUse)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
 	}
@@ -1247,12 +1278,16 @@ func (s *Server) handleTraceCallees(ctx context.Context, request mcp.CallToolReq
 
 	compact := request.GetBool("compact", false)
 	format := request.GetString("format", "json")
-	workspace := s.resolveWorkspace(request.GetString("workspace", ""))
 	project := request.GetString("project", "")
 
 	// Validate format
 	if format != "json" && format != "toon" {
 		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	// Workspace mode
@@ -1266,12 +1301,13 @@ func (s *Server) handleTraceCallees(ctx context.Context, request mcp.CallToolReq
 		return s.handleTraceCalleesFromStores(ctx, symbolName, compact, format, stores)
 	}
 
-	// Single-project mode
-	if s.projectRoot == "" {
-		return mcp.NewToolResultError("trace requires a project context; use --workspace parameter or start mcp-serve from a project directory"), nil
+	// Single-project mode (allow explicit root override)
+	projectRootToUse := effectiveProjectRoot(s.projectRoot, root)
+	if projectRootToUse == "" {
+		return mcp.NewToolResultError("trace requires a project context; use --workspace parameter, start mcp-serve from a project directory, or pass root"), nil
 	}
 
-	symbolStore, err := s.loadProjectSymbolStore(ctx)
+	symbolStore, err := s.loadProjectSymbolStore(ctx, projectRootToUse)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
 	}
@@ -1423,12 +1459,16 @@ func (s *Server) handleTraceGraph(ctx context.Context, request mcp.CallToolReque
 	}
 
 	format := request.GetString("format", "json")
-	workspace := s.resolveWorkspace(request.GetString("workspace", ""))
 	project := request.GetString("project", "")
 
 	// Validate format
 	if format != "json" && format != "toon" {
 		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	// Workspace mode: merge call graphs across projects
@@ -1479,12 +1519,13 @@ func (s *Server) handleTraceGraph(ctx context.Context, request mcp.CallToolReque
 		return mcp.NewToolResultText(output), nil
 	}
 
-	// Single-project mode
-	if s.projectRoot == "" {
-		return mcp.NewToolResultError("trace requires a project context; use --workspace parameter or start mcp-serve from a project directory"), nil
+	// Single-project mode (allow explicit root override)
+	projectRootToUse := effectiveProjectRoot(s.projectRoot, root)
+	if projectRootToUse == "" {
+		return mcp.NewToolResultError("trace requires a project context; use --workspace parameter, start mcp-serve from a project directory, or pass root"), nil
 	}
 
-	symbolStore, err := s.loadProjectSymbolStore(ctx)
+	symbolStore, err := s.loadProjectSymbolStore(ctx, projectRootToUse)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
 	}
@@ -1554,11 +1595,15 @@ func (s *Server) handleRefsGraph(ctx context.Context, request mcp.CallToolReques
 
 	compact := request.GetBool("compact", false)
 	format := request.GetString("format", "json")
-	workspace := s.resolveWorkspace(request.GetString("workspace", ""))
 	project := request.GetString("project", "")
 
 	if format != "json" && format != "toon" {
 		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	var stores []trace.SymbolStore
@@ -1569,10 +1614,11 @@ func (s *Server) handleRefsGraph(ctx context.Context, request mcp.CallToolReques
 		}
 		defer trace.CloseSymbolStores(stores)
 	} else {
-		if s.projectRoot == "" {
-			return mcp.NewToolResultError("refs requires a project context; use --workspace parameter or start mcp-serve from a project directory"), nil
+		projectRootToUse := effectiveProjectRoot(s.projectRoot, root)
+		if projectRootToUse == "" {
+			return mcp.NewToolResultError("refs requires a project context; use --workspace parameter, start mcp-serve from a project directory, or pass root"), nil
 		}
-		symbolStore, err := s.loadProjectSymbolStore(ctx)
+		symbolStore, err := s.loadProjectSymbolStore(ctx, projectRootToUse)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
 		}
@@ -1673,11 +1719,15 @@ func (s *Server) handleRefsByKind(ctx context.Context, request mcp.CallToolReque
 
 	compact := request.GetBool("compact", false)
 	format := request.GetString("format", "json")
-	workspace := s.resolveWorkspace(request.GetString("workspace", ""))
 	project := request.GetString("project", "")
 
 	if format != "json" && format != "toon" {
 		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	// Workspace mode
@@ -1690,12 +1740,13 @@ func (s *Server) handleRefsByKind(ctx context.Context, request mcp.CallToolReque
 		return s.handleRefsFromStores(ctx, symbolName, kind, compact, format, stores)
 	}
 
-	// Single-project mode
-	if s.projectRoot == "" {
-		return mcp.NewToolResultError("refs requires a project context; use --workspace parameter or start mcp-serve from a project directory"), nil
+	// Single-project mode (allow explicit root override)
+	projectRootToUse := effectiveProjectRoot(s.projectRoot, root)
+	if projectRootToUse == "" {
+		return mcp.NewToolResultError("refs requires a project context; use --workspace parameter, start mcp-serve from a project directory, or pass root"), nil
 	}
 
-	symbolStore, err := s.loadProjectSymbolStore(ctx)
+	symbolStore, err := s.loadProjectSymbolStore(ctx, projectRootToUse)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
 	}
@@ -1876,11 +1927,15 @@ type WorkspaceProjectStatus struct {
 // handleIndexStatus handles the grepai_index_status tool call.
 func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	format := request.GetString("format", "json")
-	workspace := s.resolveWorkspace(request.GetString("workspace", ""))
 
 	// Validate format
 	if format != "json" && format != "toon" {
 		return mcp.NewToolResultError("format must be 'json' or 'toon'"), nil
+	}
+
+	workspace, root, err := s.resolveProjectContext(request, request.GetString("workspace", ""))
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
 	}
 
 	// Workspace mode
@@ -1928,19 +1983,25 @@ func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequ
 		return mcp.NewToolResultText(output), nil
 	}
 
-	// Single-project mode
-	if s.projectRoot == "" {
-		return mcp.NewToolResultError("index status requires a project context; start mcp-serve from a project directory"), nil
+	// Single-project mode (allow explicit root override)
+	projectRootToUse := effectiveProjectRoot(s.projectRoot, root)
+	if projectRootToUse == "" {
+		return mcp.NewToolResultError("index status requires a project context; start mcp-serve from a project directory or pass root"), nil
 	}
 
 	// Load configuration
-	cfg, err := config.Load(s.projectRoot)
+	cfg, err := config.Load(projectRootToUse)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to load configuration: %v", err)), nil
 	}
 
-	// Initialize store
-	st, err := s.createStore(ctx, cfg)
+	// Initialize store (respect root override)
+	var st store.VectorStore
+	if root != "" {
+		st, err = s.createStoreForRoot(ctx, cfg, root)
+	} else {
+		st, err = s.createStore(ctx, cfg)
+	}
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to initialize store: %v", err)), nil
 	}
@@ -1953,7 +2014,7 @@ func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequ
 	}
 
 	// Check symbol index
-	symbolStore, symbolStoreErr := trace.NewSymbolStore(ctx, cfg, s.projectRoot)
+	symbolStore, symbolStoreErr := trace.NewSymbolStore(ctx, cfg, projectRootToUse)
 	symbolsReady := false
 	if symbolStoreErr == nil {
 		symbolsReady, _ = readAndCloseSymbolStatus(ctx, symbolStore)
@@ -1970,7 +2031,7 @@ func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequ
 	}
 
 	// Check RPG status
-	rpgSt, _, rpgErr := s.tryLoadRPG(ctx)
+	rpgSt, _, rpgErr := s.tryLoadRPGForRoot(ctx, projectRootToUse)
 	if rpgErr != nil && !errors.Is(rpgErr, rpg.ErrRPGIndexOutdated) {
 		log.Printf("Warning: failed to load RPG status: %v", rpgErr)
 	}
@@ -2105,6 +2166,70 @@ func (s *Server) createStore(ctx context.Context, cfg *config.Config) (store.Vec
 	}
 }
 
+// createStoreForRoot creates a vector store based on configuration but using an
+// explicit project root. This mirrors createStore but uses the provided root
+// for index path / collection naming instead of the server startup project.
+func (s *Server) createStoreForRoot(ctx context.Context, cfg *config.Config, projectRoot string) (store.VectorStore, error) {
+	switch cfg.Store.Backend {
+	case "gob":
+		indexPath := config.GetIndexPath(projectRoot)
+		gobStore := store.NewGOBStore(indexPath)
+		if err := gobStore.Load(ctx); err != nil {
+			return nil, fmt.Errorf("failed to load index: %w", err)
+		}
+		return gobStore, nil
+	case "postgres":
+		return store.NewPostgresStore(ctx, cfg.Store.Postgres.DSN, projectRoot, cfg.Embedder.GetDimensions(), cfg.Embedder.CacheNamespace())
+	case "qdrant":
+		collectionName := cfg.Store.Qdrant.Collection
+		if collectionName == "" {
+			collectionName = store.SanitizeCollectionName(projectRoot)
+		}
+		return store.NewQdrantStore(ctx, cfg.Store.Qdrant.Endpoint, cfg.Store.Qdrant.Port, cfg.Store.Qdrant.UseTLS, collectionName, cfg.Store.Qdrant.APIKey, cfg.Embedder.GetDimensions())
+	default:
+		return nil, fmt.Errorf("unknown storage backend: %s", cfg.Store.Backend)
+	}
+}
+
+// resolveProjectContext resolves the project context for a tool request: an
+// optional explicit workspace name and an optional "root" override. The
+// server-level workspace is auto-injected only when neither a workspace nor a
+// root is provided, so an explicit root always wins over a startup --workspace.
+// Passing both an explicit workspace and an explicit root is an error.
+func (s *Server) resolveProjectContext(request mcp.CallToolRequest, workspaceParam string) (string, string, error) {
+	rootParam := strings.TrimSpace(request.GetString("root", ""))
+	if workspaceParam == "" && s.workspaceName != "" && rootParam == "" {
+		workspaceParam = s.workspaceName
+	}
+	if rootParam == "" {
+		return workspaceParam, "", nil
+	}
+	if workspaceParam != "" {
+		return "", "", fmt.Errorf("cannot specify both workspace and root parameters")
+	}
+	abs, err := filepath.Abs(rootParam)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid root parameter: %v", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", "", fmt.Errorf("root parameter does not exist: %s", abs)
+	}
+	if !info.IsDir() {
+		return "", "", fmt.Errorf("root parameter must be a directory: %s", abs)
+	}
+	return "", abs, nil
+}
+
+// effectiveProjectRoot picks between the server startup project and the
+// request-level root override.
+func effectiveProjectRoot(serverRoot, rootOverride string) string {
+	if rootOverride != "" {
+		return rootOverride
+	}
+	return serverRoot
+}
+
 // Serve starts the MCP server using stdio transport.
 func (s *Server) Serve() error {
 	// Create stdio server with title fix wrapper
@@ -2185,19 +2310,26 @@ func formatBytes(b int64) string {
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
-// tryLoadRPG attempts to load the RPG store. Returns nil values if RPG is disabled or unavailable.
+// tryLoadRPG attempts to load the RPG store for the server startup project.
+// Returns nil values if RPG is disabled or unavailable.
 func (s *Server) tryLoadRPG(ctx context.Context) (rpg.RPGStore, *rpg.QueryEngine, error) {
-	if s.projectRoot == "" {
+	return s.tryLoadRPGForRoot(ctx, s.projectRoot)
+}
+
+// tryLoadRPGForRoot attempts to load the RPG store from an explicit project
+// root. Returns nil values if RPG is disabled or unavailable.
+func (s *Server) tryLoadRPGForRoot(ctx context.Context, projectRoot string) (rpg.RPGStore, *rpg.QueryEngine, error) {
+	if projectRoot == "" {
 		return nil, nil, nil
 	}
-	cfg, err := config.Load(s.projectRoot)
+	cfg, err := config.Load(projectRoot)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to load config: %w", err)
 	}
 	if !cfg.RPG.Enabled {
 		return nil, nil, nil
 	}
-	rpgStore := rpg.NewGOBRPGStore(config.GetRPGIndexPath(s.projectRoot))
+	rpgStore := rpg.NewGOBRPGStore(config.GetRPGIndexPath(projectRoot))
 	if err := rpgStore.Load(ctx); err != nil {
 		if errors.Is(err, rpg.ErrRPGIndexOutdated) {
 			return nil, nil, rpg.ErrRPGIndexOutdated

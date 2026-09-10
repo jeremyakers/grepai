@@ -17,6 +17,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Bulk-copy GOB migrations per 500-file batch instead of issuing per-file SQL operations, with bounded-memory progress reporting
   - Preserve arbitrary filename and symbol-name bytes exactly while sanitizing invalid UTF-8 only in display text
 
+## [0.37.0] - 2026-09-10
+
+### Added
+
+- **Per-Request Project Root for MCP Tools**: Project-scoped MCP tools (`grepai_search`, `grepai_trace_callers`, `grepai_trace_callees`, `grepai_trace_graph`, `grepai_refs_readers`, `grepai_refs_writers`, `grepai_refs_graph`, `grepai_index_status`) accept an optional `root` parameter with an absolute project path; configuration, vector store and symbol index are loaded from that path instead of the server startup project, enabling per-launch project detection across multiple projects without restarting `mcp-serve` (#305) - @wasup-yash
+  - Specifying both `workspace` and `root` in one request is rejected; an explicit `root` also takes precedence over a server started with `--workspace`
+  - The server now advertises tool capabilities during MCP initialization (`server.WithToolCapabilities(true)`), which some MCP clients require before discovering server features/roots
+
+### Fixed
+
+- **Non-Reproducible Search Ranking**: Results that scored exactly the same came back in a different order on every search over an unchanged index, because callers assembled them by ranging over a Go map and `sort.Slice` is not stable. Since callers truncate to a limit after sorting, this also changed **which** results were returned, not just their order. Score ties now break on the chunk ID, which is unique within a store, so an unchanged index returns the same ranking every time (#303) - @MaxFreedomPollard
+- **Idle GOB Index Rewrites**: Vector and symbol GOB stores now persist only when modified, eliminating full-index rewrites every 30 seconds when idle (#298) - @jeremyakers
+- **Atomic GOB Replacement**: Failed cross-platform index replacement now preserves the previous index instead of falling back to a remove-then-rename window that could leave no index after interruption - @jeremyakers
+- **Concurrent Watcher Snapshot Loss**: Foreground, background, and workspace watchers now enforce one lifetime writer per canonical project root, while read-only search, MCP, and trace processes remain concurrent - @jeremyakers
+- **Missing-Index Reader Overwrites**: Read-only vector and symbol GOB stores that load before an index exists now close cleanly without replacing an index created later, while real pre-load mutations and direct first persists are preserved - @jeremyakers
+- **Worktree Seed Races**: Worktree auto-initialization now copies complete vector and symbol seed indexes under the project writer lock before exposing the copied configuration - @jeremyakers
+- **GOB Mutable Aliases**: Vector GOB stores now own deep copies of mutable inputs, and symbol lookups return detached slices, preventing caller mutations from changing clean in-memory snapshots - @jeremyakers
+- **Worktree Auto-Init Rollback**: Seed and configuration files are now atomically published from synced temporary files, failed copy stages remove partial destinations, and only a parseable configuration counts as initialization completion - @jeremyakers
+- **Incomplete or Stale File Watching**: File, worktree, and workspace watchers now fail closed when a directory watch cannot be registered, fsnotify closes or reports an error, or the internal event queue cannot keep up. Fatal coverage shutdown withdraws daemon readiness and synchronously aborts event handling without flushing potentially untrustworthy derived state; the CLI then exits immediately and lets the OS reclaim watcher descriptors. Library callers that remain alive after receiving a fatal error may call `Close` to release the backend explicitly. The next startup's full scan repairs the indexes. Ready markers are PID-validated, write failures stop startup, timed-out children are stopped and cleaned up, and stale PID cleanup removes the matching marker. On Linux, registration `ENOSPC` means the per-user inotify watch quota is exhausted, not that the filesystem is out of disk space (#304) - @jeremyakers
+  - **Behaviour change**: `grepai watch` now exits on a filesystem watch failure where it previously logged a warning and kept running. On a host whose inotify quota is exhausted, this surfaces as a startup error instead of a watcher that silently misses changes. The error names the affected path and, on Linux, explains the quota.
+
+### Dependencies
+
+- Bump `github.com/mark3labs/mcp-go` from 0.58.0 to 1.0.0 (#302)
+
 ## [0.36.1] - 2026-09-01
 
 ### Fixed
@@ -713,7 +738,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial public release
 
-[Unreleased]: https://github.com/yoanbernabeu/grepai/compare/v0.36.1...HEAD
+[Unreleased]: https://github.com/yoanbernabeu/grepai/compare/v0.37.0...HEAD
+[0.37.0]: https://github.com/yoanbernabeu/grepai/compare/v0.36.1...v0.37.0
 [0.36.1]: https://github.com/yoanbernabeu/grepai/compare/v0.36.0...v0.36.1
 [0.36.0]: https://github.com/yoanbernabeu/grepai/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/yoanbernabeu/grepai/compare/v0.34.0...v0.35.0

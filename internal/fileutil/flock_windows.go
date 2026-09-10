@@ -4,11 +4,17 @@
 package fileutil
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
 	"unsafe"
 )
+
+func isFlockContention(err error) bool {
+	// ERROR_LOCK_VIOLATION is returned by LockFileEx with FAIL_IMMEDIATELY.
+	return errors.Is(err, syscall.Errno(33))
+}
 
 var (
 	modkernel32    = syscall.NewLazyDLL("kernel32.dll")

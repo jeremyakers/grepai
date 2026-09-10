@@ -17,6 +17,35 @@ type failingWatchSymbolStore struct {
 func (s *failingWatchSymbolStore) Load(context.Context) error { return s.loadErr }
 func (s *failingWatchSymbolStore) Close() error               { s.closes++; return nil }
 
+type lockHeldWatchSymbolStore struct {
+	failingWatchSymbolStore
+	ordinaryLoads int
+	heldLoads     int
+}
+
+func (s *lockHeldWatchSymbolStore) Load(context.Context) error {
+	s.ordinaryLoads++
+	return nil
+}
+
+func (s *lockHeldWatchSymbolStore) LoadWithProjectWriterLockHeld(context.Context) error {
+	s.heldLoads++
+	return nil
+}
+
+func TestPostgresWatcherLoadUsesLockHeldPath(t *testing.T) {
+	// Given a Postgres watcher store with distinct ordinary and lock-held loaders.
+	store := &lockHeldWatchSymbolStore{}
+
+	// When the watcher helper loads the symbol store.
+	err := runAfterWatcherSymbolLoad(context.Background(), "postgres", "project", store, nil)
+
+	// Then it uses only the path that assumes the watcher lock is already held.
+	if err != nil || store.heldLoads != 1 || store.ordinaryLoads != 0 {
+		t.Fatalf("err=%v heldLoads=%d ordinaryLoads=%d", err, store.heldLoads, store.ordinaryLoads)
+	}
+}
+
 func TestPostgresLoadPolicyStopsCallbackBeforeScan(t *testing.T) {
 	store := &failingWatchSymbolStore{loadErr: errors.New("migration failed")}
 	scans := 0

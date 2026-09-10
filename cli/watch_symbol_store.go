@@ -9,8 +9,18 @@ import (
 	"github.com/yoanbernabeu/grepai/trace"
 )
 
+type projectWriterLockHeldSymbolLoader interface {
+	LoadWithProjectWriterLockHeld(context.Context) error
+}
+
 func runAfterWatcherSymbolLoad(ctx context.Context, backend, project string, symbolStore trace.SymbolStore, next func() error) error {
-	if err := symbolStore.Load(ctx); err != nil {
+	load := symbolStore.Load
+	if backend == "postgres" {
+		if lockHeldLoader, ok := symbolStore.(projectWriterLockHeldSymbolLoader); ok {
+			load = lockHeldLoader.LoadWithProjectWriterLockHeld
+		}
+	}
+	if err := load(ctx); err != nil {
 		if backend == "postgres" {
 			return fmt.Errorf("failed to load Postgres symbol index for %s: %w", project, err)
 		}

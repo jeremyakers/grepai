@@ -4,9 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestGOBSymbolStore_should_load_empty_when_no_file_exists(t *testing.T) {
@@ -278,6 +280,352 @@ func TestGOBSymbolStore_should_persist_and_reload(t *testing.T) {
 
 	if !store2.IsFileIndexed("persist.go") {
 		t.Error("expected file indexed after reload")
+	}
+}
+
+func TestGOBSymbolStore_CleanPersistIsNoOp(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	ctx := context.Background()
+
+	seed := NewGOBSymbolStore(indexPath)
+	if err := seed.SaveFile(ctx, "main.go", []Symbol{{Name: "main", File: "main.go"}}, nil); err != nil {
+		t.Fatalf("SaveFile failed: %v", err)
+	}
+	if err := seed.Persist(ctx); err != nil {
+		t.Fatalf("seed Persist failed: %v", err)
+	}
+
+	store := NewGOBSymbolStore(indexPath)
+	if err := store.Load(ctx); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	oldTime := time.Unix(1, 0)
+	if err := os.Chtimes(indexPath, oldTime, oldTime); err != nil {
+		t.Fatalf("Chtimes failed: %v", err)
+	}
+	if err := store.Persist(ctx); err != nil {
+		t.Fatalf("first clean Persist failed: %v", err)
+	}
+	if err := store.Persist(ctx); err != nil {
+		t.Fatalf("second clean Persist failed: %v", err)
+	}
+	info, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if !info.ModTime().Equal(oldTime) {
+		t.Fatal("clean Persist rewrote index")
+	}
+}
+
+func TestGOBSymbolStore_LoadMissingIndexPreservesPendingChanges(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	ctx := context.Background()
+	store := NewGOBSymbolStore(indexPath)
+
+	if err := store.SaveFile(ctx, "main.go", []Symbol{{Name: "main", File: "main.go"}}, nil); err != nil {
+		t.Fatalf("SaveFile failed: %v", err)
+	}
+	if err := store.Load(ctx); err != nil {
+		t.Fatalf("Load missing index failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	reloaded := NewGOBSymbolStore(indexPath)
+	if err := reloaded.Load(ctx); err != nil {
+		t.Fatalf("reload failed: %v", err)
+	}
+	symbols, err := reloaded.LookupSymbol(ctx, "main")
+	if err != nil {
+		t.Fatalf("LookupSymbol failed: %v", err)
+	}
+	if len(symbols) != 1 || symbols[0].File != "main.go" {
+		t.Fatalf("pending symbols were lost: %#v", symbols)
+	}
+}
+
+func TestGOBSymbolStore_UntouchedMissingReaderCloseWritesNothing(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	store := NewGOBSymbolStore(indexPath)
+	if err := store.Load(context.Background()); err != nil {
+		t.Fatalf("Load missing index failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if _, err := os.Stat(indexPath); !os.IsNotExist(err) {
+		t.Fatalf("untouched missing-index reader wrote %s: %v", indexPath, err)
+	}
+}
+
+func TestGOBSymbolStore_MissingReaderCannotOverwriteLaterWriter(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	ctx := context.Background()
+	reader := NewGOBSymbolStore(indexPath)
+	if err := reader.Load(ctx); err != nil {
+		t.Fatalf("reader Load failed: %v", err)
+	}
+
+	writer := NewGOBSymbolStore(indexPath)
+	symbol := Symbol{Name: "Writer", File: "writer.go", Kind: KindFunction}
+	if err := writer.SaveFile(ctx, "writer.go", []Symbol{symbol}, nil); err != nil {
+		t.Fatalf("writer SaveFile failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("writer Close failed: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("reader Close failed: %v", err)
+	}
+
+	check := NewGOBSymbolStore(indexPath)
+	if err := check.Load(ctx); err != nil {
+		t.Fatalf("check Load failed: %v", err)
+	}
+	symbols, err := check.LookupSymbol(ctx, "Writer")
+	if err != nil || len(symbols) != 1 || symbols[0].File != "writer.go" {
+		t.Fatalf("writer symbols were overwritten: symbols=%#v err=%v", symbols, err)
+	}
+}
+
+func TestGOBSymbolStoreReturnsOwnedSlices(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	ctx := context.Background()
+	store := NewGOBSymbolStore(indexPath)
+	symbols := []Symbol{{Name: "Target", File: "main.go", Kind: KindFunction}}
+	refs := []Reference{{SymbolName: "Target", File: "main.go", Kind: RefKindCall, CallerName: "Caller"}}
+	if err := store.SaveFile(ctx, "main.go", symbols, refs); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Persist(ctx); err != nil {
+		t.Fatal(err)
+	}
+	symbols[0].Name = "input-mutated"
+	refs[0].CallerName = "input-mutated"
+	gotSymbols, _ := store.LookupSymbol(ctx, "Target")
+	gotSymbols[0].Name = "getter-mutated"
+	gotCallers, _ := store.LookupCallers(ctx, "Target")
+	gotCallers[0].CallerName = "getter-mutated"
+	gotForFile, _ := store.GetSymbolsForFile(ctx, "main.go")
+	gotForFile[0].Name = "file-getter-mutated"
+	gotSymbols, _ = store.LookupSymbol(ctx, "Target")
+	gotCallers, _ = store.LookupCallers(ctx, "Target")
+	if gotSymbols[0].Name != "Target" || gotCallers[0].CallerName != "Caller" {
+		t.Fatalf("store state changed through returned slice: symbols=%#v callers=%#v", gotSymbols, gotCallers)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := NewGOBSymbolStore(indexPath)
+	if err := reloaded.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
+	gotSymbols, _ = reloaded.LookupSymbol(ctx, "Target")
+	gotCallers, _ = reloaded.LookupCallers(ctx, "Target")
+	if len(gotSymbols) != 1 || gotSymbols[0].Name != "Target" || len(gotCallers) != 1 || gotCallers[0].CallerName != "Caller" {
+		t.Fatalf("persisted symbol data changed through alias: symbols=%#v callers=%#v", gotSymbols, gotCallers)
+	}
+}
+
+func TestGOBSymbolStore_DeleteFileRemovesExtractorVersion(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	ctx := context.Background()
+	store := NewGOBSymbolStore(indexPath)
+
+	if err := store.SaveFileWithSignature(ctx, "main.go", "hash", "extractor-v1", nil, nil); err != nil {
+		t.Fatalf("SaveFileWithSignature failed: %v", err)
+	}
+	if err := store.Persist(ctx); err != nil {
+		t.Fatalf("initial Persist failed: %v", err)
+	}
+	if err := store.DeleteFile(ctx, "main.go"); err != nil {
+		t.Fatalf("DeleteFile failed: %v", err)
+	}
+	if err := store.Persist(ctx); err != nil {
+		t.Fatalf("delete Persist failed: %v", err)
+	}
+
+	reloaded := NewGOBSymbolStore(indexPath)
+	if err := reloaded.Load(ctx); err != nil {
+		t.Fatalf("reload failed: %v", err)
+	}
+	if _, ok := reloaded.GetFileExtractorVersion("main.go"); ok {
+		t.Fatal("extractor version survived DeleteFile")
+	}
+}
+
+func TestGOBSymbolStore_SaveFileWithSignaturePersistsBothFingerprints(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	ctx := context.Background()
+	store := NewGOBSymbolStore(indexPath)
+
+	if err := store.SaveFileWithSignature(ctx, "main.go", "hash", "extractor-v1", nil, nil); err != nil {
+		t.Fatalf("SaveFileWithSignature failed: %v", err)
+	}
+	if err := store.Persist(ctx); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+	reloaded := NewGOBSymbolStore(indexPath)
+	if err := reloaded.Load(ctx); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	hash, hashOK := reloaded.GetFileContentHash("main.go")
+	version, versionOK := reloaded.GetFileExtractorVersion("main.go")
+	if !hashOK || hash != "hash" || !versionOK || version != "extractor-v1" {
+		t.Fatalf("fingerprints = hash(%q,%v) version(%q,%v)", hash, hashOK, version, versionOK)
+	}
+}
+
+func TestGOBSymbolStore_LoadFallsBackWhenLockFileCannotOpen(t *testing.T) {
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "symbols.gob")
+	ctx := context.Background()
+	seed := NewGOBSymbolStore(indexPath)
+	if err := seed.SaveFile(ctx, "main.go", []Symbol{{Name: "main", File: "main.go"}}, nil); err != nil {
+		t.Fatalf("SaveFile failed: %v", err)
+	}
+	if err := seed.Persist(ctx); err != nil {
+		t.Fatalf("seed Persist failed: %v", err)
+	}
+
+	store := NewGOBSymbolStore(indexPath)
+	store.lockPath = dir // OpenFile(O_RDWR) on a directory fails; Load must use its fallback.
+	if err := store.Load(ctx); err != nil {
+		t.Fatalf("fallback Load failed: %v", err)
+	}
+	symbols, err := store.LookupSymbol(ctx, "main")
+	if err != nil || len(symbols) != 1 || symbols[0].File != "main.go" {
+		t.Fatalf("fallback Load symbols = %#v, %v", symbols, err)
+	}
+}
+
+func TestGOBSymbolStore_LoadUnreadableIndexReturnsError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX directory permissions required")
+	}
+	dir := t.TempDir()
+	indexPath := filepath.Join(dir, "symbols.gob")
+	if err := os.WriteFile(indexPath, []byte("symbols"), 0o600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatalf("Chmod failed: %v", err)
+	}
+	defer os.Chmod(dir, 0o700)
+
+	store := NewGOBSymbolStore(indexPath)
+	if err := store.Load(context.Background()); err == nil {
+		t.Fatal("Load succeeded for unreadable symbol index")
+	}
+}
+
+func TestGOBSymbolStore_LoadCorruptIndexReturnsError(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	if err := os.WriteFile(indexPath, []byte("not gob"), 0o600); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	store := NewGOBSymbolStore(indexPath)
+	if err := store.Load(context.Background()); err == nil {
+		t.Fatal("Load succeeded for corrupt symbol index")
+	}
+}
+
+func TestGOBSymbolStore_DirtyPersistWritesOnce(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	store := NewGOBSymbolStore(indexPath)
+	ctx := context.Background()
+
+	if err := store.Persist(ctx); err != nil {
+		t.Fatalf("initial Persist failed: %v", err)
+	}
+	oldTime := time.Unix(1, 0)
+	if err := os.Chtimes(indexPath, oldTime, oldTime); err != nil {
+		t.Fatalf("Chtimes failed: %v", err)
+	}
+	if err := store.SaveFile(ctx, "main.go", []Symbol{{Name: "main", File: "main.go"}}, nil); err != nil {
+		t.Fatalf("SaveFile failed: %v", err)
+	}
+	if err := store.Persist(ctx); err != nil {
+		t.Fatalf("dirty Persist failed: %v", err)
+	}
+	info, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if info.ModTime().Equal(oldTime) {
+		t.Fatal("dirty Persist did not rewrite index")
+	}
+	if err := os.Chtimes(indexPath, oldTime, oldTime); err != nil {
+		t.Fatalf("Chtimes failed: %v", err)
+	}
+	if err := store.Persist(ctx); err != nil {
+		t.Fatalf("clean Persist failed: %v", err)
+	}
+	info, err = os.Stat(indexPath)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if !info.ModTime().Equal(oldTime) {
+		t.Fatal("clean Persist rewrote index")
+	}
+}
+
+func TestGOBSymbolStore_FailedPersistStaysDirty(t *testing.T) {
+	tmpDir := t.TempDir()
+	indexPath := filepath.Join(tmpDir, "symbols.gob")
+	ctx := context.Background()
+	store := NewGOBSymbolStore(indexPath)
+
+	if err := store.SaveFile(ctx, "main.go", []Symbol{{Name: "main", File: "main.go"}}, nil); err != nil {
+		t.Fatalf("SaveFile failed: %v", err)
+	}
+	if err := os.Mkdir(indexPath, 0o755); err != nil {
+		t.Fatalf("Mkdir failed: %v", err)
+	}
+	blocker := filepath.Join(indexPath, "blocker")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+	if err := store.Persist(ctx); err == nil {
+		t.Fatal("Persist should fail when target is a non-empty directory")
+	}
+	if err := os.Remove(blocker); err != nil {
+		t.Fatalf("Remove blocker failed: %v", err)
+	}
+	if err := os.Remove(indexPath); err != nil {
+		t.Fatalf("Remove target directory failed: %v", err)
+	}
+	if err := store.Persist(ctx); err != nil {
+		t.Fatalf("retry Persist failed: %v", err)
+	}
+	if _, err := os.Stat(indexPath); err != nil {
+		t.Fatalf("retry Persist did not write index: %v", err)
+	}
+}
+
+func TestGOBSymbolStore_CleanCloseIsNoOp(t *testing.T) {
+	indexPath := filepath.Join(t.TempDir(), "symbols.gob")
+	store := NewGOBSymbolStore(indexPath)
+	ctx := context.Background()
+
+	if err := store.Persist(ctx); err != nil {
+		t.Fatalf("Persist failed: %v", err)
+	}
+	oldTime := time.Unix(1, 0)
+	if err := os.Chtimes(indexPath, oldTime, oldTime); err != nil {
+		t.Fatalf("Chtimes failed: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	info, err := os.Stat(indexPath)
+	if err != nil {
+		t.Fatalf("Stat failed: %v", err)
+	}
+	if !info.ModTime().Equal(oldTime) {
+		t.Fatal("clean Close rewrote index")
 	}
 }
 

@@ -4,10 +4,15 @@
 package fileutil
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"syscall"
 )
+
+func isFlockContention(err error) bool {
+	return errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN)
+}
 
 // FlockExclusive acquires an exclusive (write) lock on the file.
 // If nonBlocking is true, returns immediately with an error if the lock cannot be acquired.
