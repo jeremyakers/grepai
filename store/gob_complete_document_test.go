@@ -161,6 +161,59 @@ func TestGOBStoreGetCompleteDocumentWithPrefix(t *testing.T) {
 			chunks: []Chunk{{ID: rawID, FilePath: docPath, Vector: []float32{1}}},
 			want:   true,
 		},
+		{
+			// Legacy Windows metadata recorded raw references with native
+			// backslash separators while the writer stored slash-normalized
+			// prefixed IDs; the prefixed candidate resolves them.
+			name:   "windows raw reference resolves to slash-stored prefixed chunk",
+			ids:    []string{`src\a.go_0`},
+			prefix: prefix,
+			chunks: []Chunk{validPrefixed},
+			want:   true,
+		},
+		{
+			// Already-prefixed Windows references normalize without adding the
+			// prefix a second time, alongside raw Windows references.
+			name:   "mixed raw and full windows references",
+			ids:    []string{`src\a.go_0`, `ws\proj\src\a.go_1`},
+			prefix: prefix,
+			chunks: []Chunk{
+				validPrefixed,
+				{ID: "ws/proj/src/a.go_1", FilePath: docPath, Vector: []float32{2}},
+			},
+			want: true,
+		},
+		{
+			// A normalized full reference still requires the same owning file.
+			name:   "full windows reference wrong owner rejected",
+			ids:    []string{`ws\proj\other.go_0`},
+			prefix: prefix,
+			chunks: []Chunk{{ID: "ws/proj/other.go_0", FilePath: "ws/proj/other.go", Vector: []float32{1}}},
+		},
+		{
+			// Normalization only widens the namespace lookup: an ID match via
+			// the normalized candidate still requires the same owning file.
+			name:   "windows reference normalized candidate wrong file",
+			ids:    []string{`sub\b.go_0`},
+			prefix: prefix,
+			chunks: []Chunk{{ID: "ws/proj/sub/b.go_0", FilePath: "ws/proj/sub/b.go", Vector: []float32{1}}},
+		},
+		{
+			// Hosts whose names literally contain backslashes keep resolving
+			// through the literal prefixed candidate.
+			name:   "literal backslash reference resolves to literal stored chunk",
+			ids:    []string{`src\a.go_0`},
+			prefix: prefix,
+			chunks: []Chunk{{ID: `ws/proj/src\a.go_0`, FilePath: docPath, Vector: []float32{1}}},
+			want:   true,
+		},
+		{
+			// An empty prefix never rewrites the reference, so a backslash
+			// reference does not match a slash-spelled stored ID.
+			name:   "empty prefix keeps windows reference literal",
+			ids:    []string{`src\a.go_0`},
+			chunks: []Chunk{{ID: rawID, FilePath: docPath, Vector: []float32{1}}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

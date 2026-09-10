@@ -24,19 +24,17 @@ func (s *GOBStore) GetCompleteDocumentWithPrefix(_ context.Context, filePath, ch
 	return &doc, nil
 }
 
-// hasValidChunkForReference reports whether any chunk stored under the raw
-// reference or its prefixed form belongs to filePath and carries a vector. An
-// exact-ID chunk with the wrong owner or an empty vector does not block a
-// valid prefixed mapping.
+// hasValidChunkForReference reports whether any chunk stored under one of the
+// reference's candidate IDs (see ChunkReferenceCandidates) belongs to
+// filePath and carries a vector. An exact-ID chunk with the wrong owner or an
+// empty vector does not block a valid prefixed mapping.
 func (s *GOBStore) hasValidChunkForReference(id, filePath, chunkIDPrefix string) bool {
-	if chunk, ok := s.chunks[id]; ok && chunk.FilePath == filePath && len(chunk.Vector) > 0 {
-		return true
+	for _, candidate := range ChunkReferenceCandidates(id, chunkIDPrefix) {
+		if chunk, ok := s.chunks[candidate]; ok && chunk.FilePath == filePath && len(chunk.Vector) > 0 {
+			return true
+		}
 	}
-	if chunkIDPrefix == "" {
-		return false
-	}
-	chunk, ok := s.chunks[chunkIDPrefix+"/"+id]
-	return ok && chunk.FilePath == filePath && len(chunk.Vector) > 0
+	return false
 }
 
 var _ CompleteDocumentSource = (*GOBStore)(nil)
