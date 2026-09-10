@@ -87,6 +87,45 @@ func TestGOBLoadWarningRemainsOptional(t *testing.T) {
 	}
 }
 
+func TestPostgresScanFailureMarkedRequiredAndClosesOnce(t *testing.T) {
+	// Given a Postgres store whose load succeeds but whose initial scan fails.
+	store := &failingWatchSymbolStore{}
+	scanErr := errors.New("initial scan save failed")
+
+	// When workspace initialization runs the scan seam.
+	err := initializeWorkspaceSymbolStore(context.Background(), "postgres", "project", store, func() error { return scanErr })
+
+	// Then the failure is required (startup must abort), retains the original
+	// cause, and the unreturned store is closed exactly once.
+	if !isRequiredSymbolStoreInitError(err) {
+		t.Fatalf("postgres scan error = %v, want required symbol store init error", err)
+	}
+	if !errors.Is(err, scanErr) {
+		t.Fatalf("postgres scan error = %v, want errors.Is(%v)", err, scanErr)
+	}
+	if store.closes != 1 {
+		t.Fatalf("store closes = %d, want 1", store.closes)
+	}
+}
+
+func TestGOBScanFailureRemainsUnmarked(t *testing.T) {
+	// Given a GOB store whose scan fails.
+	store := &failingWatchSymbolStore{}
+	scanErr := errors.New("initial scan failed")
+
+	// When the watcher helper runs the scan seam.
+	err := runAfterWatcherSymbolLoad(context.Background(), "gob", "project", store, func() error { return scanErr })
+
+	// Then the error propagates unchanged and unmarked (GOB stays optional
+	// at the workspace initializer).
+	if !errors.Is(err, scanErr) {
+		t.Fatalf("gob scan error = %v, want errors.Is(%v)", err, scanErr)
+	}
+	if isRequiredSymbolStoreInitError(err) {
+		t.Fatal("gob scan error must not become a required init error")
+	}
+}
+
 func TestWorkspacePostgresSymbolLoadStopsAndClosesBeforeScan(t *testing.T) {
 	store := &failingWatchSymbolStore{loadErr: errors.New("migration failed")}
 	scans := 0

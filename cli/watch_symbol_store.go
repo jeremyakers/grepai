@@ -43,10 +43,16 @@ func runAfterWatcherSymbolLoad(ctx context.Context, backend, project string, sym
 		}
 		log.Printf("Warning: failed to load symbol index for %s: %v", project, err)
 	}
-	if next != nil {
-		return next()
+	if next == nil {
+		return nil
 	}
-	return nil
+	err := next()
+	if err != nil && backend == "postgres" && !isRequiredSymbolStoreInitError(err) {
+		// A failed Postgres initial scan leaves the index incomplete; like a
+		// load/migration failure it must abort startup, not drop the project.
+		return &requiredSymbolStoreInitError{cause: err}
+	}
+	return err
 }
 
 func initializeWorkspaceSymbolStore(ctx context.Context, backend, project string, symbolStore trace.SymbolStore, scan func() error) error {
