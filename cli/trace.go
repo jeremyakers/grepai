@@ -277,9 +277,9 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 	}
 	defer symbolStore.Close()
 
-	// Check if index exists
-	stats, err := symbolStore.GetStats(ctx)
-	if err != nil || stats.TotalSymbols == 0 {
+	// Check if index exists (count-only; avoids full stats aggregation)
+	totalSymbols, err := trace.CountSymbolsForReadiness(ctx, symbolStore)
+	if err != nil || totalSymbols == 0 {
 		if traceUI {
 			return showTraceActionCardUIError(
 				fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index"),
@@ -443,9 +443,9 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 	}
 	defer symbolStore.Close()
 
-	// Check if index exists
-	stats, err := symbolStore.GetStats(ctx)
-	if err != nil || stats.TotalSymbols == 0 {
+	// Check if index exists (count-only; avoids full stats aggregation)
+	totalSymbols, err := trace.CountSymbolsForReadiness(ctx, symbolStore)
+	if err != nil || totalSymbols == 0 {
 		if traceUI {
 			return showTraceActionCardUIError(
 				fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index"),
@@ -591,9 +591,9 @@ func runTraceGraph(cmd *cobra.Command, args []string) error {
 	}
 	defer symbolStore.Close()
 
-	// Check if index exists
-	stats, err := symbolStore.GetStats(ctx)
-	if err != nil || stats.TotalSymbols == 0 {
+	// Check if index exists (count-only; avoids full stats aggregation)
+	totalSymbols, err := trace.CountSymbolsForReadiness(ctx, symbolStore)
+	if err != nil || totalSymbols == 0 {
 		if traceUI {
 			return showTraceActionCardUIError(
 				fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index"),

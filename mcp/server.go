@@ -1151,8 +1151,9 @@ func (s *Server) handleTraceCallers(ctx context.Context, request mcp.CallToolReq
 	}
 	defer symbolStore.Close()
 
-	stats, err := symbolStore.GetStats(ctx)
-	if err != nil || stats.TotalSymbols == 0 {
+	// Readiness gate (count-only; avoids full stats aggregation)
+	totalSymbols, err := trace.CountSymbolsForReadiness(ctx, symbolStore)
+	if err != nil || totalSymbols == 0 {
 		return mcp.NewToolResultError("symbol index is empty. Run 'grepai watch' first to build the index"), nil
 	}
 
@@ -1313,8 +1314,9 @@ func (s *Server) handleTraceCallees(ctx context.Context, request mcp.CallToolReq
 	}
 	defer symbolStore.Close()
 
-	stats, err := symbolStore.GetStats(ctx)
-	if err != nil || stats.TotalSymbols == 0 {
+	// Readiness gate (count-only; avoids full stats aggregation)
+	totalSymbols, err := trace.CountSymbolsForReadiness(ctx, symbolStore)
+	if err != nil || totalSymbols == 0 {
 		return mcp.NewToolResultError("symbol index is empty. Run 'grepai watch' first to build the index"), nil
 	}
 
@@ -1531,8 +1533,9 @@ func (s *Server) handleTraceGraph(ctx context.Context, request mcp.CallToolReque
 	}
 	defer symbolStore.Close()
 
-	symStats, err := symbolStore.GetStats(ctx)
-	if err != nil || symStats.TotalSymbols == 0 {
+	// Readiness gate (count-only; avoids full stats aggregation)
+	totalSymbols, err := trace.CountSymbolsForReadiness(ctx, symbolStore)
+	if err != nil || totalSymbols == 0 {
 		return mcp.NewToolResultError("symbol index is empty. Run 'grepai watch' first to build the index"), nil
 	}
 
@@ -1623,8 +1626,9 @@ func (s *Server) handleRefsGraph(ctx context.Context, request mcp.CallToolReques
 			return mcp.NewToolResultError(fmt.Sprintf("failed to load symbol index: %v. Run 'grepai watch' first", err)), nil
 		}
 		defer symbolStore.Close()
-		stats, err := symbolStore.GetStats(ctx)
-		if err != nil || stats.TotalSymbols == 0 {
+		// Readiness gate (count-only; avoids full stats aggregation)
+		totalSymbols, err := trace.CountSymbolsForReadiness(ctx, symbolStore)
+		if err != nil || totalSymbols == 0 {
 			return mcp.NewToolResultError("symbol index is empty. Run 'grepai watch' first to build the index"), nil
 		}
 		stores = []trace.SymbolStore{symbolStore}
@@ -1752,8 +1756,9 @@ func (s *Server) handleRefsByKind(ctx context.Context, request mcp.CallToolReque
 	}
 	defer symbolStore.Close()
 
-	stats, err := symbolStore.GetStats(ctx)
-	if err != nil || stats.TotalSymbols == 0 {
+	// Readiness gate (count-only; avoids full stats aggregation)
+	totalSymbols, err := trace.CountSymbolsForReadiness(ctx, symbolStore)
+	if err != nil || totalSymbols == 0 {
 		return mcp.NewToolResultError("symbol index is empty. Run 'grepai watch' first to build the index"), nil
 	}
 

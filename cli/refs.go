@@ -192,8 +192,9 @@ func runRefs(symbolName string, readers bool) (refsResult, error) {
 		}
 		defer symbolStore.Close()
 
-		stats, err := symbolStore.GetStats(ctx)
-		if err != nil || stats.TotalSymbols == 0 {
+		// Readiness gate (count-only; avoids full stats aggregation)
+		totalSymbols, err := trace.CountSymbolsForReadiness(ctx, symbolStore)
+		if err != nil || totalSymbols == 0 {
 			return refsResult{}, fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index")
 		}
 
