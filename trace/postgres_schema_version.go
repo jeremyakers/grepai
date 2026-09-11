@@ -14,6 +14,10 @@ import (
 const currentSymbolSchemaVersion = 1
 const symbolSchemaVersionQuery = `SELECT value FROM symbol_store_meta WHERE key='schema_version'`
 
+// ErrSymbolSchemaVersionTooNew marks a symbol store whose stored schema
+// version is newer than this build understands.
+var ErrSymbolSchemaVersionTooNew = errors.New("symbol store schema version is newer than this build supports")
+
 type symbolSchemaVersionReader interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
 }
@@ -37,9 +41,21 @@ func schemaAdvisoryKey() (int32, int32) {
 	return advisoryKey("grepai:symbol-schema")
 }
 
+// checkSymbolSchemaVersion prevents an older binary from downgrading a newer
+// schema's version marker or running incompatible DDL against it.
+func checkSymbolSchemaVersion(version int) error {
+	if version > currentSymbolSchemaVersion {
+		return fmt.Errorf("%w: stored %d, supported %d", ErrSymbolSchemaVersionTooNew, version, currentSymbolSchemaVersion)
+	}
+	return nil
+}
+
 func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) (retErr error) {
 	version, _, err := readSymbolSchemaVersion(ctx, s.pool)
 	if err != nil {
+		return err
+	}
+	if err := checkSymbolSchemaVersion(version); err != nil {
 		return err
 	}
 	if version == currentSymbolSchemaVersion {
@@ -57,6 +73,9 @@ func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) (retErr error) {
 	defer func() { retErr = errors.Join(retErr, releaseSchemaAdvisoryLock(conn, key1, key2)) }()
 	version, _, err = readSymbolSchemaVersion(ctx, conn)
 	if err != nil {
+		return err
+	}
+	if err := checkSymbolSchemaVersion(version); err != nil {
 		return err
 	}
 	if version == currentSymbolSchemaVersion {
