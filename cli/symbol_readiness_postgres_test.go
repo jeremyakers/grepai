@@ -170,6 +170,9 @@ func TestTraceCommandReadinessPostgresAvoidsFullStats(t *testing.T) {
 }
 
 func TestRefsCommandReadinessPostgresAvoidsFullStats(t *testing.T) {
+	originalWorkspace, originalProject := refsWorkspace, refsProject
+	refsWorkspace, refsProject = "", ""
+	t.Cleanup(func() { refsWorkspace, refsProject = originalWorkspace, originalProject })
 	for _, readers := range []bool{true, false} {
 		name := "writers"
 		if readers {
