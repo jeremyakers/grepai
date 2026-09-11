@@ -28,42 +28,66 @@ func resolveCalleeSymbol(originByName map[string][]trace.Symbol, crossProject ma
 // at most one batch query for the still-unresolved names, so the fallback
 // adds no per-callee point lookups. Single-store (project mode) resolution
 // is unchanged.
-func lookupMissingCalleeSymbols(ctx context.Context, stores []trace.SymbolStore, refs []storeReference, origin []map[string][]trace.Symbol) map[string]trace.Symbol {
-	resolved := make(map[string]trace.Symbol)
+func lookupMissingCalleeSymbols(ctx context.Context, stores []trace.SymbolStore, refs []storeReference, origin []map[string][]trace.Symbol) []map[string]trace.Symbol {
+	resolved := make([]map[string]trace.Symbol, len(stores))
+	for i := range resolved {
+		resolved[i] = make(map[string]trace.Symbol)
+	}
 	if len(stores) < 2 {
 		return resolved
 	}
-	missing := make([]string, 0, len(refs))
-	seen := make(map[string]struct{}, len(refs))
+	missing := make([][]string, len(stores))
+	seen := make([]map[string]struct{}, len(stores))
+	for i := range seen {
+		seen[i] = make(map[string]struct{})
+	}
 	for _, item := range refs {
 		name := item.ref.SymbolName
 		if len(origin[item.storeIndex][name]) > 0 {
 			continue
 		}
-		if _, ok := seen[name]; ok {
+		if _, ok := seen[item.storeIndex][name]; ok {
 			continue
 		}
-		seen[name] = struct{}{}
-		missing = append(missing, name)
+		seen[item.storeIndex][name] = struct{}{}
+		missing[item.storeIndex] = append(missing[item.storeIndex], name)
 	}
-	for _, store := range stores {
-		remaining := make([]string, 0, len(missing))
-		for _, name := range missing {
-			if _, ok := resolved[name]; !ok {
-				remaining = append(remaining, name)
+	for fallbackIndex, store := range stores {
+		queryNames := make([]string, 0)
+		querySeen := make(map[string]struct{})
+		for originIndex := range stores {
+			if originIndex == fallbackIndex {
+				continue
+			}
+			for _, name := range missing[originIndex] {
+				if _, ok := resolved[originIndex][name]; ok {
+					continue
+				}
+				if _, ok := querySeen[name]; !ok {
+					querySeen[name] = struct{}{}
+					queryNames = append(queryNames, name)
+				}
 			}
 		}
-		if len(remaining) == 0 {
-			break
+		if len(queryNames) == 0 {
+			continue
 		}
-		symbols, err := store.LookupSymbolsBatch(ctx, remaining)
+		symbols, err := store.LookupSymbolsBatch(ctx, queryNames)
 		if err != nil {
 			log.Printf("Warning: failed to lookup cross-project callee symbols: %v", err)
 			continue
 		}
-		for _, name := range remaining {
-			if defs := symbols[name]; len(defs) > 0 {
-				resolved[name] = defs[0]
+		for originIndex := range stores {
+			if originIndex == fallbackIndex {
+				continue
+			}
+			for _, name := range missing[originIndex] {
+				if _, ok := resolved[originIndex][name]; ok {
+					continue
+				}
+				if defs := symbols[name]; len(defs) > 0 {
+					resolved[originIndex][name] = defs[0]
+				}
 			}
 		}
 	}

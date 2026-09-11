@@ -72,23 +72,6 @@ func pickBestSymbolForFile(candidates []trace.Symbol, preferredFile string) *tra
 	return &candidates[0]
 }
 
-func uniqueReferenceSymbolNames(refs []trace.Reference, caller bool) []string {
-	names := make([]string, 0, len(refs))
-	seen := make(map[string]struct{}, len(refs))
-	for _, ref := range refs {
-		name := ref.SymbolName
-		if caller {
-			name = ref.CallerName
-		}
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
-		names = append(names, name)
-	}
-	return names
-}
-
 var (
 	traceMode      string
 	traceDepth     int
@@ -308,40 +291,15 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 
 		result := trace.TraceResult{Query: symbolName, Mode: traceMode}
 		for _, ss := range stores {
-			symbols, err := ss.LookupSymbol(ctx, symbolName)
+			target, callees, err := lookupCalleesFromStore(ctx, ss, symbolName)
 			if err != nil {
-				log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
+				log.Printf("Warning: failed to lookup callees of %q: %v", symbolName, err)
+				continue
 			}
-			if len(symbols) > 0 && result.Symbol == nil {
-				result.Symbol = &symbols[0]
+			if target != nil && result.Symbol == nil {
+				result.Symbol = target
 			}
-			if len(symbols) > 0 {
-				refs, err := ss.LookupCallees(ctx, symbolName, symbols[0].File)
-				if err != nil {
-					log.Printf("Warning: failed to lookup callees of %q: %v", symbolName, err)
-				}
-				calleeSymbols, err := ss.LookupSymbolsBatch(ctx, uniqueReferenceSymbolNames(refs, false))
-				if err != nil {
-					log.Printf("Warning: failed to lookup callee symbols: %v", err)
-				}
-				for _, ref := range refs {
-					calleeSyms := calleeSymbols[ref.SymbolName]
-					var calleeSym trace.Symbol
-					if len(calleeSyms) > 0 {
-						calleeSym = calleeSyms[0]
-					} else {
-						calleeSym = trace.Symbol{Name: ref.SymbolName}
-					}
-					result.Callees = append(result.Callees, trace.CalleeInfo{
-						Symbol: calleeSym,
-						CallSite: trace.CallSite{
-							File:    ref.File,
-							Line:    ref.Line,
-							Context: ref.Context,
-						},
-					})
-				}
-			}
+			result.Callees = append(result.Callees, callees...)
 		}
 
 		if result.Symbol == nil {
@@ -391,49 +349,20 @@ func runTraceCallees(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index")
 	}
 
-	// Lookup symbol
-	symbols, err := symbolStore.LookupSymbol(ctx, symbolName)
+	target, callees, err := lookupCalleesFromStore(ctx, symbolStore, symbolName)
 	if err != nil {
-		return fmt.Errorf("failed to lookup symbol: %w", err)
+		return fmt.Errorf("failed to lookup callees: %w", err)
 	}
-
-	if len(symbols) == 0 {
+	if target == nil {
 		emptyResult := trace.TraceResult{Query: symbolName, Mode: traceMode}
 		return outputTraceResult(emptyResult, traceViewCallees)
 	}
 
-	// Find callees
-	refs, err := symbolStore.LookupCallees(ctx, symbolName, symbols[0].File)
-	if err != nil {
-		return fmt.Errorf("failed to lookup callees: %w", err)
-	}
-
 	result := trace.TraceResult{
-		Query:  symbolName,
-		Mode:   traceMode,
-		Symbol: &symbols[0],
-	}
-
-	calleeSymbols, err := symbolStore.LookupSymbolsBatch(ctx, uniqueReferenceSymbolNames(refs, false))
-	if err != nil {
-		log.Printf("Warning: failed to lookup callee symbols: %v", err)
-	}
-	for _, ref := range refs {
-		calleeSyms := calleeSymbols[ref.SymbolName]
-		var calleeSym trace.Symbol
-		if len(calleeSyms) > 0 {
-			calleeSym = calleeSyms[0]
-		} else {
-			calleeSym = trace.Symbol{Name: ref.SymbolName}
-		}
-		result.Callees = append(result.Callees, trace.CalleeInfo{
-			Symbol: calleeSym,
-			CallSite: trace.CallSite{
-				File:    ref.File,
-				Line:    ref.Line,
-				Context: ref.Context,
-			},
-		})
+		Query:   symbolName,
+		Mode:    traceMode,
+		Symbol:  target,
+		Callees: callees,
 	}
 
 	// Enrich with RPG feature paths

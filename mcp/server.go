@@ -1325,22 +1325,22 @@ func (s *Server) handleTraceCallees(ctx context.Context, request mcp.CallToolReq
 func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName string, compact bool, format string, stores []trace.SymbolStore) (*mcp.CallToolResult, error) {
 	var firstSymbol *trace.Symbol
 	var allRefs []storeReference
+	calleeSymbols := make([]map[string][]trace.Symbol, len(stores))
 
 	for storeIndex, ss := range stores {
-		symbols, err := ss.LookupSymbol(ctx, symbolName)
+		lookup, err := trace.LookupCalleeResult(ctx, ss, symbolName, "")
 		if err != nil {
-			log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
+			log.Printf("Warning: failed to lookup callees of %q: %v", symbolName, err)
+			continue
 		}
+		symbols := lookup.Symbols[symbolName]
 		if len(symbols) > 0 {
 			if firstSymbol == nil {
 				sym := symbols[0]
 				firstSymbol = &sym
 			}
-			refs, err := ss.LookupCallees(ctx, symbolName, symbols[0].File)
-			if err != nil {
-				log.Printf("Warning: failed to lookup callees of %q: %v", symbolName, err)
-			}
-			for _, ref := range refs {
+			calleeSymbols[storeIndex] = lookup.Symbols
+			for _, ref := range lookup.References {
 				allRefs = append(allRefs, storeReference{ref: ref, storeIndex: storeIndex})
 			}
 		}
@@ -1354,7 +1354,6 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 		}
 		return mcp.NewToolResultText(output), nil
 	}
-	calleeSymbols := lookupSymbolsByOrigin(ctx, stores, allRefs, false, "callee")
 	crossProjectCallees := lookupMissingCalleeSymbols(ctx, stores, allRefs, calleeSymbols)
 
 	var data any
@@ -1373,7 +1372,7 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 
 		for _, item := range allRefs {
 			ref := item.ref
-			calleeSym := resolveCalleeSymbol(calleeSymbols[item.storeIndex], crossProjectCallees, ref.SymbolName)
+			calleeSym := resolveCalleeSymbol(calleeSymbols[item.storeIndex], crossProjectCallees[item.storeIndex], ref.SymbolName)
 			resultCompact.Callees = append(resultCompact.Callees, CalleeInfoCompact{
 				Symbol: calleeSym,
 				CallSite: CallSiteCompact{
@@ -1399,7 +1398,7 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 		}
 		for _, item := range allRefs {
 			ref := item.ref
-			calleeSym := resolveCalleeSymbol(calleeSymbols[item.storeIndex], crossProjectCallees, ref.SymbolName)
+			calleeSym := resolveCalleeSymbol(calleeSymbols[item.storeIndex], crossProjectCallees[item.storeIndex], ref.SymbolName)
 			result.Callees = append(result.Callees, trace.CalleeInfo{
 				Symbol: calleeSym,
 				CallSite: trace.CallSite{
@@ -1619,85 +1618,7 @@ func (s *Server) handleRefsGraph(ctx context.Context, request mcp.CallToolReques
 		stores = []trace.SymbolStore{symbolStore}
 	}
 
-	readers := make([]RefUsage, 0)
-	writers := make([]RefUsage, 0)
-	for _, ss := range stores {
-		r, readErr := ss.LookupReaders(ctx, symbolName)
-		if readErr != nil {
-			log.Printf("Warning: failed to lookup readers of %q: %v", symbolName, readErr)
-		}
-		w, writeErr := ss.LookupWriters(ctx, symbolName)
-		if writeErr != nil {
-			log.Printf("Warning: failed to lookup writers of %q: %v", symbolName, writeErr)
-		}
-		refs := append(append([]trace.Reference{}, r...), w...)
-		callerSymbols, batchErr := ss.LookupSymbolsBatch(ctx, uniqueRefNames(refs, true))
-		if batchErr != nil {
-			log.Printf("Warning: failed to lookup ref caller symbols: %v", batchErr)
-		}
-		for _, ref := range r {
-			readers = append(readers, RefUsage{
-				Symbol:   resolveRefCallerSymbol(callerSymbols, ref),
-				Access:   ref.Kind,
-				AccessAt: trace.CallSite{File: ref.File, Line: ref.Line, Context: ref.Context},
-			})
-		}
-		for _, ref := range w {
-			writers = append(writers, RefUsage{
-				Symbol:   resolveRefCallerSymbol(callerSymbols, ref),
-				Access:   ref.Kind,
-				AccessAt: trace.CallSite{File: ref.File, Line: ref.Line, Context: ref.Context},
-			})
-		}
-	}
-
-	var data any
-	if compact {
-		rc := make([]RefUsageCompact, 0, len(readers))
-		for _, usage := range readers {
-			rc = append(rc, RefUsageCompact{
-				Symbol: usage.Symbol,
-				Access: usage.Access,
-				AccessAt: CallSiteCompact{
-					File: usage.AccessAt.File,
-					Line: usage.AccessAt.Line,
-				},
-			})
-		}
-		wc := make([]RefUsageCompact, 0, len(writers))
-		for _, usage := range writers {
-			wc = append(wc, RefUsageCompact{
-				Symbol: usage.Symbol,
-				Access: usage.Access,
-				AccessAt: CallSiteCompact{
-					File: usage.AccessAt.File,
-					Line: usage.AccessAt.Line,
-				},
-			})
-		}
-		data = map[string]any{
-			"query":   symbolName,
-			"kind":    "property",
-			"mode":    "fast",
-			"readers": rc,
-			"writers": wc,
-		}
-	} else {
-		data = map[string]any{
-			"query":   symbolName,
-			"kind":    "property",
-			"mode":    "fast",
-			"readers": readers,
-			"writers": writers,
-		}
-	}
-
-	output, err := encodeOutput(data, format)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("failed to encode results: %v", err)), nil
-	}
-
-	return mcp.NewToolResultText(output), nil
+	return s.handleRefsGraphFromStores(ctx, symbolName, compact, format, stores)
 }
 
 func (s *Server) handleRefsByKind(ctx context.Context, request mcp.CallToolRequest, kind string) (*mcp.CallToolResult, error) {
@@ -1751,36 +1672,10 @@ func (s *Server) handleRefsByKind(ctx context.Context, request mcp.CallToolReque
 }
 
 func (s *Server) handleRefsFromStores(ctx context.Context, symbolName string, kind string, compact bool, format string, stores []trace.SymbolStore) (*mcp.CallToolResult, error) {
-	usages := make([]RefUsage, 0)
-
-	for _, ss := range stores {
-		var refs []trace.Reference
-		var err error
-		if kind == trace.RefKindWrite {
-			refs, err = ss.LookupWriters(ctx, symbolName)
-		} else {
-			refs, err = ss.LookupReaders(ctx, symbolName)
-		}
-		if err != nil {
-			log.Printf("Warning: failed to lookup refs of %q: %v", symbolName, err)
-			continue
-		}
-		callerSymbols, batchErr := ss.LookupSymbolsBatch(ctx, uniqueRefNames(refs, true))
-		if batchErr != nil {
-			log.Printf("Warning: failed to lookup ref caller symbols: %v", batchErr)
-		}
-
-		for _, ref := range refs {
-			usages = append(usages, RefUsage{
-				Symbol: resolveRefCallerSymbol(callerSymbols, ref),
-				Access: ref.Kind,
-				AccessAt: trace.CallSite{
-					File:    ref.File,
-					Line:    ref.Line,
-					Context: ref.Context,
-				},
-			})
-		}
+	readers, writers := lookupRefUsagesFromStores(ctx, stores, symbolName)
+	usages := readers
+	if kind == trace.RefKindWrite {
+		usages = writers
 	}
 
 	label := "readers"
@@ -1842,23 +1737,6 @@ func resolveRefCallerSymbol(candidatesByName map[string][]trace.Symbol, ref trac
 	}
 
 	return candidates[0]
-}
-
-func uniqueRefNames(refs []trace.Reference, callers bool) []string {
-	names := make([]string, 0, len(refs))
-	seen := make(map[string]struct{}, len(refs))
-	for _, ref := range refs {
-		name := ref.SymbolName
-		if callers {
-			name = ref.CallerName
-		}
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
-		names = append(names, name)
-	}
-	return names
 }
 
 type storeReference struct {

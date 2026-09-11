@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Repair missing indexes in otherwise valid current PostgreSQL schemas under the schema lock, and reject current markers over legacy identity types
   - Read caller trace targets, references and caller definitions from one PostgreSQL snapshot across CLI and MCP paths
   - Lock symbol data tables in mutation order during schema repair to avoid deadlocks with active writers
+  - Read callee definitions and read/write reference graphs with their related metadata in one PostgreSQL snapshot, including CLI and MCP formatting paths
 
 ## [0.37.0] - 2026-09-10
 

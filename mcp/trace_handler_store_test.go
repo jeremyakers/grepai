@@ -150,17 +150,31 @@ type countingBatchSymbolStore struct {
 
 type compoundMCPStore struct {
 	trace.SymbolStore
-	result trace.CallerLookupResult
-	called int
+	callerResult trace.CallerLookupResult
+	calleeResult trace.CalleeLookupResult
+	refsResult   trace.RefsLookupResult
+	callerCalls  int
+	calleeCalls  int
+	refsCalls    int
 }
 
 func (s *compoundMCPStore) LookupCallerResult(context.Context, string) (trace.CallerLookupResult, error) {
-	s.called++
-	return s.result, nil
+	s.callerCalls++
+	return s.callerResult, nil
+}
+
+func (s *compoundMCPStore) LookupCalleeResult(context.Context, string, string) (trace.CalleeLookupResult, error) {
+	s.calleeCalls++
+	return s.calleeResult, nil
+}
+
+func (s *compoundMCPStore) LookupRefsResult(context.Context, string) (trace.RefsLookupResult, error) {
+	s.refsCalls++
+	return s.refsResult, nil
 }
 
 func TestTraceCallersHandlerRoutesThroughCompoundCapability(t *testing.T) {
-	store := &compoundMCPStore{result: trace.CallerLookupResult{
+	store := &compoundMCPStore{callerResult: trace.CallerLookupResult{
 		Symbols: map[string][]trace.Symbol{
 			"Target": {{Name: "Target", File: "target.go"}},
 			"Caller": {{Name: "Caller", File: "caller.go"}},
@@ -169,11 +183,44 @@ func TestTraceCallersHandlerRoutesThroughCompoundCapability(t *testing.T) {
 	}}
 	server := &Server{}
 	result, err := server.handleTraceCallersFromStores(context.Background(), "Target", false, "json", []trace.SymbolStore{store})
-	if err != nil || store.called != 1 {
-		t.Fatalf("compound calls=%d err=%v", store.called, err)
+	if err != nil || store.callerCalls != 1 {
+		t.Fatalf("compound calls=%d err=%v", store.callerCalls, err)
 	}
 	if output := textResultPayload(t, result); !containsMCPParts(output, "target.go", "caller.go", "use.go") {
 		t.Fatalf("compound handler output = %s", output)
+	}
+}
+
+func TestCalleeAndRefsHandlersRouteThroughCompoundCapabilities(t *testing.T) {
+	store := &compoundMCPStore{
+		calleeResult: trace.CalleeLookupResult{
+			Symbols:    map[string][]trace.Symbol{"Target": {{Name: "Target", File: "target.go"}}, "Callee": {{Name: "Callee", File: "callee.go"}}},
+			References: []trace.Reference{{SymbolName: "Callee", File: "use.go", Line: 2}},
+		},
+		refsResult: trace.RefsLookupResult{
+			Symbols:    map[string][]trace.Symbol{"Reader": {{Name: "Reader", File: "reader.go"}}, "Writer": {{Name: "Writer", File: "writer.go"}}},
+			References: []trace.Reference{{Kind: trace.RefKindRead, CallerName: "Reader", CallerFile: "reader.go"}, {Kind: trace.RefKindWrite, CallerName: "Writer", CallerFile: "writer.go"}},
+		},
+	}
+	server := &Server{}
+	calleeOutput, err := server.handleTraceCalleesFromStores(context.Background(), "Target", true, "json", []trace.SymbolStore{store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	graphOutput, err := server.handleRefsGraphFromStores(context.Background(), "uid", false, "json", []trace.SymbolStore{store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerOutput, err := server.handleRefsFromStores(context.Background(), "uid", trace.RefKindRead, true, "json", []trace.SymbolStore{store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writerOutput, err := server.handleRefsFromStores(context.Background(), "uid", trace.RefKindWrite, false, "json", []trace.SymbolStore{store})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.calleeCalls != 1 || store.refsCalls != 3 || !containsMCPParts(textResultPayload(t, calleeOutput), "callee.go") || !containsMCPParts(textResultPayload(t, graphOutput), "reader.go", "writer.go") || !containsMCPParts(textResultPayload(t, readerOutput), "reader.go") || !containsMCPParts(textResultPayload(t, writerOutput), "writer.go") {
+		t.Fatalf("compound routes callee=%d refs=%d", store.calleeCalls, store.refsCalls)
 	}
 }
 

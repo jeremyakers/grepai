@@ -17,17 +17,31 @@ import (
 
 type compoundCLIStore struct {
 	trace.SymbolStore
-	result trace.CallerLookupResult
-	called int
+	callerResult trace.CallerLookupResult
+	calleeResult trace.CalleeLookupResult
+	refsResult   trace.RefsLookupResult
+	callerCalls  int
+	calleeCalls  int
+	refsCalls    int
 }
 
 func (s *compoundCLIStore) LookupCallerResult(context.Context, string) (trace.CallerLookupResult, error) {
-	s.called++
-	return s.result, nil
+	s.callerCalls++
+	return s.callerResult, nil
+}
+
+func (s *compoundCLIStore) LookupCalleeResult(context.Context, string, string) (trace.CalleeLookupResult, error) {
+	s.calleeCalls++
+	return s.calleeResult, nil
+}
+
+func (s *compoundCLIStore) LookupRefsResult(context.Context, string) (trace.RefsLookupResult, error) {
+	s.refsCalls++
+	return s.refsResult, nil
 }
 
 func TestTraceCallersStoreLookupRoutesThroughCompoundCapability(t *testing.T) {
-	store := &compoundCLIStore{result: trace.CallerLookupResult{
+	store := &compoundCLIStore{callerResult: trace.CallerLookupResult{
 		Symbols: map[string][]trace.Symbol{
 			"Target": {{Name: "Target", File: "target.go"}},
 			"Caller": {{Name: "Caller", File: "caller.go"}},
@@ -35,8 +49,38 @@ func TestTraceCallersStoreLookupRoutesThroughCompoundCapability(t *testing.T) {
 		References: []trace.Reference{{SymbolName: "Target", CallerName: "Caller", CallerFile: "caller.go", File: "use.go", Line: 2}},
 	}}
 	target, callers, err := lookupCallersFromStore(context.Background(), store, "Target")
-	if err != nil || store.called != 1 || target == nil || target.File != "target.go" || len(callers) != 1 || callers[0].Symbol.File != "caller.go" {
-		t.Fatalf("compound route target=%#v callers=%#v called=%d err=%v", target, callers, store.called, err)
+	if err != nil || store.callerCalls != 1 || target == nil || target.File != "target.go" || len(callers) != 1 || callers[0].Symbol.File != "caller.go" {
+		t.Fatalf("compound route target=%#v callers=%#v called=%d err=%v", target, callers, store.callerCalls, err)
+	}
+}
+
+func TestTraceCalleesStoreLookupRoutesThroughCompoundCapability(t *testing.T) {
+	store := &compoundCLIStore{calleeResult: trace.CalleeLookupResult{
+		Symbols: map[string][]trace.Symbol{
+			"Target": {{Name: "Target", File: "target.go"}},
+			"Callee": {{Name: "Callee", File: "callee.go"}},
+		},
+		References: []trace.Reference{{SymbolName: "Callee", File: "use.go", Line: 3}},
+	}}
+	target, callees, err := lookupCalleesFromStore(context.Background(), store, "Target")
+	if err != nil || store.calleeCalls != 1 || target == nil || target.File != "target.go" || len(callees) != 1 || callees[0].Symbol.File != "callee.go" {
+		t.Fatalf("compound route target=%#v callees=%#v called=%d err=%v", target, callees, store.calleeCalls, err)
+	}
+}
+
+func TestRefsStoreLookupRoutesGraphAndKindThroughCompoundCapability(t *testing.T) {
+	store := &compoundCLIStore{refsResult: trace.RefsLookupResult{
+		Symbols: map[string][]trace.Symbol{"Reader": {{Name: "Reader", File: "reader.go"}}, "Writer": {{Name: "Writer", File: "writer.go"}}},
+		References: []trace.Reference{
+			{Kind: trace.RefKindRead, CallerName: "Reader", CallerFile: "reader.go"},
+			{Kind: trace.RefKindWrite, CallerName: "Writer", CallerFile: "writer.go"},
+		},
+	}}
+	graph := lookupRefsFromStores(context.Background(), []trace.SymbolStore{store}, "uid", true, true)
+	readers := lookupRefsFromStores(context.Background(), []trace.SymbolStore{store}, "uid", true, false)
+	writers := lookupRefsFromStores(context.Background(), []trace.SymbolStore{store}, "uid", false, true)
+	if store.refsCalls != 3 || len(graph.Readers) != 1 || len(graph.Writers) != 1 || len(readers.Readers) != 1 || len(readers.Writers) != 0 || len(writers.Readers) != 0 || len(writers.Writers) != 1 {
+		t.Fatalf("compound refs calls=%d graph=%#v readers=%#v writers=%#v", store.refsCalls, graph, readers, writers)
 	}
 }
 

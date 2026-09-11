@@ -32,25 +32,32 @@ func (s *PostgresSymbolStore) LookupCallees(ctx context.Context, symbolName, _ s
 			err = errors.Join(err, fmt.Errorf("failed to rollback callee snapshot transaction: %w", rollbackErr))
 		}
 	}()
-	edges, err := s.calleeEdges(ctx, tx, symbolName)
-	if err != nil {
-		return nil, err
-	}
-	callRefs, err := s.callRefsByCaller(ctx, tx, symbolName)
+	result, err = s.lookupCallees(ctx, tx, symbolName)
 	if err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("failed to commit callee snapshot transaction: %w", err)
 	}
+	return result, nil
+}
 
+func (s *PostgresSymbolStore) lookupCallees(ctx context.Context, q postgresQuerier, symbolName string) ([]Reference, error) {
+	edges, err := s.calleeEdges(ctx, q, symbolName)
+	if err != nil {
+		return nil, err
+	}
+	callRefs, err := s.callRefsByCaller(ctx, q, symbolName)
+	if err != nil {
+		return nil, err
+	}
 	refsBySite := make(map[calleeSite][]Reference)
 	for _, ref := range callRefs {
 		key := calleeSite{name: ref.SymbolName, file: ref.File, line: ref.Line}
 		refsBySite[key] = append(refsBySite[key], ref)
 	}
 
-	result = []Reference{}
+	result := []Reference{}
 	seen := make(map[calleeSite]bool)
 	for _, edge := range edges {
 		key := calleeSite{file: edge.File, line: edge.Line}

@@ -115,11 +115,7 @@ var refsGraphCmd = &cobra.Command{
 		if err := validateRefsOutputFlags(); err != nil {
 			return err
 		}
-		readersResult, err := runRefs(args[0], true)
-		if err != nil {
-			return err
-		}
-		writersResult, err := runRefs(args[0], false)
+		result, err := runRefsKinds(args[0], true, true)
 		if err != nil {
 			return err
 		}
@@ -128,8 +124,8 @@ var refsGraphCmd = &cobra.Command{
 			Query:   args[0],
 			Kind:    "property",
 			Mode:    "fast",
-			Readers: readersResult.Readers,
-			Writers: writersResult.Writers,
+			Readers: result.Readers,
+			Writers: result.Writers,
 		}
 		return outputRefsGraphResult(graph)
 	},
@@ -159,6 +155,10 @@ func validateRefsOutputFlags() error {
 }
 
 func runRefs(symbolName string, readers bool) (refsResult, error) {
+	return runRefsKinds(symbolName, readers, !readers)
+}
+
+func runRefsKinds(symbolName string, includeReaders, includeWriters bool) (refsResult, error) {
 	ctx := context.Background()
 
 	if refsProject != "" && refsWorkspace == "" {
@@ -201,34 +201,23 @@ func runRefs(symbolName string, readers bool) (refsResult, error) {
 		stores = []trace.SymbolStore{symbolStore}
 	}
 
+	return lookupRefsFromStores(ctx, stores, symbolName, includeReaders, includeWriters), nil
+}
+
+func lookupRefsFromStores(ctx context.Context, stores []trace.SymbolStore, symbolName string, includeReaders, includeWriters bool) refsResult {
 	result := refsResult{Query: symbolName, Kind: "property", Mode: "fast"}
 	for _, ss := range stores {
-		var refs []trace.Reference
-		var err error
-		if readers {
-			refs, err = ss.LookupReaders(ctx, symbolName)
-		} else {
-			refs, err = ss.LookupWriters(ctx, symbolName)
-		}
+		lookup, err := trace.LookupRefsResult(ctx, ss, symbolName)
 		if err != nil {
 			log.Printf("Warning: failed to lookup refs for %q: %v", symbolName, err)
 			continue
 		}
-		names := make([]string, 0, len(refs))
-		seen := make(map[string]struct{}, len(refs))
-		for _, ref := range refs {
-			if _, ok := seen[ref.CallerName]; !ok {
-				seen[ref.CallerName] = struct{}{}
-				names = append(names, ref.CallerName)
-			}
-		}
-		callerSymbols, batchErr := ss.LookupSymbolsBatch(ctx, names)
-		if batchErr != nil {
-			log.Printf("Warning: failed to lookup ref caller symbols: %v", batchErr)
-		}
 
-		for _, ref := range refs {
-			sym := resolveRefCallerSymbol(callerSymbols, ref)
+		for _, ref := range lookup.References {
+			if (ref.Kind == trace.RefKindRead && !includeReaders) || (ref.Kind == trace.RefKindWrite && !includeWriters) {
+				continue
+			}
+			sym := resolveRefCallerSymbol(lookup.Symbols, ref)
 			usage := refsUsage{
 				Symbol: sym,
 				Access: ref.Kind,
@@ -238,15 +227,14 @@ func runRefs(symbolName string, readers bool) (refsResult, error) {
 					Context: ref.Context,
 				},
 			}
-			if readers {
+			if ref.Kind == trace.RefKindRead {
 				result.Readers = append(result.Readers, usage)
-			} else {
+			} else if ref.Kind == trace.RefKindWrite {
 				result.Writers = append(result.Writers, usage)
 			}
 		}
 	}
-
-	return result, nil
+	return result
 }
 
 func compactRefsUsages(usages []refsUsage) []refsUsageCompact {

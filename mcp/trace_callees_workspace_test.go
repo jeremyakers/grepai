@@ -139,13 +139,13 @@ func TestLookupMissingCalleeSymbolsFallsBackInLoadedOrder(t *testing.T) {
 
 	resolved := lookupMissingCalleeSymbols(context.Background(), []trace.SymbolStore{one, two}, refs, origin)
 
-	if got := resolved["CrossCallee"]; got.File != "two/cross.go" || got.Line != 7 {
+	if got := resolved[0]["CrossCallee"]; got.File != "two/cross.go" || got.Line != 7 {
 		t.Fatalf("cross-project fallback = %#v", got)
 	}
-	if _, ok := resolved["Shared"]; ok {
+	if _, ok := resolved[0]["Shared"]; ok {
 		t.Fatal("origin-defined name must not be re-resolved")
 	}
-	if _, ok := resolved["Undefined"]; ok {
+	if _, ok := resolved[1]["Undefined"]; ok {
 		t.Fatal("undefined name must stay unresolved")
 	}
 	if one.pointLookups != 0 || two.pointLookups != 0 {
@@ -176,7 +176,7 @@ func TestLookupMissingCalleeSymbolsEvaluatesMissingnessPerOrigin(t *testing.T) {
 
 	resolved := lookupMissingCalleeSymbols(context.Background(), []trace.SymbolStore{one, two}, refs, origin)
 
-	if got := resolved["Shared"]; got.File != "one/shared.go" || got.Line != 5 {
+	if got := resolved[1]["Shared"]; got.File != "one/shared.go" || got.Line != 5 {
 		t.Fatalf("later origin without definition lost cross-project fallback: %#v", got)
 	}
 	if one.pointLookups != 0 || two.pointLookups != 0 {
@@ -193,7 +193,7 @@ func TestLookupMissingCalleeSymbolsSingleStoreUnchanged(t *testing.T) {
 
 	resolved := lookupMissingCalleeSymbols(context.Background(), []trace.SymbolStore{one}, refs, []map[string][]trace.Symbol{{}})
 
-	if len(resolved) != 0 || one.batchCalls != 0 || one.pointLookups != 0 {
+	if len(resolved[0]) != 0 || one.batchCalls != 0 || one.pointLookups != 0 {
 		t.Fatalf("single-store semantics changed: resolved=%v batch=%d point=%d", resolved, one.batchCalls, one.pointLookups)
 	}
 }
