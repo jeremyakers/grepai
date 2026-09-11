@@ -174,6 +174,15 @@ func (inv symbolSchemaInventory) validateIndexes() error {
 	return nil
 }
 
+func (inv symbolSchemaInventory) hasAllIndexes() bool {
+	for _, spec := range symbolIndexSpecs {
+		if _, ok := inv.indexes[spec.name]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func defaultKind(expr string) string {
 	canonical := strings.TrimSpace(expr)
 	switch canonical {

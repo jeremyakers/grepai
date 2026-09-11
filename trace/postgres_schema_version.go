@@ -102,10 +102,12 @@ func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) (retErr error) {
 		return err
 	}
 	if version == currentSymbolSchemaVersion {
-		if _, err := classifySymbolSchema(inv, true); err != nil {
+		if err := inv.validateCurrentLayout(); err != nil {
 			return err
 		}
-		return tx.Commit(ctx)
+		if inv.hasAllIndexes() {
+			return tx.Commit(ctx)
+		}
 	}
 	ownership, err := classifySymbolSchema(inv, markerPresent)
 	if err != nil {
@@ -127,17 +129,23 @@ func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) (retErr error) {
 			return err
 		}
 		if version == currentSymbolSchemaVersion {
-			if _, err := classifySymbolSchema(inv, true); err != nil {
+			if err := inv.validateCurrentLayout(); err != nil {
 				return err
 			}
-			return tx.Commit(ctx)
+			if inv.hasAllIndexes() {
+				return tx.Commit(ctx)
+			}
 		}
 		ownership, err = classifySymbolSchema(inv, markerPresent)
 		if err != nil {
 			return err
 		}
 	}
-	if err := executeSymbolSchemaQueries(ctx, tx, symbolSchemaPlan(s.schema, inv, ownership), s.schemaDDLHook); err != nil {
+	queries := symbolSchemaPlan(s.schema, inv, ownership)
+	if version == currentSymbolSchemaVersion {
+		queries = missingIndexQueries(s.schema, inv)
+	}
+	if err := executeSymbolSchemaQueries(ctx, tx, queries, s.schemaDDLHook); err != nil {
 		return err
 	}
 	meta := pgx.Identifier{s.schema, "symbol_store_meta"}.Sanitize()
@@ -176,8 +184,11 @@ func (s *PostgresSymbolStore) validateCurrentSymbolSchema(ctx context.Context) (
 	if !markerPresent || version != currentSymbolSchemaVersion {
 		return false, nil
 	}
-	if _, err := classifySymbolSchema(inv, true); err != nil {
+	if err := inv.validateCurrentLayout(); err != nil {
 		return false, err
+	}
+	if !inv.hasAllIndexes() {
+		return false, nil
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("failed to commit current symbol schema validation: %w", err)

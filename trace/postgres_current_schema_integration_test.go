@@ -75,3 +75,19 @@ func TestPostgresSymbolSchemaCurrentValidationAvoidsTableLocks(t *testing.T) {
 		})
 	}
 }
+
+func TestPostgresSymbolSchemaCurrentMarkerRejectsLegacyIdentityType(t *testing.T) {
+	cfg := isolatedSymbolSchemaConfig(t)
+	store := newIsolatedSchemaStore(t, cfg)
+	if _, err := store.pool.Exec(context.Background(), `ALTER TABLE symbols ALTER COLUMN project_id TYPE TEXT USING convert_from(project_id,'UTF8')`); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := newPostgresSymbolStoreWithPoolConfig(context.Background(), cfg.Copy(), "schema-project", t.TempDir())
+	if reopened != nil {
+		reopened.Close()
+		t.Fatal("current marker accepted a legacy TEXT identity used by BYTEA queries")
+	}
+	if err == nil {
+		t.Fatal("current schema did not reject the wrong identity type")
+	}
+}

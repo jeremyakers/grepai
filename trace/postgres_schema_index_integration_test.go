@@ -52,3 +52,22 @@ func TestPostgresSymbolSchemaVersionOneAddsRefsCallerIndex(t *testing.T) {
 	}
 	requireRefsCallerIndex(t, upgraded)
 }
+
+func TestPostgresSymbolSchemaCurrentVersionRepairsMissingIndex(t *testing.T) {
+	cfg := isolatedSymbolSchemaConfig(t)
+	store := newIsolatedSchemaStore(t, cfg)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `DROP INDEX `+refsCallerIndexName); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := newPostgresSymbolStoreWithPoolConfig(ctx, cfg.Copy(), "schema-project", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { reopened.Close() })
+	requireRefsCallerIndex(t, reopened)
+	if got := storedSchemaVersion(t, reopened); got != currentSymbolSchemaVersion {
+		t.Fatalf("index repair changed schema version to %d", got)
+	}
+}

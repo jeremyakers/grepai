@@ -166,3 +166,17 @@ func classifySymbolSchema(inv symbolSchemaInventory, markerPresent bool) (symbol
 	}
 	return symbolSchemaLegacy, nil
 }
+
+func (inv symbolSchemaInventory) validateCurrentLayout() error {
+	if _, err := classifySymbolSchema(inv, true); err != nil {
+		return err
+	}
+	for table, names := range identityColumns {
+		for _, column := range inv.tables[table].columns {
+			if slices.Contains(names, column.name) && column.typeOID != pgtype.ByteaOID {
+				return fmt.Errorf("current symbol schema identity %s.%s must use BYTEA", table, column.name)
+			}
+		}
+	}
+	return nil
+}
