@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Upgrade the symbol schema to version 2 with a project/caller reference index so callee lookups stay selective on existing PostgreSQL stores
   - Keep all breadth levels and symbol lookups of a PostgreSQL call graph in the same read-only snapshot
   - Resolve workspace callees from other loaded projects when no definition exists in their originating project, while preserving origin preference and batched lookups
+  - Pin symbol storage to one PostgreSQL schema and reject reserved-name collisions before transactional initialization or upgrades, preserving recognized legacy layouts
+  - Bound deadline-free readers' migration contention waits to 30 seconds and return actionable watcher guidance without limiting the subsequent import
+  - Quote migrated GOB archive paths in logs so filenames cannot forge additional log lines
 
 ## [0.37.0] - 2026-09-10
 

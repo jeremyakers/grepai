@@ -25,21 +25,21 @@ func (s *schemaExecutorStub) Exec(context.Context, string, ...any) (pgconn.Comma
 	return pgconn.NewCommandTag("CREATE TABLE"), nil
 }
 
-func TestRunSymbolSchemaDDLSuccessAndFailures(t *testing.T) {
-	// Given an executor that accepts the complete idempotent schema.
+func TestExecuteSymbolSchemaQueriesSuccessAndFailures(t *testing.T) {
+	plan := symbolSchemaPlan("test_schema", symbolSchemaInventory{
+		tables: make(map[string]schemaTable), indexes: make(map[string]schemaIndex),
+	}, symbolSchemaFresh)
 	success := &schemaExecutorStub{}
 
-	// When all DDL runs, every schema phase executes.
-	if err := runSymbolSchemaDDL(context.Background(), success, nil); err != nil {
+	if err := executeSymbolSchemaQueries(context.Background(), success, plan, nil); err != nil {
 		t.Fatal(err)
 	}
-	if success.calls <= len(symbolSchemaQueries()) {
-		t.Fatalf("only %d DDL statements executed", success.calls)
+	if success.calls != len(plan) {
+		t.Fatalf("executed %d DDL statements, want %d", success.calls, len(plan))
 	}
 
-	// Then hook and database errors both stop the migration.
 	hookCalls := 0
-	err := runSymbolSchemaDDL(context.Background(), &schemaExecutorStub{}, func(int, string) error {
+	err := executeSymbolSchemaQueries(context.Background(), &schemaExecutorStub{}, plan, func(int, string) error {
 		hookCalls++
 		return errors.New("hook failed")
 	})
@@ -47,7 +47,7 @@ func TestRunSymbolSchemaDDLSuccessAndFailures(t *testing.T) {
 		t.Fatalf("hook failure = %v, calls=%d", err, hookCalls)
 	}
 	databaseFailure := &schemaExecutorStub{failAt: 2}
-	if err := runSymbolSchemaDDL(context.Background(), databaseFailure, nil); err == nil || databaseFailure.calls != 2 {
+	if err := executeSymbolSchemaQueries(context.Background(), databaseFailure, plan, nil); err == nil || databaseFailure.calls != 2 {
 		t.Fatalf("database failure = %v, calls=%d", err, databaseFailure.calls)
 	}
 }

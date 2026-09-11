@@ -120,7 +120,7 @@ func (s *PostgresSymbolStore) migrateGOBIfNeeded(ctx context.Context) (retErr er
 	if err := archiveMigratedGOB(path); err != nil {
 		return err
 	}
-	log.Printf("trace: migrated GOB symbol index to Postgres and archived it as %s", path+".migrated.bak")
+	log.Printf("trace: migrated GOB symbol index to Postgres and archived it as %q", path+".migrated.bak") // #nosec G706 -- %q escapes path control characters; covered by the log-injection regression.
 	return nil
 }
 

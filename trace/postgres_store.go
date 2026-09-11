@@ -16,6 +16,7 @@ import (
 // PostgresSymbolStore stores symbol and trace data incrementally in Postgres.
 type PostgresSymbolStore struct {
 	pool               *pgxpool.Pool
+	schema             string
 	projectID          string
 	projectRoot        string
 	migrationBatchHook func(int) error
@@ -32,11 +33,41 @@ func NewPostgresSymbolStore(ctx context.Context, dsn, projectID, projectRoot str
 }
 
 func newPostgresSymbolStoreWithPoolConfig(ctx context.Context, poolConfig *pgxpool.Config, projectID, projectRoot string) (*PostgresSymbolStore, error) {
-	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	probe, err := pgxpool.NewWithConfig(ctx, poolConfig.Copy())
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
 	}
-	s := &PostgresSymbolStore{pool: pool, projectID: projectID, projectRoot: projectRoot}
+	var schema string
+	if err := probe.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
+		probe.Close()
+		return nil, fmt.Errorf("failed to resolve postgres symbol schema: %w", err)
+	}
+	probe.Close()
+	if schema == "" {
+		return nil, fmt.Errorf("failed to resolve postgres symbol schema: current_schema is null")
+	}
+
+	pinned := poolConfig.Copy()
+	if pinned.ConnConfig.RuntimeParams == nil {
+		pinned.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	searchPath := pgx.Identifier{schema}.Sanitize()
+	pinned.ConnConfig.RuntimeParams["search_path"] = searchPath
+	afterConnect := pinned.AfterConnect
+	pinned.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		if afterConnect != nil {
+			if err := afterConnect(ctx, conn); err != nil {
+				return err
+			}
+		}
+		_, err := conn.Exec(ctx, `SET search_path TO `+searchPath)
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, pinned)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
+	}
+	s := &PostgresSymbolStore{pool: pool, schema: schema, projectID: projectID, projectRoot: projectRoot}
 	if err := s.ensureSchema(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -160,13 +191,41 @@ func (s *PostgresSymbolStore) GetFileExtractorVersion(filePath string) (string, 
 
 const migrationWriterWaitInterval = 10 * time.Millisecond
 
+// migrationWriterWaitBudget bounds how long Load waits for a contending
+// project writer to complete the GOB-to-Postgres migration when the caller's
+// context carries no deadline of its own. It bounds only the wait for the
+// writer lock / migration marker, never the GOB import once the lock is
+// acquired.
+const migrationWriterWaitBudget = 30 * time.Second
+
 func (s *PostgresSymbolStore) Load(ctx context.Context) (retErr error) {
 	if err := s.ensureSchema(ctx); err != nil {
 		return err
 	}
+	// waitCtx bounds only contention on the project writer lock / migration
+	// marker; it equals ctx until the first lock rejection. The default
+	// budget arms lazily on that first contention — never at Load entry — so
+	// schema checks/upgrades and the initial fast-path reads never consume
+	// it. Callers with their own deadline keep it; deadline-free callers
+	// (e.g. CLI Loads passing context.Background) get a finite default so a
+	// stale GOB watcher holding the lifetime lock can never hang Load: such
+	// a watcher can no longer publish the Postgres migration marker. Once
+	// armed, marker re-checks also run under waitCtx, so a stalled marker
+	// query cannot bypass the bound. The GOB import after lock acquisition
+	// always runs under the caller's original ctx, never under waitCtx.
+	waitCtx := ctx
+	budgetArmed := false
+	internalBudget := false
+	// lastActiveErr retains the most recent contention cause so that a
+	// budget expiry observed by a marker re-check (not just by the wait
+	// timer) still surfaces the typed active-writer error.
+	var lastActiveErr *fileutil.ProjectWriterActiveError
 	for {
-		completed, err := s.migrationCompletedWithoutGOB(ctx)
+		completed, err := s.migrationCompletedWithoutGOB(waitCtx)
 		if err != nil {
+			if internalBudget && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+				return migrationWaitBudgetError(lastActiveErr, err)
+			}
 			return err
 		}
 		if completed {
@@ -181,15 +240,36 @@ func (s *PostgresSymbolStore) Load(ctx context.Context) (retErr error) {
 		if !errors.As(err, &activeErr) {
 			return fmt.Errorf("failed to acquire project writer lock for Postgres symbol migration: %w", err)
 		}
+		lastActiveErr = activeErr
 		// Another writer holds the project lock: a concurrent initial
-		// migration or a live watcher. Wait — bounded by ctx — for it to
+		// migration or a live watcher. Wait — bounded by waitCtx — for it to
 		// finish the migration or release the lock, then re-check completion
 		// so readers never queue behind a lifelong watcher once migration is
 		// done, and concurrent Loads serialize instead of failing fast.
-		if err := waitForMigrationWriter(ctx, activeErr); err != nil {
+		if !budgetArmed {
+			budgetArmed = true
+			if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+				var waitCancel context.CancelFunc
+				waitCtx, waitCancel = context.WithTimeout(ctx, migrationWriterWaitBudget)
+				defer waitCancel()
+				internalBudget = true
+			}
+		}
+		if err := waitForMigrationWriter(waitCtx, activeErr); err != nil {
+			if internalBudget && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
+				return migrationWaitBudgetError(activeErr, err)
+			}
 			return err
 		}
 	}
+}
+
+// migrationWaitBudgetError reports exhaustion of the internal default
+// writer-wait budget, whether the expiry was observed by the wait timer or
+// by a bounded marker re-check. It preserves the typed active-writer cause
+// and the context cause, and tells CLI users how to clear the stale watcher.
+func migrationWaitBudgetError(activeErr *fileutil.ProjectWriterActiveError, cause error) error {
+	return fmt.Errorf("gave up after %s waiting for the active project writer to finish the Postgres symbol migration; stop or restart the prior grepai watcher holding %s, then retry: %w: %w", migrationWriterWaitBudget, activeErr.LockPath, activeErr, cause)
 }
 
 // waitForMigrationWriter blocks one retry interval, mirroring the bounded

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -71,7 +72,23 @@ func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) (retErr error) {
 		return fmt.Errorf("failed to acquire symbol schema advisory lock: %w", err)
 	}
 	defer func() { retErr = errors.Join(retErr, releaseSchemaAdvisoryLock(conn, key1, key2)) }()
-	version, _, err = readSymbolSchemaVersion(ctx, conn)
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin symbol schema transaction: %w", err)
+	}
+	defer func() {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			retErr = errors.Join(retErr, fmt.Errorf("failed to rollback symbol schema transaction: %w", rollbackErr))
+		}
+	}()
+
+	inv, err := inspectSymbolSchema(ctx, tx, s.schema)
+	if err != nil {
+		return err
+	}
+	markerPresent, version, err := inspectSchemaMarker(ctx, tx, inv)
 	if err != nil {
 		return err
 	}
@@ -79,13 +96,82 @@ func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) (retErr error) {
 		return err
 	}
 	if version == currentSymbolSchemaVersion {
-		return nil
+		if _, err := classifySymbolSchema(inv, true); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
 	}
-	if err := runSymbolSchemaDDL(ctx, conn, s.schemaDDLHook); err != nil {
+	ownership, err := classifySymbolSchema(inv, markerPresent)
+	if err != nil {
 		return err
 	}
-	if _, err := conn.Exec(ctx, `INSERT INTO symbol_store_meta(key,value) VALUES('schema_version',$1) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`, currentSymbolSchemaVersion); err != nil {
+	if ownership != symbolSchemaFresh {
+		if err := lockOwnedSymbolTables(ctx, tx, s.schema, inv); err != nil {
+			return err
+		}
+		inv, err = inspectSymbolSchema(ctx, tx, s.schema)
+		if err != nil {
+			return err
+		}
+		markerPresent, version, err = inspectSchemaMarker(ctx, tx, inv)
+		if err != nil {
+			return err
+		}
+		if err := checkSymbolSchemaVersion(version); err != nil {
+			return err
+		}
+		if version == currentSymbolSchemaVersion {
+			if _, err := classifySymbolSchema(inv, true); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}
+		ownership, err = classifySymbolSchema(inv, markerPresent)
+		if err != nil {
+			return err
+		}
+	}
+	if err := executeSymbolSchemaQueries(ctx, tx, symbolSchemaPlan(s.schema, inv, ownership), s.schemaDDLHook); err != nil {
+		return err
+	}
+	meta := pgx.Identifier{s.schema, "symbol_store_meta"}.Sanitize()
+	if _, err := tx.Exec(ctx, `INSERT INTO `+meta+`(key,value) VALUES('schema_version',$1) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value`, currentSymbolSchemaVersion); err != nil {
 		return fmt.Errorf("failed to record symbol schema version: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit symbol schema transaction: %w", err)
+	}
+	return nil
+}
+
+func inspectSchemaMarker(ctx context.Context, tx pgx.Tx, inv symbolSchemaInventory) (bool, int, error) {
+	if _, ok := inv.tables["symbol_store_meta"]; !ok {
+		return false, 0, nil
+	}
+	if err := validateTable("symbol_store_meta", inv.tables["symbol_store_meta"], [][]columnRule{metaShape}, []string{"key"}); err != nil {
+		return false, 0, err
+	}
+	var version int
+	err := tx.QueryRow(ctx, symbolSchemaVersionQuery).Scan(&version)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, fmt.Errorf("failed to read symbol schema version: %w", err)
+	}
+	return true, version, nil
+}
+
+func lockOwnedSymbolTables(ctx context.Context, tx pgx.Tx, schema string, inv symbolSchemaInventory) error {
+	names := make([]string, 0, len(inv.tables))
+	for name := range inv.tables {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if _, err := tx.Exec(ctx, `LOCK TABLE `+pgx.Identifier{schema, name}.Sanitize()+` IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+			return fmt.Errorf("failed to lock owned symbol table %q: %w", name, err)
+		}
 	}
 	return nil
 }

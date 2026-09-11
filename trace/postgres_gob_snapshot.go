@@ -20,6 +20,7 @@ func loadLockedGOBSymbolSnapshot(indexPath string) (*GOBSymbolStore, bool, error
 	defer file.Close()
 
 	var data gobSymbolData
+	// #nosec G709 -- intentional local-cache migration into a fixed data-only schema; untrusted GOB imports are unsupported.
 	if err := gob.NewDecoder(file).Decode(&data); err != nil {
 		return nil, false, fmt.Errorf("failed to decode symbol index: %w", err)
 	}

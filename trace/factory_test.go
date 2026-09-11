@@ -148,9 +148,9 @@ func TestSymbolStoreBackendSelection(t *testing.T) {
 	}
 }
 
-func TestSymbolSchemaQueriesAreIdempotent(t *testing.T) {
-	queries := symbolSchemaQueries()
-	if second := symbolSchemaQueries(); !reflect.DeepEqual(queries, second) {
+func TestFreshSymbolSchemaQueriesAreDeterministicAndFailOnDuplicates(t *testing.T) {
+	queries := freshSymbolSchemaQueries()
+	if second := freshSymbolSchemaQueries(); !reflect.DeepEqual(queries, second) {
 		t.Fatal("schema generation is not deterministic")
 	}
 	seen := make(map[string]bool, len(queries))
@@ -162,19 +162,10 @@ func TestSymbolSchemaQueriesAreIdempotent(t *testing.T) {
 			t.Fatalf("duplicate schema query: %s", query)
 		}
 		seen[query] = true
-		if query[:6] == "CREATE" && !containsIFNotExists(query) {
-			t.Fatalf("CREATE query is not idempotent: %s", query)
+		if query[:6] != "CREATE" || strings.Contains(query, "IF NOT EXISTS") {
+			t.Fatalf("fresh creation must duplicate-fail: %s", query)
 		}
 	}
-}
-
-func containsIFNotExists(query string) bool {
-	for i := 0; i+13 <= len(query); i++ {
-		if query[i:i+13] == "IF NOT EXISTS" {
-			return true
-		}
-	}
-	return false
 }
 
 func TestMigrationAdvisoryKeyIsStableAndProjectScoped(t *testing.T) {
@@ -217,14 +208,14 @@ func TestAdvisoryKeyPartPreservesSignedBitPattern(t *testing.T) {
 }
 
 func TestSymbolSchemaUsesLosslessIdentityColumnsAndMigrationState(t *testing.T) {
-	schema := strings.Join(symbolSchemaQueries(), "\n")
+	schema := strings.Join(freshSymbolSchemaQueries(), "\n")
 	for _, required := range []string{
 		"symbol_files (project_id BYTEA", "path BYTEA",
 		"symbols (project_id BYTEA", "name BYTEA", "file BYTEA",
 		"refs (project_id BYTEA", "symbol_name BYTEA", "caller BYTEA", "caller_file BYTEA",
 		"call_edges (project_id BYTEA", "callee BYTEA",
 		"symbol_migrations (project_id BYTEA PRIMARY KEY", "source_digest BYTEA", "source_size BIGINT", "completed_at TIMESTAMPTZ",
-		"refs ADD COLUMN IF NOT EXISTS ordinal", "call_edges ADD COLUMN IF NOT EXISTS ordinal",
+		"caller_line INTEGER NOT NULL DEFAULT 0, ordinal INTEGER", "call_type TEXT NOT NULL DEFAULT '', ordinal INTEGER",
 	} {
 		if !strings.Contains(schema, required) {
 			t.Fatalf("symbol schema missing %q", required)
