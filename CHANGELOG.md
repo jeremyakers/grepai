@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Use count-only readiness checks for CLI and MCP trace/reference queries instead of calculating full PostgreSQL index statistics on every request
   - Upgrade the symbol schema to version 2 with a project/caller reference index so callee lookups stay selective on existing PostgreSQL stores
   - Keep all breadth levels and symbol lookups of a PostgreSQL call graph in the same read-only snapshot
+  - Resolve workspace callees from other loaded projects when no definition exists in their originating project, while preserving origin preference and batched lookups
 
 ## [0.37.0] - 2026-09-10
 

@@ -1357,6 +1357,7 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 		return mcp.NewToolResultText(output), nil
 	}
 	calleeSymbols := lookupSymbolsByOrigin(ctx, stores, allRefs, false, "callee")
+	crossProjectCallees := lookupMissingCalleeSymbols(ctx, stores, allRefs, calleeSymbols)
 
 	var data any
 	if compact {
@@ -1374,14 +1375,7 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 
 		for _, item := range allRefs {
 			ref := item.ref
-			calleeSyms := calleeSymbols[item.storeIndex][ref.SymbolName]
-			var calleeSym trace.Symbol
-			if len(calleeSyms) > 0 {
-				calleeSym = calleeSyms[0]
-			}
-			if calleeSym.Name == "" {
-				calleeSym = trace.Symbol{Name: ref.SymbolName}
-			}
+			calleeSym := resolveCalleeSymbol(calleeSymbols[item.storeIndex], crossProjectCallees, ref.SymbolName)
 			resultCompact.Callees = append(resultCompact.Callees, CalleeInfoCompact{
 				Symbol: calleeSym,
 				CallSite: CallSiteCompact{
@@ -1407,14 +1401,7 @@ func (s *Server) handleTraceCalleesFromStores(ctx context.Context, symbolName st
 		}
 		for _, item := range allRefs {
 			ref := item.ref
-			calleeSyms := calleeSymbols[item.storeIndex][ref.SymbolName]
-			var calleeSym trace.Symbol
-			if len(calleeSyms) > 0 {
-				calleeSym = calleeSyms[0]
-			}
-			if calleeSym.Name == "" {
-				calleeSym = trace.Symbol{Name: ref.SymbolName}
-			}
+			calleeSym := resolveCalleeSymbol(calleeSymbols[item.storeIndex], crossProjectCallees, ref.SymbolName)
 			result.Callees = append(result.Callees, trace.CalleeInfo{
 				Symbol: calleeSym,
 				CallSite: trace.CallSite{
