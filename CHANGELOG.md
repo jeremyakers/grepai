@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Read callee edges and references from one PostgreSQL snapshot so concurrent file updates cannot mix old and new results
   - Use count-only readiness checks for CLI and MCP trace/reference queries instead of calculating full PostgreSQL index statistics on every request
   - Upgrade the symbol schema to version 2 with a project/caller reference index so callee lookups stay selective on existing PostgreSQL stores
+  - Keep all breadth levels and symbol lookups of a PostgreSQL call graph in the same read-only snapshot
 
 ## [0.37.0] - 2026-09-10
 

@@ -2,11 +2,29 @@ package trace
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
-func (s *PostgresSymbolStore) GetCallGraph(ctx context.Context, symbolName string, depth int) (*CallGraph, error) {
-	graph := &CallGraph{Root: symbolName, Nodes: map[string]Symbol{}, Edges: []CallEdge{}, Depth: depth}
+func (s *PostgresSymbolStore) GetCallGraph(ctx context.Context, symbolName string, depth int) (graph *CallGraph, retErr error) {
+	graph = &CallGraph{Root: symbolName, Nodes: map[string]Symbol{}, Edges: []CallEdge{}, Depth: depth}
+	if depth < 0 {
+		return graph, nil
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin call graph snapshot transaction: %w", err)
+	}
+	defer func() {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			retErr = errors.Join(retErr, fmt.Errorf("failed to rollback call graph snapshot transaction: %w", rollbackErr))
+		}
+	}()
 	visited, edgeSeen := map[string]bool{}, map[string]bool{}
 	frontier := []string{symbolName}
 	// One edge query and one symbol batch query are issued per breadth level. A
@@ -22,7 +40,7 @@ func (s *PostgresSymbolStore) GetCallGraph(ctx context.Context, symbolName strin
 		if len(frontierIDs) == 0 {
 			break
 		}
-		edges, err := s.graphEdgesForLevel(ctx, frontierIDs, level, symbolName)
+		edges, err := s.graphEdgesForLevel(ctx, tx, frontierIDs, level, symbolName)
 		if err != nil {
 			return nil, err
 		}
@@ -31,7 +49,7 @@ func (s *PostgresSymbolStore) GetCallGraph(ctx context.Context, symbolName strin
 			edge := candidate.edge
 			names = append(names, edge.Caller, edge.Callee)
 		}
-		symbols, err := s.LookupSymbolsBatch(ctx, names)
+		symbols, err := s.lookupSymbolsBatch(ctx, tx, names)
 		if err != nil {
 			return nil, err
 		}
@@ -61,11 +79,14 @@ func (s *PostgresSymbolStore) GetCallGraph(ctx context.Context, symbolName strin
 		}
 		frontier = next
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit call graph snapshot transaction: %w", err)
+	}
 	return graph, nil
 }
 
-func (s *PostgresSymbolStore) graphEdgesForLevel(ctx context.Context, frontier [][]byte, level int, root string) ([]callEdgeCandidate, error) {
-	rows, err := s.pool.Query(ctx, `SELECT caller,callee,file,line,call_type,ordinal FROM call_edges WHERE project_id=$1 AND (caller=ANY($2::bytea[]) OR ($3=0 AND callee=$4)) ORDER BY caller,callee,file,line,call_type,ordinal`, identityBytes(s.projectID), frontier, level, identityBytes(root))
+func (s *PostgresSymbolStore) graphEdgesForLevel(ctx context.Context, q postgresQuerier, frontier [][]byte, level int, root string) ([]callEdgeCandidate, error) {
+	rows, err := q.Query(ctx, `SELECT caller,callee,file,line,call_type,ordinal FROM call_edges WHERE project_id=$1 AND (caller=ANY($2::bytea[]) OR ($3=0 AND callee=$4)) ORDER BY caller,callee,file,line,call_type,ordinal`, identityBytes(s.projectID), frontier, level, identityBytes(root))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query call graph: %w", err)
 	}

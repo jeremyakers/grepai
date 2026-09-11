@@ -18,11 +18,6 @@ type calleeSite struct {
 const calleeEdgesSQL = `SELECT caller,callee,file,line,call_type FROM call_edges WHERE project_id=$1 AND caller=$2 ORDER BY file,line,ordinal,callee`
 const calleeRefsSQL = `SELECT ` + refColumns + ` FROM refs WHERE project_id=$1 AND caller=$2 AND (ref_type=$3 OR ref_type='') ORDER BY file,line,ordinal,symbol_name`
 
-// calleeQuerier lets both queries share the same pgx transaction.
-type calleeQuerier interface {
-	Query(context.Context, string, ...any) (pgx.Rows, error)
-}
-
 // LookupCallees reads edges and references from one snapshot, so a concurrent
 // file update cannot mix generations in the returned callees.
 func (s *PostgresSymbolStore) LookupCallees(ctx context.Context, symbolName, _ string) (result []Reference, err error) {
@@ -76,7 +71,7 @@ func (s *PostgresSymbolStore) LookupCallees(ctx context.Context, symbolName, _ s
 	return result, nil
 }
 
-func (s *PostgresSymbolStore) calleeEdges(ctx context.Context, q calleeQuerier, symbolName string) ([]CallEdge, error) {
+func (s *PostgresSymbolStore) calleeEdges(ctx context.Context, q postgresQuerier, symbolName string) ([]CallEdge, error) {
 	rows, err := q.Query(ctx, calleeEdgesSQL, identityBytes(s.projectID), identityBytes(symbolName))
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup callee edges: %w", err)
@@ -95,7 +90,7 @@ func (s *PostgresSymbolStore) calleeEdges(ctx context.Context, q calleeQuerier, 
 	return edges, rows.Err()
 }
 
-func (s *PostgresSymbolStore) callRefsByCaller(ctx context.Context, q calleeQuerier, symbolName string) ([]Reference, error) {
+func (s *PostgresSymbolStore) callRefsByCaller(ctx context.Context, q postgresQuerier, symbolName string) ([]Reference, error) {
 	rows, err := q.Query(ctx, calleeRefsSQL, identityBytes(s.projectID), identityBytes(symbolName), RefKindCall)
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup callee references: %w", err)

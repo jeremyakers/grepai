@@ -10,6 +10,10 @@ import (
 const symbolColumns = `name,kind,file,line,end_line,signature,receiver,package_name,exported,language,docstring,feature_path`
 const refColumns = `symbol_name,ref_type,file,line,col,context,caller,caller_file,caller_line`
 
+type postgresQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
 func scanSymbols(rows pgx.Rows) ([]Symbol, error) {
 	result := []Symbol{}
 	for rows.Next() {
@@ -49,6 +53,10 @@ func (s *PostgresSymbolStore) LookupSymbol(ctx context.Context, name string) ([]
 }
 
 func (s *PostgresSymbolStore) LookupSymbolsBatch(ctx context.Context, names []string) (map[string][]Symbol, error) {
+	return s.lookupSymbolsBatch(ctx, s.pool, names)
+}
+
+func (s *PostgresSymbolStore) lookupSymbolsBatch(ctx context.Context, q postgresQuerier, names []string) (map[string][]Symbol, error) {
 	result := make(map[string][]Symbol)
 	if len(names) == 0 {
 		return result, nil
@@ -66,7 +74,7 @@ func (s *PostgresSymbolStore) LookupSymbolsBatch(ctx context.Context, names []st
 	for i, name := range unique {
 		identities[i] = identityBytes(name)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT `+symbolColumns+` FROM symbols WHERE project_id=$1 AND name=ANY($2::bytea[]) ORDER BY name,file,line`, identityBytes(s.projectID), identities)
+	rows, err := q.Query(ctx, `SELECT `+symbolColumns+` FROM symbols WHERE project_id=$1 AND name=ANY($2::bytea[]) ORDER BY name,file,line`, identityBytes(s.projectID), identities)
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup symbols batch: %w", err)
 	}
