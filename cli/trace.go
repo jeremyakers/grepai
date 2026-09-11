@@ -205,42 +205,15 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 
 		result := trace.TraceResult{Query: symbolName, Mode: traceMode}
 		for _, ss := range stores {
-			refs, err := ss.LookupCallers(ctx, symbolName)
+			target, callers, err := lookupCallersFromStore(ctx, ss, symbolName)
 			if err != nil {
 				log.Printf("Warning: failed to lookup callers of %q: %v", symbolName, err)
+				continue
 			}
-			symbols, err := ss.LookupSymbol(ctx, symbolName)
-			if err != nil {
-				log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
+			if target != nil && result.Symbol == nil {
+				result.Symbol = target
 			}
-			if len(symbols) > 0 && result.Symbol == nil {
-				result.Symbol = pickBestTargetSymbol(symbols, refs)
-			}
-			callerSymbols, err := ss.LookupSymbolsBatch(ctx, uniqueReferenceSymbolNames(refs, true))
-			if err != nil {
-				log.Printf("Warning: failed to lookup caller symbols: %v", err)
-			}
-			for _, ref := range refs {
-				callerSyms := callerSymbols[ref.CallerName]
-				var callerSym trace.Symbol
-				if len(callerSyms) > 0 {
-					if picked := pickBestSymbolForFile(callerSyms, ref.CallerFile); picked != nil {
-						callerSym = *picked
-					} else {
-						callerSym = callerSyms[0]
-					}
-				} else {
-					callerSym = trace.Symbol{Name: ref.CallerName, File: ref.CallerFile, Line: ref.CallerLine}
-				}
-				result.Callers = append(result.Callers, trace.CallerInfo{
-					Symbol: callerSym,
-					CallSite: trace.CallSite{
-						File:    ref.File,
-						Line:    ref.Line,
-						Context: ref.Context,
-					},
-				})
-			}
+			result.Callers = append(result.Callers, callers...)
 		}
 
 		if result.Symbol == nil {
@@ -291,59 +264,20 @@ func runTraceCallers(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("symbol index is empty. Run 'grepai watch' first to build the index")
 	}
 
-	// Lookup symbol
-	symbols, err := symbolStore.LookupSymbol(ctx, symbolName)
+	target, callers, err := lookupCallersFromStore(ctx, symbolStore, symbolName)
 	if err != nil {
-		return fmt.Errorf("failed to lookup symbol: %w", err)
+		return fmt.Errorf("failed to lookup callers: %w", err)
 	}
-
-	if len(symbols) == 0 {
+	if target == nil {
 		emptyResult := trace.TraceResult{Query: symbolName, Mode: traceMode}
 		return outputTraceResult(emptyResult, traceViewCallers)
 	}
 
-	// Find callers
-	refs, err := symbolStore.LookupCallers(ctx, symbolName)
-	if err != nil {
-		return fmt.Errorf("failed to lookup callers: %w", err)
-	}
-
-	target := pickBestTargetSymbol(symbols, refs)
-	if target == nil {
-		target = &symbols[0]
-	}
-
 	result := trace.TraceResult{
-		Query:  symbolName,
-		Mode:   traceMode,
-		Symbol: target,
-	}
-
-	// Convert refs to CallerInfo
-	callerSymbols, err := symbolStore.LookupSymbolsBatch(ctx, uniqueReferenceSymbolNames(refs, true))
-	if err != nil {
-		log.Printf("Warning: failed to lookup caller symbols: %v", err)
-	}
-	for _, ref := range refs {
-		callerSyms := callerSymbols[ref.CallerName]
-		var callerSym trace.Symbol
-		if len(callerSyms) > 0 {
-			if picked := pickBestSymbolForFile(callerSyms, ref.CallerFile); picked != nil {
-				callerSym = *picked
-			} else {
-				callerSym = callerSyms[0]
-			}
-		} else {
-			callerSym = trace.Symbol{Name: ref.CallerName, File: ref.CallerFile, Line: ref.CallerLine}
-		}
-		result.Callers = append(result.Callers, trace.CallerInfo{
-			Symbol: callerSym,
-			CallSite: trace.CallSite{
-				File:    ref.File,
-				Line:    ref.Line,
-				Context: ref.Context,
-			},
-		})
+		Query:   symbolName,
+		Mode:    traceMode,
+		Symbol:  target,
+		Callers: callers,
 	}
 
 	// Enrich with RPG feature paths

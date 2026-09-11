@@ -94,7 +94,7 @@ func (s *PostgresSymbolStore) lookupSymbolsBatch(ctx context.Context, q postgres
 	return result, nil
 }
 
-func (s *PostgresSymbolStore) lookupRefs(ctx context.Context, symbolName, kind string) ([]Reference, error) {
+func (s *PostgresSymbolStore) lookupRefs(ctx context.Context, q postgresQuerier, symbolName, kind string) ([]Reference, error) {
 	query := `SELECT ` + refColumns + ` FROM refs WHERE project_id=$1 AND symbol_name=$2`
 	args := []any{identityBytes(s.projectID), identityBytes(symbolName)}
 	if kind == RefKindCall {
@@ -105,7 +105,7 @@ func (s *PostgresSymbolStore) lookupRefs(ctx context.Context, symbolName, kind s
 		args = append(args, kind)
 	}
 	query += ` ORDER BY file,line,ordinal`
-	rows, err := s.pool.Query(ctx, query, args...)
+	rows, err := q.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup references: %w", err)
 	}
@@ -114,13 +114,13 @@ func (s *PostgresSymbolStore) lookupRefs(ctx context.Context, symbolName, kind s
 }
 
 func (s *PostgresSymbolStore) LookupCallers(ctx context.Context, symbolName string) ([]Reference, error) {
-	return s.lookupRefs(ctx, symbolName, RefKindCall)
+	return s.lookupRefs(ctx, s.pool, symbolName, RefKindCall)
 }
 func (s *PostgresSymbolStore) LookupReaders(ctx context.Context, symbolName string) ([]Reference, error) {
-	return s.lookupRefs(ctx, symbolName, RefKindRead)
+	return s.lookupRefs(ctx, s.pool, symbolName, RefKindRead)
 }
 func (s *PostgresSymbolStore) LookupWriters(ctx context.Context, symbolName string) ([]Reference, error) {
-	return s.lookupRefs(ctx, symbolName, RefKindWrite)
+	return s.lookupRefs(ctx, s.pool, symbolName, RefKindWrite)
 }
 
 func (s *PostgresSymbolStore) GetSymbolsForFile(ctx context.Context, filePath string) ([]Symbol, error) {

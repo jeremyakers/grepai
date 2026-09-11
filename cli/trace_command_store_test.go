@@ -15,6 +15,31 @@ import (
 	"github.com/yoanbernabeu/grepai/trace"
 )
 
+type compoundCLIStore struct {
+	trace.SymbolStore
+	result trace.CallerLookupResult
+	called int
+}
+
+func (s *compoundCLIStore) LookupCallerResult(context.Context, string) (trace.CallerLookupResult, error) {
+	s.called++
+	return s.result, nil
+}
+
+func TestTraceCallersStoreLookupRoutesThroughCompoundCapability(t *testing.T) {
+	store := &compoundCLIStore{result: trace.CallerLookupResult{
+		Symbols: map[string][]trace.Symbol{
+			"Target": {{Name: "Target", File: "target.go"}},
+			"Caller": {{Name: "Caller", File: "caller.go"}},
+		},
+		References: []trace.Reference{{SymbolName: "Target", CallerName: "Caller", CallerFile: "caller.go", File: "use.go", Line: 2}},
+	}}
+	target, callers, err := lookupCallersFromStore(context.Background(), store, "Target")
+	if err != nil || store.called != 1 || target == nil || target.File != "target.go" || len(callers) != 1 || callers[0].Symbol.File != "caller.go" {
+		t.Fatalf("compound route target=%#v callers=%#v called=%d err=%v", target, callers, store.called, err)
+	}
+}
+
 func captureCommandStdout(t *testing.T, run func() error) (string, error) {
 	t.Helper()
 	old := os.Stdout

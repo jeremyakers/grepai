@@ -1165,21 +1165,21 @@ func (s *Server) handleTraceCallersFromStores(ctx context.Context, symbolName st
 	// Aggregate results across stores
 	var firstSymbol *trace.Symbol
 	var allRefs []storeReference
+	callerSymbols := make([]map[string][]trace.Symbol, len(stores))
 
 	for storeIndex, ss := range stores {
-		symbols, err := ss.LookupSymbol(ctx, symbolName)
+		lookup, err := trace.LookupCallerResult(ctx, ss, symbolName)
 		if err != nil {
-			log.Printf("Warning: failed to lookup symbol %q: %v", symbolName, err)
+			log.Printf("Warning: failed to lookup callers of %q: %v", symbolName, err)
+			continue
 		}
+		symbols := lookup.Symbols[symbolName]
 		if len(symbols) > 0 && firstSymbol == nil {
 			sym := symbols[0]
 			firstSymbol = &sym
 		}
-		refs, err := ss.LookupCallers(ctx, symbolName)
-		if err != nil {
-			log.Printf("Warning: failed to lookup callers of %q: %v", symbolName, err)
-		}
-		for _, ref := range refs {
+		callerSymbols[storeIndex] = lookup.Symbols
+		for _, ref := range lookup.References {
 			allRefs = append(allRefs, storeReference{ref: ref, storeIndex: storeIndex})
 		}
 	}
@@ -1192,8 +1192,6 @@ func (s *Server) handleTraceCallersFromStores(ctx context.Context, symbolName st
 		}
 		return mcp.NewToolResultText(output), nil
 	}
-	callerSymbols := lookupSymbolsByOrigin(ctx, stores, allRefs, true, "caller")
-
 	var data any
 	if compact {
 		resultCompact := struct {

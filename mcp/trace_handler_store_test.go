@@ -148,6 +148,35 @@ type countingBatchSymbolStore struct {
 	batchNames  []string
 }
 
+type compoundMCPStore struct {
+	trace.SymbolStore
+	result trace.CallerLookupResult
+	called int
+}
+
+func (s *compoundMCPStore) LookupCallerResult(context.Context, string) (trace.CallerLookupResult, error) {
+	s.called++
+	return s.result, nil
+}
+
+func TestTraceCallersHandlerRoutesThroughCompoundCapability(t *testing.T) {
+	store := &compoundMCPStore{result: trace.CallerLookupResult{
+		Symbols: map[string][]trace.Symbol{
+			"Target": {{Name: "Target", File: "target.go"}},
+			"Caller": {{Name: "Caller", File: "caller.go"}},
+		},
+		References: []trace.Reference{{SymbolName: "Target", CallerName: "Caller", CallerFile: "caller.go", File: "use.go", Line: 2}},
+	}}
+	server := &Server{}
+	result, err := server.handleTraceCallersFromStores(context.Background(), "Target", false, "json", []trace.SymbolStore{store})
+	if err != nil || store.called != 1 {
+		t.Fatalf("compound calls=%d err=%v", store.called, err)
+	}
+	if output := textResultPayload(t, result); !containsMCPParts(output, "target.go", "caller.go", "use.go") {
+		t.Fatalf("compound handler output = %s", output)
+	}
+}
+
 func (s *countingBatchSymbolStore) LookupSymbolsBatch(_ context.Context, names []string) (map[string][]trace.Symbol, error) {
 	s.batchCalls++
 	s.batchNames = append([]string(nil), names...)
