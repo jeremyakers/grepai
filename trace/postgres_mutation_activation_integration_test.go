@@ -105,6 +105,12 @@ func TestPostgresMutationActivationLockPreventsMarkerRemoval(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("marker removal while mutation holds activation lock = %v", err)
 	}
+	stateCtx, stateCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer stateCancel()
+	_, err = store.pool.Exec(stateCtx, `UPDATE symbol_migrations SET state='migrating' WHERE project_id=$1`, identityBytes(store.projectID))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("activation state change while mutation holds lock = %v", err)
+	}
 	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}

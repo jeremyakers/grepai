@@ -3,6 +3,7 @@ package trace
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/jackc/pgx/v5"
@@ -16,7 +17,7 @@ func freshSymbolSchemaQueries() []string {
 		`CREATE TABLE symbols (project_id BYTEA NOT NULL, name BYTEA NOT NULL, file BYTEA NOT NULL, line INTEGER NOT NULL, end_line INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL, signature TEXT NOT NULL DEFAULT '', receiver TEXT NOT NULL DEFAULT '', package_name TEXT NOT NULL DEFAULT '', exported BOOLEAN NOT NULL DEFAULT FALSE, language TEXT NOT NULL DEFAULT '', docstring TEXT NOT NULL DEFAULT '', feature_path TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE refs (project_id BYTEA NOT NULL, symbol_name BYTEA NOT NULL, file BYTEA NOT NULL, line INTEGER NOT NULL, col INTEGER NOT NULL DEFAULT 0, ref_type TEXT NOT NULL DEFAULT '', context TEXT NOT NULL DEFAULT '', caller BYTEA NOT NULL DEFAULT ''::bytea, caller_file BYTEA NOT NULL DEFAULT ''::bytea, caller_line INTEGER NOT NULL DEFAULT 0, ordinal INTEGER NOT NULL DEFAULT 0)`,
 		`CREATE TABLE call_edges (project_id BYTEA NOT NULL, caller BYTEA NOT NULL, callee BYTEA NOT NULL, file BYTEA NOT NULL, line INTEGER NOT NULL, call_type TEXT NOT NULL DEFAULT '', ordinal INTEGER NOT NULL DEFAULT 0)`,
-		`CREATE TABLE symbol_migrations (project_id BYTEA PRIMARY KEY, state TEXT NOT NULL, source_path BYTEA NOT NULL, source_digest BYTEA, source_size BIGINT, started_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ)`,
+		`CREATE TABLE symbol_migrations (project_id BYTEA PRIMARY KEY, state TEXT NOT NULL, source_path BYTEA NOT NULL, source_digest BYTEA, source_size BIGINT, started_at TIMESTAMPTZ NOT NULL, completed_at TIMESTAMPTZ, last_mutation_at TIMESTAMPTZ NOT NULL)`,
 		`CREATE TABLE symbol_store_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL)`,
 	}
 }
@@ -66,6 +67,8 @@ func symbolSchemaPlan(schema string, inv symbolSchemaInventory, ownership symbol
 		return append(queries, missingIndexQueries(schema, inv)...)
 	}
 	var queries []string
+	setCallerDefault := false
+	setCallerFileDefault := false
 	tables := make([]string, 0, len(identityColumns))
 	for table := range identityColumns {
 		tables = append(tables, table)
@@ -85,13 +88,18 @@ func symbolSchemaPlan(schema string, inv symbolSchemaInventory, ownership symbol
 					queries = append(queries,
 						`ALTER TABLE `+qualified+` ALTER COLUMN `+identifier+` DROP DEFAULT`,
 						`ALTER TABLE `+qualified+` ALTER COLUMN `+identifier+` TYPE BYTEA USING convert_to(`+identifier+`, 'UTF8')`)
+					setCallerDefault = setCallerDefault || table == "refs" && name == "caller"
+					setCallerFileDefault = setCallerFileDefault || table == "refs" && name == "caller_file"
 				}
 			}
 		}
 	}
-	queries = append(queries,
-		`ALTER TABLE `+pgx.Identifier{schema, "refs"}.Sanitize()+` ALTER COLUMN caller SET DEFAULT ''::bytea`,
-		`ALTER TABLE `+pgx.Identifier{schema, "refs"}.Sanitize()+` ALTER COLUMN caller_file SET DEFAULT ''::bytea`)
+	if setCallerDefault {
+		queries = append(queries, `ALTER TABLE `+pgx.Identifier{schema, "refs"}.Sanitize()+` ALTER COLUMN caller SET DEFAULT ''::bytea`)
+	}
+	if setCallerFileDefault {
+		queries = append(queries, `ALTER TABLE `+pgx.Identifier{schema, "refs"}.Sanitize()+` ALTER COLUMN caller_file SET DEFAULT ''::bytea`)
+	}
 	if table, ok := inv.tables["refs"]; ok && !hasSchemaColumn(table, "ordinal") {
 		queries = append(queries, `ALTER TABLE `+pgx.Identifier{schema, "refs"}.Sanitize()+` ADD COLUMN ordinal INTEGER NOT NULL DEFAULT 0`)
 	}
@@ -105,6 +113,14 @@ func symbolSchemaPlan(schema string, inv symbolSchemaInventory, ownership symbol
 		if !hasSchemaColumn(table, "source_size") {
 			queries = append(queries, `ALTER TABLE `+pgx.Identifier{schema, "symbol_migrations"}.Sanitize()+` ADD COLUMN source_size BIGINT`)
 		}
+		if !hasSchemaColumn(table, "last_mutation_at") {
+			migrationTable := pgx.Identifier{schema, "symbol_migrations"}.Sanitize()
+			filesTable := pgx.Identifier{schema, "symbol_files"}.Sanitize()
+			queries = append(queries,
+				`ALTER TABLE `+migrationTable+` ADD COLUMN last_mutation_at TIMESTAMPTZ`,
+				`UPDATE `+migrationTable+` m SET last_mutation_at=COALESCE((SELECT MAX(f.mod_time) FROM `+filesTable+` f WHERE f.project_id=m.project_id),m.completed_at,m.started_at,clock_timestamp()) WHERE last_mutation_at IS NULL`,
+				`ALTER TABLE `+migrationTable+` ALTER COLUMN last_mutation_at SET NOT NULL`)
+		}
 	} else {
 		queries = append(queries, qualifiedSchemaQueries(schema)[4])
 	}
@@ -113,6 +129,24 @@ func symbolSchemaPlan(schema string, inv symbolSchemaInventory, ownership symbol
 	}
 	queries = append(queries, missingIndexQueries(schema, inv)...)
 	return queries
+}
+
+func symbolMigrationNeedsDDL(inv symbolSchemaInventory) bool {
+	table, ok := inv.tables["symbol_migrations"]
+	if !ok {
+		return false
+	}
+	for _, name := range []string{"source_digest", "source_size", "last_mutation_at"} {
+		if !hasSchemaColumn(table, name) {
+			return true
+		}
+	}
+	for _, column := range table.columns {
+		if slices.Contains(identityColumns["symbol_migrations"], column.name) && column.typeOID == pgtype.TextOID {
+			return true
+		}
+	}
+	return false
 }
 
 func hasSchemaColumn(table schemaTable, name string) bool {
@@ -130,7 +164,11 @@ func missingIndexQueries(schema string, inv symbolSchemaInventory) []string {
 		if _, ok := inv.indexes[spec.name]; ok {
 			continue
 		}
-		queries = append(queries, `CREATE INDEX `+pgx.Identifier{spec.name}.Sanitize()+` ON `+
+		create := "CREATE INDEX "
+		if spec.unique {
+			create = "CREATE UNIQUE INDEX "
+		}
+		queries = append(queries, create+pgx.Identifier{spec.name}.Sanitize()+` ON `+
 			pgx.Identifier{schema, spec.table}.Sanitize()+` (`+joinIdentifiers(spec.columns)+`)`)
 	}
 	return queries

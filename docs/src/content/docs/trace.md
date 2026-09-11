@@ -197,6 +197,8 @@ Only migrate trusted local GOB caches. The fixed cache format is not a resource-
 
 Migration decodes the source GOB in memory, but regroups row values only for the current batch of up to 500 files and releases consumed entries. It does not keep extra whole-index symbol and reference copies. The file-count batch limit is not a fixed byte limit; large individual files and the decoded source still require memory. Batch-wise rescanning trades some CPU time for lower peak memory.
 
+Symbol schema v3 records per-project mutation time in the same transaction as successful file changes. Deleting the newest or final file therefore keeps an accurate freshness timestamp; failed changes and deletion of a nonexistent file do not advance it. Statistics are read from one database snapshot. Upgrades backfill the best available saved-file or activation time, but cannot reconstruct historical deletion times that older schemas never recorded.
+
 Postgres stores project, path, filename, and symbol identity values as raw bytes. This preserves unusual filesystem names exactly; invalid UTF-8 is replaced only in display-oriented text such as signatures, documentation, and reference context.
 
 ### How It Works

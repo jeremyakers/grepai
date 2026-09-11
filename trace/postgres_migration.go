@@ -93,7 +93,7 @@ func (s *PostgresSymbolStore) migrateGOBIfNeeded(ctx context.Context) (retErr er
 		if status.state != "" {
 			return fmt.Errorf("incomplete Postgres symbol migration has no source GOB file to retry")
 		}
-		if _, err := conn.Exec(ctx, `INSERT INTO symbol_migrations(project_id,state,source_path,source_digest,source_size,started_at,completed_at) VALUES($1,'completed',$2,NULL,NULL,NOW(),NOW())`, identityBytes(s.projectID), identityBytes(path)); err != nil {
+		if _, err := conn.Exec(ctx, `INSERT INTO symbol_migrations(project_id,state,source_path,source_digest,source_size,started_at,completed_at,last_mutation_at) VALUES($1,'completed',$2,NULL,NULL,NOW(),NOW(),clock_timestamp())`, identityBytes(s.projectID), identityBytes(path)); err != nil {
 			return fmt.Errorf("failed to activate empty Postgres symbol store: %w", err)
 		}
 		return nil
@@ -110,7 +110,7 @@ func (s *PostgresSymbolStore) migrateGOBIfNeeded(ctx context.Context) (retErr er
 	if !loaded {
 		return nil
 	}
-	if _, err := conn.Exec(ctx, `INSERT INTO symbol_migrations(project_id,state,source_path,source_digest,source_size,started_at,completed_at) VALUES($1,'migrating',$2,$3,$4,NOW(),NULL) ON CONFLICT(project_id) DO UPDATE SET state='migrating',source_path=EXCLUDED.source_path,source_digest=EXCLUDED.source_digest,source_size=EXCLUDED.source_size,started_at=EXCLUDED.started_at,completed_at=NULL`, identityBytes(s.projectID), identityBytes(path), fingerprint.digest, fingerprint.size); err != nil {
+	if _, err := conn.Exec(ctx, `INSERT INTO symbol_migrations(project_id,state,source_path,source_digest,source_size,started_at,completed_at,last_mutation_at) VALUES($1,'migrating',$2,$3,$4,NOW(),NULL,clock_timestamp()) ON CONFLICT(project_id) DO UPDATE SET state='migrating',source_path=EXCLUDED.source_path,source_digest=EXCLUDED.source_digest,source_size=EXCLUDED.source_size,started_at=EXCLUDED.started_at,completed_at=NULL,last_mutation_at=EXCLUDED.last_mutation_at`, identityBytes(s.projectID), identityBytes(path), fingerprint.digest, fingerprint.size); err != nil {
 		return fmt.Errorf("failed to record symbol migration start: %w", err)
 	}
 	if err := s.importGOBSnapshot(ctx, conn, gobStore, fingerprint); err != nil {
@@ -146,7 +146,7 @@ func (s *PostgresSymbolStore) importGOBSnapshot(ctx context.Context, conn *pgxpo
 		done, total := iterator.progress()
 		log.Printf("trace: Postgres symbol migration progress: %d/%d files, batch %d, elapsed %s", done, total, batch+1, time.Since(started).Round(time.Second)) // #nosec G706 -- only integer counts and a computed duration are formatted, never input text.
 	}
-	if _, err := tx.Exec(ctx, `UPDATE symbol_migrations SET state='completed',source_digest=$2,source_size=$3,completed_at=NOW() WHERE project_id=$1`, identityBytes(s.projectID), fingerprint.digest, fingerprint.size); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE symbol_migrations SET state='completed',source_digest=$2,source_size=$3,completed_at=NOW(),last_mutation_at=clock_timestamp() WHERE project_id=$1`, identityBytes(s.projectID), fingerprint.digest, fingerprint.size); err != nil {
 		return rollbackMigration(tx, fmt.Errorf("failed to complete symbol migration marker: %w", err))
 	}
 	if err := tx.Commit(ctx); err != nil {

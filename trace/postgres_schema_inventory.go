@@ -167,7 +167,7 @@ func (inv symbolSchemaInventory) validateIndexes() error {
 		if !ok {
 			continue
 		}
-		if index.table != spec.table || index.method != "btree" || !index.valid || !index.ready || index.unique || index.expression || !slices.Equal(index.columns, spec.columns) {
+		if index.table != spec.table || index.method != "btree" || !index.valid || !index.ready || index.unique != spec.unique || index.expression || !slices.Equal(index.columns, spec.columns) {
 			return fmt.Errorf("reserved symbol index %q has incompatible owner or definition", spec.name)
 		}
 	}

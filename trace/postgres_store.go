@@ -24,57 +24,6 @@ type PostgresSymbolStore struct {
 	schemaDDLHook      func(int, string) error
 }
 
-func NewPostgresSymbolStore(ctx context.Context, dsn, projectID, projectRoot string) (*PostgresSymbolStore, error) {
-	poolConfig, err := pgxpool.ParseConfig(dsn)
-	if err != nil {
-		return nil, fmt.Errorf("failed to configure postgres: %w", err)
-	}
-	return newPostgresSymbolStoreWithPoolConfig(ctx, poolConfig, projectID, projectRoot)
-}
-
-func newPostgresSymbolStoreWithPoolConfig(ctx context.Context, poolConfig *pgxpool.Config, projectID, projectRoot string) (*PostgresSymbolStore, error) {
-	probe, err := pgxpool.NewWithConfig(ctx, poolConfig.Copy())
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
-	}
-	var schema string
-	if err := probe.QueryRow(ctx, `SELECT current_schema()`).Scan(&schema); err != nil {
-		probe.Close()
-		return nil, fmt.Errorf("failed to resolve postgres symbol schema: %w", err)
-	}
-	probe.Close()
-	if schema == "" {
-		return nil, fmt.Errorf("failed to resolve postgres symbol schema: current_schema is null")
-	}
-
-	pinned := poolConfig.Copy()
-	if pinned.ConnConfig.RuntimeParams == nil {
-		pinned.ConnConfig.RuntimeParams = make(map[string]string)
-	}
-	searchPath := pgx.Identifier{schema}.Sanitize()
-	pinned.ConnConfig.RuntimeParams["search_path"] = searchPath
-	afterConnect := pinned.AfterConnect
-	pinned.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
-		if afterConnect != nil {
-			if err := afterConnect(ctx, conn); err != nil {
-				return err
-			}
-		}
-		_, err := conn.Exec(ctx, `SET search_path TO `+searchPath)
-		return err
-	}
-	pool, err := pgxpool.NewWithConfig(ctx, pinned)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to postgres: %w", err)
-	}
-	s := &PostgresSymbolStore{pool: pool, schema: schema, projectID: projectID, projectRoot: projectRoot}
-	if err := s.ensureSchema(ctx); err != nil {
-		pool.Close()
-		return nil, err
-	}
-	return s, nil
-}
-
 // SaveFile requires Load to have activated this project in the database before
 // the first mutation.
 func (s *PostgresSymbolStore) SaveFile(ctx context.Context, filePath string, symbols []Symbol, refs []Reference) error {
@@ -104,13 +53,16 @@ func (s *PostgresSymbolStore) saveFile(ctx context.Context, filePath, contentHas
 			retErr = errors.Join(retErr, fmt.Errorf("failed to rollback symbol file transaction: %w", rollbackErr))
 		}
 	}()
-	if err := s.lockFileMutation(ctx, tx, "save", filePath); err != nil {
-		return err
-	}
 	if err := s.requireProjectActivation(ctx, tx, "save"); err != nil {
 		return err
 	}
+	if err := s.lockFileMutation(ctx, tx, "save", filePath); err != nil {
+		return err
+	}
 	if err := s.saveFileTx(ctx, tx, filePath, contentHash, extractorVersion, symbols, refs); err != nil {
+		return err
+	}
+	if err := s.recordProjectMutation(ctx, tx); err != nil {
 		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -129,7 +81,7 @@ func (s *PostgresSymbolStore) saveFileTx(ctx context.Context, tx pgx.Tx, filePat
 			return fmt.Errorf("failed to read existing extractor version: %w", err)
 		}
 	}
-	if err := s.deleteFileTx(ctx, tx, filePath); err != nil {
+	if _, err := s.deleteFileTx(ctx, tx, filePath); err != nil {
 		return err
 	}
 	rows := buildPostgresFileRows(s.projectID, filePath, contentHash, version, symbols, refs, time.Now().UTC())
@@ -159,14 +111,20 @@ func (s *PostgresSymbolStore) DeleteFile(ctx context.Context, filePath string) (
 			retErr = errors.Join(retErr, fmt.Errorf("failed to rollback delete transaction: %w", rollbackErr))
 		}
 	}()
-	if err := s.lockFileMutation(ctx, tx, "delete", filePath); err != nil {
-		return err
-	}
 	if err := s.requireProjectActivation(ctx, tx, "delete"); err != nil {
 		return err
 	}
-	if err := s.deleteFileTx(ctx, tx, filePath); err != nil {
+	if err := s.lockFileMutation(ctx, tx, "delete", filePath); err != nil {
 		return err
+	}
+	deleted, err := s.deleteFileTx(ctx, tx, filePath)
+	if err != nil {
+		return err
+	}
+	if deleted {
+		if err := s.recordProjectMutation(ctx, tx); err != nil {
+			return err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("failed to commit delete transaction: %w", err)
@@ -174,13 +132,16 @@ func (s *PostgresSymbolStore) DeleteFile(ctx context.Context, filePath string) (
 	return nil
 }
 
-func (s *PostgresSymbolStore) deleteFileTx(ctx context.Context, tx pgx.Tx, filePath string) error {
+func (s *PostgresSymbolStore) deleteFileTx(ctx context.Context, tx pgx.Tx, filePath string) (bool, error) {
+	deleted := false
 	for _, query := range []string{`DELETE FROM symbols WHERE project_id=$1 AND file=$2`, `DELETE FROM refs WHERE project_id=$1 AND file=$2`, `DELETE FROM call_edges WHERE project_id=$1 AND file=$2`, `DELETE FROM symbol_files WHERE project_id=$1 AND path=$2`} {
-		if _, err := tx.Exec(ctx, query, identityBytes(s.projectID), identityBytes(filePath)); err != nil {
-			return fmt.Errorf("failed to delete symbol file data: %w", err)
+		tag, err := tx.Exec(ctx, query, identityBytes(s.projectID), identityBytes(filePath))
+		if err != nil {
+			return false, fmt.Errorf("failed to delete symbol file data: %w", err)
 		}
+		deleted = deleted || tag.RowsAffected() != 0
 	}
-	return nil
+	return deleted, nil
 }
 
 func (s *PostgresSymbolStore) IsFileIndexed(filePath string) bool {

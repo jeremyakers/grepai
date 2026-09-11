@@ -117,6 +117,9 @@ func TestPostgresSymbolSchemaExistingTablesWithoutMarkerInitializeOnce(t *testin
 func TestPostgresSymbolSchemaStaleVersionUpgradesLast(t *testing.T) {
 	store := newIsolatedSchemaStore(t, isolatedSymbolSchemaConfig(t))
 	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `ALTER TABLE symbol_migrations DROP COLUMN last_mutation_at`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.pool.Exec(ctx, `UPDATE symbol_store_meta SET value=0 WHERE key='schema_version'`); err != nil {
 		t.Fatal(err)
 	}
@@ -167,6 +170,9 @@ func TestPostgresSymbolSchemaConcurrentFirstConstructors(t *testing.T) {
 func TestPostgresSymbolSchemaDDLFailureDoesNotAdvanceVersion(t *testing.T) {
 	store := newIsolatedSchemaStore(t, isolatedSymbolSchemaConfig(t))
 	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `ALTER TABLE symbol_migrations DROP COLUMN last_mutation_at`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.pool.Exec(ctx, `UPDATE symbol_store_meta SET value=0 WHERE key='schema_version'`); err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +208,7 @@ func truncateSymbolTables(t *testing.T, store *PostgresSymbolStore) {
 
 func activateSymbolProject(t *testing.T, store *PostgresSymbolStore) {
 	t.Helper()
-	if _, err := store.pool.Exec(context.Background(), `INSERT INTO symbol_migrations(project_id,state,source_path,started_at,completed_at) VALUES($1,'completed',$2,NOW(),NOW())`, identityBytes(store.projectID), identityBytes(config.GetSymbolIndexPath(store.projectRoot))); err != nil {
+	if _, err := store.pool.Exec(context.Background(), `INSERT INTO symbol_migrations(project_id,state,source_path,started_at,completed_at,last_mutation_at) VALUES($1,'completed',$2,NOW(),NOW(),clock_timestamp())`, identityBytes(store.projectID), identityBytes(config.GetSymbolIndexPath(store.projectRoot))); err != nil {
 		t.Fatalf("failed to activate Postgres symbol test project: %v", err)
 	}
 }

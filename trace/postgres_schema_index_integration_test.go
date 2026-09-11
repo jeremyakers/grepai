@@ -47,8 +47,8 @@ func TestPostgresSymbolSchemaVersionOneAddsRefsCallerIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { upgraded.Close() })
-	if got := storedSchemaVersion(t, upgraded); got != 2 {
-		t.Fatalf("upgraded schema version=%d, want 2", got)
+	if got := storedSchemaVersion(t, upgraded); got != currentSymbolSchemaVersion {
+		t.Fatalf("upgraded schema version=%d, want %d", got, currentSymbolSchemaVersion)
 	}
 	requireRefsCallerIndex(t, upgraded)
 }

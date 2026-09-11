@@ -33,7 +33,7 @@ func (*PostgresSymbolStoreActivationRequiredError) Unwrap() error {
 
 func (s *PostgresSymbolStore) requireProjectActivation(ctx context.Context, tx pgx.Tx, operation string) error {
 	var state string
-	err := tx.QueryRow(ctx, `SELECT state FROM symbol_migrations WHERE project_id=$1 FOR SHARE`, identityBytes(s.projectID)).Scan(&state)
+	err := tx.QueryRow(ctx, `SELECT state FROM symbol_migrations WHERE project_id=$1 FOR KEY SHARE`, identityBytes(s.projectID)).Scan(&state)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return &PostgresSymbolStoreActivationRequiredError{ProjectID: s.projectID, Operation: operation}
 	}
@@ -42,6 +42,13 @@ func (s *PostgresSymbolStore) requireProjectActivation(ctx context.Context, tx p
 	}
 	if state != "completed" {
 		return &PostgresSymbolStoreActivationRequiredError{ProjectID: s.projectID, Operation: operation, State: state}
+	}
+	return nil
+}
+
+func (s *PostgresSymbolStore) recordProjectMutation(ctx context.Context, tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, `UPDATE symbol_migrations SET last_mutation_at=clock_timestamp() WHERE project_id=$1`, identityBytes(s.projectID)); err != nil {
+		return fmt.Errorf("failed to record PostgreSQL symbol mutation: %w", err)
 	}
 	return nil
 }

@@ -11,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const currentSymbolSchemaVersion = 2
+const currentSymbolSchemaVersion = 3
 const symbolSchemaVersionQuery = `SELECT value FROM symbol_store_meta WHERE key='schema_version'`
 
 // ErrSymbolSchemaVersionTooNew marks a symbol store whose stored schema
@@ -108,12 +108,12 @@ func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) (retErr error) {
 			return tx.Commit(ctx)
 		}
 	}
-	ownership, err := classifySymbolSchema(inv, markerPresent)
+	ownership, err := classifySymbolSchema(inv, markerPresent, version)
 	if err != nil {
 		return err
 	}
 	if ownership != symbolSchemaFresh {
-		if err := lockOwnedSymbolTables(ctx, tx, s.schema, inv); err != nil {
+		if err := lockOwnedSymbolTables(ctx, tx, s.schema, inv, symbolMigrationNeedsDDL(inv)); err != nil {
 			return err
 		}
 		inv, err = inspectSymbolSchema(ctx, tx, s.schema)
@@ -135,7 +135,7 @@ func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) (retErr error) {
 				return tx.Commit(ctx)
 			}
 		}
-		ownership, err = classifySymbolSchema(inv, markerPresent)
+		ownership, err = classifySymbolSchema(inv, markerPresent, version)
 		if err != nil {
 			return err
 		}
@@ -213,28 +213,26 @@ func inspectSchemaMarker(ctx context.Context, tx pgx.Tx, inv symbolSchemaInvento
 	return true, version, nil
 }
 
-// symbolTableLockOrder is the mutation-consistent schema lock order. The
-// data tables follow the exact row-mutation order of saveFileTx/deleteFileTx
-// and copyPostgresRows (symbols -> refs -> call_edges -> symbol_files), so a
-// schema repair blocked on an earlier-mutated table never already holds a
-// later-mutated one — the cycle the previous alphabetical order created
-// against a concurrent writer (repair held refs/call_edges while waiting on
-// symbols; writer held symbols while waiting on refs). Metadata tables come
-// last: mutation flows touch them only through the FOR SHARE activation
-// read, which stays compatible with SHARE ROW EXCLUSIVE. This order is
-// deliberately local to locking; reservedSymbolTables keeps its own order
-// because fresh-schema creation queries depend on it.
+// symbolTableLockOrder follows the mutation hierarchy: project metadata first,
+// then data tables in their exact write order. Metadata upgrades therefore
+// wait for old and new writers before holding any data-table lock.
 var symbolTableLockOrder = []string{
-	"symbols", "refs", "call_edges", "symbol_files",
-	"symbol_migrations", "symbol_store_meta",
+	"symbol_migrations", "symbols", "refs", "call_edges", "symbol_files", "symbol_store_meta",
 }
 
-func lockOwnedSymbolTables(ctx context.Context, tx pgx.Tx, schema string, inv symbolSchemaInventory) error {
+func lockOwnedSymbolTables(ctx context.Context, tx pgx.Tx, schema string, inv symbolSchemaInventory, migrationMetadataExclusive bool) error {
 	for _, name := range symbolTableLockOrder {
 		if _, ok := inv.tables[name]; !ok {
 			continue
 		}
-		if _, err := tx.Exec(ctx, `LOCK TABLE `+pgx.Identifier{schema, name}.Sanitize()+` IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		mode := "SHARE ROW EXCLUSIVE"
+		if name == "symbol_migrations" {
+			mode = "ROW SHARE"
+			if migrationMetadataExclusive {
+				mode = "ACCESS EXCLUSIVE"
+			}
+		}
+		if _, err := tx.Exec(ctx, `LOCK TABLE `+pgx.Identifier{schema, name}.Sanitize()+` IN `+mode+` MODE`); err != nil {
 			return fmt.Errorf("failed to lock owned symbol table %q: %w", name, err)
 		}
 	}

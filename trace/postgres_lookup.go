@@ -166,19 +166,20 @@ func (s *PostgresSymbolStore) CountSymbols(ctx context.Context) (int, error) {
 func (s *PostgresSymbolStore) GetStats(ctx context.Context) (*SymbolStats, error) {
 	var stats SymbolStats
 	projectID := identityBytes(s.projectID)
-	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM symbols WHERE project_id=$1`, projectID).Scan(&stats.TotalSymbols); err != nil {
-		return nil, err
-	}
-	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM refs WHERE project_id=$1`, projectID).Scan(&stats.TotalReferences); err != nil {
-		return nil, err
-	}
-	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*),COALESCE(MAX(mod_time),'1970-01-01'::timestamptz) FROM symbol_files WHERE project_id=$1`, projectID).Scan(&stats.TotalFiles, &stats.LastUpdated); err != nil {
-		return nil, err
-	}
-	// Logical row bytes provide a project-scoped estimate without counting
-	// unrelated tenants or global table/index overhead.
-	if err := s.pool.QueryRow(ctx, `SELECT COALESCE((SELECT SUM(pg_column_size(t)) FROM symbols t WHERE project_id=$1),0)+COALESCE((SELECT SUM(pg_column_size(t)) FROM refs t WHERE project_id=$1),0)+COALESCE((SELECT SUM(pg_column_size(t)) FROM call_edges t WHERE project_id=$1),0)+COALESCE((SELECT SUM(pg_column_size(t)) FROM symbol_files t WHERE project_id=$1),0)`, projectID).Scan(&stats.IndexSize); err != nil {
-		return nil, err
+	// One statement gives one PostgreSQL snapshot. Unactivated projects have
+	// epoch LastUpdated; activated empty projects retain their activation time.
+	err := s.pool.QueryRow(ctx, `SELECT
+		(SELECT COUNT(*) FROM symbols WHERE project_id=$1),
+		(SELECT COUNT(*) FROM refs WHERE project_id=$1),
+		(SELECT COUNT(*) FROM symbol_files WHERE project_id=$1),
+		COALESCE((SELECT SUM(pg_column_size(t)) FROM symbols t WHERE project_id=$1),0)+
+		COALESCE((SELECT SUM(pg_column_size(t)) FROM refs t WHERE project_id=$1),0)+
+		COALESCE((SELECT SUM(pg_column_size(t)) FROM call_edges t WHERE project_id=$1),0)+
+		COALESCE((SELECT SUM(pg_column_size(t)) FROM symbol_files t WHERE project_id=$1),0),
+		COALESCE((SELECT last_mutation_at FROM symbol_migrations WHERE project_id=$1 AND state='completed'),'1970-01-01'::timestamptz)`, projectID).
+		Scan(&stats.TotalSymbols, &stats.TotalReferences, &stats.TotalFiles, &stats.IndexSize, &stats.LastUpdated)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read PostgreSQL symbol statistics: %w", err)
 	}
 	return &stats, nil
 }

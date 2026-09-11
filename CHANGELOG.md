@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Read caller trace targets, references and caller definitions from one PostgreSQL snapshot across CLI and MCP paths
   - Lock symbol data tables in mutation order during schema repair to avoid deadlocks with active writers
   - Read callee definitions and read/write reference graphs with their related metadata in one PostgreSQL snapshot, including CLI and MCP formatting paths
+  - Upgrade symbol storage to schema v3 with transactional per-project mutation timestamps, preserving freshness after deleting the last file
+  - Lock activation metadata before data during metadata upgrades, while allowing different-file mutations to proceed concurrently and protecting activation state
+  - Read PostgreSQL symbol counts, size and freshness in one statistics snapshot
 
 ## [0.37.0] - 2026-09-10
 
