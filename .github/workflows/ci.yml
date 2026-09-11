@@ -91,7 +91,7 @@ jobs:
       - name: Run PostgreSQL integration tests
         env:
           GREPAI_POSTGRES_TEST_DSN: postgres://grepai:grepai_test@localhost:5432/grepai_test?sslmode=disable
-        run: go test -v -race -coverprofile=coverage-postgres.out -covermode=atomic ./trace
+        run: go test -v -race -coverprofile=coverage-postgres.out -covermode=atomic ./trace ./mcp ./cli
 
       - name: Upload PostgreSQL coverage
         uses: codecov/codecov-action@v7
