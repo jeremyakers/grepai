@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Upgrade symbol storage to schema v3 with transactional per-project mutation timestamps, preserving freshness after deleting the last file
   - Lock activation metadata before data during metadata upgrades, while allowing different-file mutations to proceed concurrently and protecting activation state
   - Read PostgreSQL symbol counts, size and freshness in one statistics snapshot
+  - Activate all indexed projects when adopting a recognized pre-marker PostgreSQL layout, without claiming a GOB import or overwriting existing migration state
 
 ## [0.37.0] - 2026-09-10
 

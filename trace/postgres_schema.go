@@ -123,6 +123,9 @@ func symbolSchemaPlan(schema string, inv symbolSchemaInventory, ownership symbol
 		}
 	} else {
 		queries = append(queries, qualifiedSchemaQueries(schema)[4])
+		if ownership == symbolSchemaLegacy {
+			queries = append(queries, legacyPostgresActivationBackfillQuery(schema))
+		}
 	}
 	if _, ok := inv.tables["symbol_store_meta"]; !ok {
 		queries = append(queries, qualifiedSchemaQueries(schema)[5])

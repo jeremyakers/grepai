@@ -3,10 +3,15 @@ package trace
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
+
+const expectedLegacyPostgresActivationSource = "legacy-postgres-no-gob"
 
 func createAuthoritativeLegacySchema(t *testing.T, cfgSchema string, exec func(string) error) {
 	t.Helper()
@@ -28,6 +33,110 @@ func createAuthoritativeLegacySchema(t *testing.T, cfgSchema string, exec func(s
 		if err := exec(statement); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func seedLegacyProjects(t *testing.T, pool schemaTestPool) map[string]time.Time {
+	t.Helper()
+	times := map[string]time.Time{
+		"legacy-one": time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC),
+		"legacy-two": time.Date(2021, 2, 3, 4, 5, 6, 0, time.UTC),
+	}
+	for project, modTime := range times {
+		file := project + ".go"
+		if _, err := pool.Exec(context.Background(), `INSERT INTO symbol_files(project_id,path,mod_time) VALUES($1,$2,$3)`, project, file, modTime); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(context.Background(), `INSERT INTO symbols(project_id,name,file,line,kind) VALUES($1,$2,$3,1,'function')`, project, project, file); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return times
+}
+
+type schemaTestPool interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func TestPostgresSymbolSchemaAdoptsAllPreActivationProjects(t *testing.T) {
+	cfg := isolatedSymbolSchemaConfig(t)
+	schema := schemaNameFromConfig(t, cfg)
+	pool := openSchemaPool(t, cfg)
+	createAuthoritativeLegacySchema(t, schema, func(query string) error {
+		_, err := pool.Exec(context.Background(), query)
+		return err
+	})
+	wantTimes := seedLegacyProjects(t, pool)
+
+	one, err := newPostgresSymbolStoreWithPoolConfig(context.Background(), cfg.Copy(), "legacy-one", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { one.Close() })
+	for project, wantTime := range wantTimes {
+		var state string
+		var source, digest []byte
+		var sourceSize *int64
+		var gotTime time.Time
+		err := one.pool.QueryRow(context.Background(), `SELECT state,source_path,source_digest,source_size,last_mutation_at FROM symbol_migrations WHERE project_id=$1`, identityBytes(project)).Scan(&state, &source, &digest, &sourceSize, &gotTime)
+		if err != nil || state != "completed" || string(source) != expectedLegacyPostgresActivationSource || digest != nil || sourceSize != nil || !gotTime.Equal(wantTime) {
+			t.Fatalf("activation %q: state=%q source=%q digest=%x size=%v time=%v err=%v", project, state, source, digest, sourceSize, gotTime, err)
+		}
+	}
+	if err := one.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := one.LookupSymbol(context.Background(), "legacy-one"); err != nil || len(got) != 1 {
+		t.Fatalf("first legacy data=%#v, %v", got, err)
+	}
+	if err := one.SaveFile(context.Background(), "one-new.go", []Symbol{{Name: "OneNew", File: "one-new.go", Line: 1}}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	two, err := newPostgresSymbolStoreWithPoolConfig(context.Background(), cfg.Copy(), "legacy-two", t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { two.Close() })
+	if err := two.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := two.LookupSymbol(context.Background(), "legacy-two"); err != nil || len(got) != 1 {
+		t.Fatalf("second legacy data=%#v, %v", got, err)
+	}
+	if err := two.SaveFile(context.Background(), "two-new.go", []Symbol{{Name: "TwoNew", File: "two-new.go", Line: 1}}, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostgresSymbolSchemaLegacyActivationBackfillRollsBackWithDDL(t *testing.T) {
+	cfg := isolatedSymbolSchemaConfig(t)
+	schema := schemaNameFromConfig(t, cfg)
+	pool := openSchemaPool(t, cfg)
+	createAuthoritativeLegacySchema(t, schema, func(query string) error {
+		_, err := pool.Exec(context.Background(), query)
+		return err
+	})
+	seedLegacyProjects(t, pool)
+	store := &PostgresSymbolStore{pool: pool, schema: schema, projectID: "legacy-one", projectRoot: t.TempDir()}
+	backfillRan := false
+	store.schemaDDLHook = func(_ int, query string) error {
+		if backfillRan {
+			return errors.New("fail after legacy activation backfill")
+		}
+		backfillRan = strings.Contains(query, expectedLegacyPostgresActivationSource)
+		return nil
+	}
+	if err := store.ensureSchema(context.Background()); err == nil || !backfillRan {
+		t.Fatalf("schema failure=%v backfillRan=%v", err, backfillRan)
+	}
+	var migrations *string
+	if err := pool.QueryRow(context.Background(), `SELECT to_regclass($1)::text`, schema+".symbol_migrations").Scan(&migrations); err != nil || migrations != nil {
+		t.Fatalf("rolled-back migration table=%v, %v", migrations, err)
+	}
+	var project string
+	if err := pool.QueryRow(context.Background(), `SELECT project_id FROM symbol_files ORDER BY project_id LIMIT 1`).Scan(&project); err != nil || project != "legacy-one" {
+		t.Fatalf("legacy data after rollback=%q, %v", project, err)
 	}
 }
 
