@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -214,13 +213,27 @@ func inspectSchemaMarker(ctx context.Context, tx pgx.Tx, inv symbolSchemaInvento
 	return true, version, nil
 }
 
+// symbolTableLockOrder is the mutation-consistent schema lock order. The
+// data tables follow the exact row-mutation order of saveFileTx/deleteFileTx
+// and copyPostgresRows (symbols -> refs -> call_edges -> symbol_files), so a
+// schema repair blocked on an earlier-mutated table never already holds a
+// later-mutated one — the cycle the previous alphabetical order created
+// against a concurrent writer (repair held refs/call_edges while waiting on
+// symbols; writer held symbols while waiting on refs). Metadata tables come
+// last: mutation flows touch them only through the FOR SHARE activation
+// read, which stays compatible with SHARE ROW EXCLUSIVE. This order is
+// deliberately local to locking; reservedSymbolTables keeps its own order
+// because fresh-schema creation queries depend on it.
+var symbolTableLockOrder = []string{
+	"symbols", "refs", "call_edges", "symbol_files",
+	"symbol_migrations", "symbol_store_meta",
+}
+
 func lockOwnedSymbolTables(ctx context.Context, tx pgx.Tx, schema string, inv symbolSchemaInventory) error {
-	names := make([]string, 0, len(inv.tables))
-	for name := range inv.tables {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	for _, name := range symbolTableLockOrder {
+		if _, ok := inv.tables[name]; !ok {
+			continue
+		}
 		if _, err := tx.Exec(ctx, `LOCK TABLE `+pgx.Identifier{schema, name}.Sanitize()+` IN SHARE ROW EXCLUSIVE MODE`); err != nil {
 			return fmt.Errorf("failed to lock owned symbol table %q: %w", name, err)
 		}

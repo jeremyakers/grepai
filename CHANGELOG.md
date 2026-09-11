@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Regroup migration rows one 500-file batch at a time and release consumed source entries instead of building extra whole-index copies
   - Repair missing indexes in otherwise valid current PostgreSQL schemas under the schema lock, and reject current markers over legacy identity types
   - Read caller trace targets, references and caller definitions from one PostgreSQL snapshot across CLI and MCP paths
+  - Lock symbol data tables in mutation order during schema repair to avoid deadlocks with active writers
 
 ## [0.37.0] - 2026-09-10
 
