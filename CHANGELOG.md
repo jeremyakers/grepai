@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Bound deadline-free readers' migration contention waits to 30 seconds and return actionable watcher guidance without limiting the subsequent import
   - Quote migrated GOB archive paths in logs so filenames cannot forge additional log lines
   - Report existing GOB symbol indexes for workspace projects without local configuration, while preserving malformed and permission-error handling
+  - Validate current-version PostgreSQL layouts through a read-only catalog snapshot before accepting symbol stores
+  - Require completed project activation before symbol mutations, returning a typed Load-required error instead of creating unrecoverable markerless data
+  - Regroup migration rows one 500-file batch at a time and release consumed source entries instead of building extra whole-index copies
 
 ## [0.37.0] - 2026-09-10
 

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -125,23 +124,16 @@ func (s *PostgresSymbolStore) migrateGOBIfNeeded(ctx context.Context) (retErr er
 }
 
 func (s *PostgresSymbolStore) importGOBSnapshot(ctx context.Context, conn *pgxpool.Conn, gobStore *GOBSymbolStore, fingerprint sourceFingerprint) error {
-	files := make([]string, 0, len(gobStore.fileIndex))
-	for file := range gobStore.fileIndex {
-		files = append(files, file)
-	}
-	sort.Strings(files)
-	refsByFile := migrationRefsByFile(gobStore)
-	symbolsByFile := migrationSymbolsByFile(gobStore)
+	iterator := newMigrationBatchIterator(gobStore)
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin GOB symbol migration: %w", err)
 	}
 	started := time.Now()
-	for start, batch := 0, 0; start < len(files); start, batch = start+migrationBatchSize, batch+1 {
-		end := min(start+migrationBatchSize, len(files))
-		batchFiles := make([]migrationFileRows, 0, end-start)
-		for _, file := range files[start:end] {
-			batchFiles = append(batchFiles, migrationFileRows{filePath: file, contentHash: gobStore.fileContentHashes[file], extractorVersion: gobStore.fileExtractorVersions[file], symbols: symbolsByFile[file], refs: refsByFile[file], modTime: time.Now().UTC()})
+	for batch := 0; ; batch++ {
+		batchFiles, ok := iterator.nextBatch()
+		if !ok {
+			break
 		}
 		if err := copyMigrationFileBatch(ctx, tx, s.projectID, batchFiles); err != nil {
 			return rollbackMigration(tx, fmt.Errorf("failed to import GOB symbol batch: %w", err))
@@ -151,7 +143,8 @@ func (s *PostgresSymbolStore) importGOBSnapshot(ctx context.Context, conn *pgxpo
 				return rollbackMigration(tx, fmt.Errorf("GOB symbol migration batch hook failed: %w", err))
 			}
 		}
-		log.Printf("trace: Postgres symbol migration progress: %d/%d files, batch %d, elapsed %s", end, len(files), batch+1, time.Since(started).Round(time.Second))
+		done, total := iterator.progress()
+		log.Printf("trace: Postgres symbol migration progress: %d/%d files, batch %d, elapsed %s", done, total, batch+1, time.Since(started).Round(time.Second)) // #nosec G706 -- only integer counts and a computed duration are formatted, never input text.
 	}
 	if _, err := tx.Exec(ctx, `UPDATE symbol_migrations SET state='completed',source_digest=$2,source_size=$3,completed_at=NOW() WHERE project_id=$1`, identityBytes(s.projectID), fingerprint.digest, fingerprint.size); err != nil {
 		return rollbackMigration(tx, fmt.Errorf("failed to complete symbol migration marker: %w", err))

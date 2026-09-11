@@ -187,11 +187,15 @@ The Postgres symbol backend is independent of `store.backend`, which controls ve
 
 Symbol storage is pinned to the DSN's first effective schema. Prefer a dedicated database or schema when sharing PostgreSQL with other applications. Initialization checks reserved tables and indexes before changing them, accepts only recognized grepai schema layouts, and rejects ambiguous collisions. Schema creation and upgrades commit atomically; a failure does not leave partially applied schema changes.
 
+The layout is validated even when its version marker is already current, using catalog reads rather than locking symbol data tables. Library callers must activate a new PostgreSQL project with `Load` before its first mutation; writes and deletes reject missing or incomplete activation markers rather than committing data that a later load cannot recover.
+
 When Postgres is enabled for a project that already has `.grepai/symbols.gob`, grepai imports that index automatically. Migration is serialized with project-scoped Postgres and exclusive GOB file locks, and the complete import commits atomically. An interruption before commit leaves no partial project data and retains the GOB file for retry. After a successful import, the original file is renamed to `.grepai/symbols.gob.migrated.bak`; if commit succeeds but archiving is interrupted, the next startup completes the archive only after verifying the locked file's SHA-256 fingerprint. A different or newly-created GOB file is never archived as though it were the imported snapshot.
 
 Stop the old watcher before switching its symbol backend. Readers without a caller-supplied deadline wait up to 30 seconds for a contending writer to finish migration, then return guidance to stop or restart that watcher. This contention limit does not shorten the actual import after the reader acquires the lock; caller-supplied deadlines still apply.
 
 Only migrate trusted local GOB caches. The fixed cache format is not a resource-hardened interchange format: a malicious or corrupted snapshot can exhaust memory during decoding. Do not import GOB files supplied by an untrusted repository or download; regenerate those caches instead. File locks and recovery fingerprints ensure consistency, not authenticity.
+
+Migration decodes the source GOB in memory, but regroups row values only for the current batch of up to 500 files and releases consumed entries. It does not keep extra whole-index symbol and reference copies. The file-count batch limit is not a fixed byte limit; large individual files and the decoded source still require memory. Batch-wise rescanning trades some CPU time for lower peak memory.
 
 Postgres stores project, path, filename, and symbol identity values as raw bytes. This preserves unusual filesystem names exactly; invalid UTF-8 is replaced only in display-oriented text such as signatures, documentation, and reference context.
 

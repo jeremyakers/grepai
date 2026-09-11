@@ -30,6 +30,7 @@ func TestPostgresCountSymbolsUsesOneProjectScopedCount(t *testing.T) {
 	poolConfig.ConnConfig.Tracer = tracer
 	store := newIsolatedSchemaStore(t, poolConfig)
 	other := &PostgresSymbolStore{pool: store.pool, projectID: "other-project"}
+	activateSymbolProject(t, other)
 	ctx := context.Background()
 	if err := store.SaveFile(ctx, "one.go", []Symbol{{Name: "One", File: "one.go"}, {Name: "Two", File: "one.go"}}, []Reference{{SymbolName: "One", File: "one.go"}}); err != nil {
 		t.Fatal(err)

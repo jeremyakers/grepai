@@ -60,7 +60,13 @@ func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) (retErr error) {
 		return err
 	}
 	if version == currentSymbolSchemaVersion {
-		return nil
+		current, err := s.validateCurrentSymbolSchema(ctx)
+		if err != nil {
+			return err
+		}
+		if current {
+			return nil
+		}
 	}
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
@@ -142,6 +148,41 @@ func (s *PostgresSymbolStore) ensureSchema(ctx context.Context) (retErr error) {
 		return fmt.Errorf("failed to commit symbol schema transaction: %w", err)
 	}
 	return nil
+}
+
+func (s *PostgresSymbolStore) validateCurrentSymbolSchema(ctx context.Context) (current bool, retErr error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return false, fmt.Errorf("failed to begin current symbol schema validation: %w", err)
+	}
+	defer func() {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			retErr = errors.Join(retErr, fmt.Errorf("failed to rollback current symbol schema validation: %w", rollbackErr))
+		}
+	}()
+	inv, err := inspectSymbolSchema(ctx, tx, s.schema)
+	if err != nil {
+		return false, err
+	}
+	markerPresent, version, err := inspectSchemaMarker(ctx, tx, inv)
+	if err != nil {
+		return false, err
+	}
+	if err := checkSymbolSchemaVersion(version); err != nil {
+		return false, err
+	}
+	if !markerPresent || version != currentSymbolSchemaVersion {
+		return false, nil
+	}
+	if _, err := classifySymbolSchema(inv, true); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("failed to commit current symbol schema validation: %w", err)
+	}
+	return true, nil
 }
 
 func inspectSchemaMarker(ctx context.Context, tx pgx.Tx, inv symbolSchemaInventory) (bool, int, error) {

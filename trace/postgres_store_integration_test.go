@@ -61,6 +61,9 @@ func newIsolatedSchemaStore(t *testing.T, poolConfig *pgxpool.Config) *PostgresS
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
+	if err := store.Load(context.Background()); err != nil {
+		t.Fatalf("failed to activate isolated Postgres symbol store: %v", err)
+	}
 	return store
 }
 
@@ -192,6 +195,19 @@ func newIntegrationSymbolStore(t *testing.T, projectID, projectRoot string) *Pos
 }
 
 func truncateSymbolTables(t *testing.T, store *PostgresSymbolStore) {
+	t.Helper()
+	truncateSymbolTablesUnactivated(t, store)
+	activateSymbolProject(t, store)
+}
+
+func activateSymbolProject(t *testing.T, store *PostgresSymbolStore) {
+	t.Helper()
+	if _, err := store.pool.Exec(context.Background(), `INSERT INTO symbol_migrations(project_id,state,source_path,started_at,completed_at) VALUES($1,'completed',$2,NOW(),NOW())`, identityBytes(store.projectID), identityBytes(config.GetSymbolIndexPath(store.projectRoot))); err != nil {
+		t.Fatalf("failed to activate Postgres symbol test project: %v", err)
+	}
+}
+
+func truncateSymbolTablesUnactivated(t *testing.T, store *PostgresSymbolStore) {
 	t.Helper()
 	if _, err := store.pool.Exec(context.Background(), `TRUNCATE TABLE symbols, refs, call_edges, symbol_files, symbol_migrations`); err != nil {
 		t.Fatalf("failed to truncate symbol tables: %v", err)
@@ -424,6 +440,9 @@ func TestPostgresSymbolStoreTenantIsolation(t *testing.T) {
 	one := newIntegrationSymbolStore(t, "tenant-one", t.TempDir())
 	truncateSymbolTables(t, one)
 	two := newIntegrationSymbolStore(t, "tenant-two", t.TempDir())
+	if err := two.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := one.SaveFile(ctx, "same.go", []Symbol{{Name: "OnlyOne", File: "same.go", Line: 1}}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +476,7 @@ func TestPostgresSymbolStoreMigratesGOB(t *testing.T) {
 	}
 
 	store := newIntegrationSymbolStore(t, "migration", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 	if err := store.Load(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +518,7 @@ func TestPostgresMigrationPreservesReferenceOrdinals(t *testing.T) {
 		t.Fatal(err)
 	}
 	pg := newIntegrationSymbolStore(t, "migration-ordinals", root)
-	truncateSymbolTables(t, pg)
+	truncateSymbolTablesUnactivated(t, pg)
 	if err := pg.Load(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +553,7 @@ func TestPostgresMigrationRollbackAndRetry(t *testing.T) {
 	root := t.TempDir()
 	path := writeMigrationGOB(t, root, migrationBatchSize+1)
 	store := newIntegrationSymbolStore(t, "migration-retry", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 	store.migrationBatchHook = func(batch int) error {
 		if batch == 0 {
 			return errors.New("injected failure")
@@ -564,7 +583,7 @@ func TestPostgresMigrationCancellationRollsBack(t *testing.T) {
 	root := t.TempDir()
 	path := writeMigrationGOB(t, root, 1)
 	store := newIntegrationSymbolStore(t, "migration-cancel", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 	ctx, cancel := context.WithCancel(context.Background())
 	store.migrationBatchHook = func(int) error {
 		cancel()
@@ -588,7 +607,7 @@ func TestPostgresMigrationConcurrentLoadsSerialize(t *testing.T) {
 	writeMigrationGOB(t, root, 2)
 	one := newIntegrationSymbolStore(t, "migration-concurrent", root)
 	two := newIntegrationSymbolStore(t, "migration-concurrent", root)
-	truncateSymbolTables(t, one)
+	truncateSymbolTablesUnactivated(t, one)
 	var batches atomic.Int32
 	one.migrationBatchHook = func(int) error { batches.Add(1); return nil }
 	two.migrationBatchHook = func(int) error { batches.Add(1); return nil }
@@ -618,7 +637,7 @@ func TestPostgresMigrationLoadWaitsForActiveWriter(t *testing.T) {
 	root := t.TempDir()
 	writeMigrationGOB(t, root, 2)
 	store := newIntegrationSymbolStore(t, "migration-wait", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 	var batches atomic.Int32
 	store.migrationBatchHook = func(int) error { batches.Add(1); return nil }
 
@@ -653,7 +672,7 @@ func TestPostgresMigrationLoadWaitCancellation(t *testing.T) {
 	root := t.TempDir()
 	writeMigrationGOB(t, root, 1)
 	store := newIntegrationSymbolStore(t, "migration-wait-cancel", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 
 	held, err := fileutil.AcquireProjectWriterLock(root)
 	if err != nil {
@@ -684,7 +703,7 @@ func TestPostgresMigrationCompletedMarkerArchivesResidualGOB(t *testing.T) {
 	root := t.TempDir()
 	path := writeMigrationGOB(t, root, 1)
 	store := newIntegrationSymbolStore(t, "migration-archive-recovery", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 	if err := store.Load(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -708,7 +727,7 @@ func TestPostgresMigrationFingerprintRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := newIntegrationSymbolStore(t, "migration-fingerprint", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 	if err := store.Load(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -734,7 +753,7 @@ func TestPostgresMigrationArchiveFailureKeepsCommittedData(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := newIntegrationSymbolStore(t, "migration-archive-failure", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 	err := store.Load(ctx)
 	if err == nil || !strings.Contains(err.Error(), "migration completed") {
 		t.Fatalf("expected actionable archive error, got %v", err)
@@ -765,7 +784,7 @@ func TestPostgresMigrationModifiedResidualFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := newIntegrationSymbolStore(t, "migration-modified-residual", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 	if err := store.Load(ctx); err == nil {
 		t.Fatal("expected initial archive failure")
 	}
@@ -791,7 +810,7 @@ func TestPostgresEmptyActivationRejectsLaterGOB(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
 	store := newIntegrationSymbolStore(t, "migration-empty-then-gob", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 	if err := store.Load(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -819,8 +838,11 @@ func TestPostgresMigrationRejectsPartialRowsWithoutMarker(t *testing.T) {
 	root := t.TempDir()
 	path := writeMigrationGOB(t, root, 1)
 	store := newIntegrationSymbolStore(t, "migration-partial", root)
-	truncateSymbolTables(t, store)
-	if err := store.SaveFile(ctx, "partial.go", []Symbol{{Name: "Partial", File: "partial.go", Line: 1}}, nil); err != nil {
+	truncateSymbolTablesUnactivated(t, store)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO symbol_files(project_id,path,mod_time) VALUES($1,$2,NOW())`, identityBytes(store.projectID), identityBytes("partial.go")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO symbols(project_id,name,file,line,kind) VALUES($1,$2,$3,1,'')`, identityBytes(store.projectID), identityBytes("Partial"), identityBytes("partial.go")); err != nil {
 		t.Fatal(err)
 	}
 	err := store.Load(ctx)

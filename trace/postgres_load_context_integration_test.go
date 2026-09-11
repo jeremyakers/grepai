@@ -78,7 +78,7 @@ func TestPostgresLoadBoundsMarkerPollingButNotImportContext(t *testing.T) {
 		t.Fatalf("failed to create Postgres symbol store: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 
 	// A contending writer holds the lifetime project lock.
 	held, err := fileutil.AcquireProjectWriterLock(root)
@@ -190,7 +190,7 @@ func TestPostgresLoadMarkerRecheckDeadlineKeepsActiveWriterError(t *testing.T) {
 		t.Fatalf("failed to create Postgres symbol store: %v", err)
 	}
 	t.Cleanup(func() { store.Close() })
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 
 	// Contention persists for the whole test: Load must error while the
 	// stale writer still holds the lifetime lock.

@@ -64,6 +64,9 @@ func TestPostgresListFileFingerprintsTenantIsolation(t *testing.T) {
 	one := newIntegrationSymbolStore(t, "fingerprint-tenant-one", t.TempDir())
 	truncateSymbolTables(t, one)
 	two := newIntegrationSymbolStore(t, "fingerprint-tenant-two", t.TempDir())
+	if err := two.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := one.SaveFileWithContentHash(ctx, "same.go", "hash-one", []Symbol{{Name: "OnlyOne", File: "same.go", Line: 1}}, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +114,9 @@ func TestPostgresListFileFingerprintsLargeSnapshotUsesSingleQuery(t *testing.T) 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
+	if err := store.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	const files = 60
 	for i := 0; i < files; i++ {
 		path := fmt.Sprintf("pkg/file%04d.go", i)

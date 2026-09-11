@@ -65,7 +65,7 @@ func TestPostgresMigrationRejectsCorruptGOBWithoutMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := newIntegrationSymbolStore(t, "corrupt-migration", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 
 	// When migration loads the locked snapshot, decoding fails.
 	err := store.Load(context.Background())

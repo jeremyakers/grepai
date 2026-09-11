@@ -75,14 +75,19 @@ func newPostgresSymbolStoreWithPoolConfig(ctx context.Context, poolConfig *pgxpo
 	return s, nil
 }
 
+// SaveFile requires Load to have activated this project in the database before
+// the first mutation.
 func (s *PostgresSymbolStore) SaveFile(ctx context.Context, filePath string, symbols []Symbol, refs []Reference) error {
 	return s.SaveFileWithContentHash(ctx, filePath, "", symbols, refs)
 }
 
+// SaveFileWithContentHash requires Load to have activated this project in the
+// database before the first mutation.
 func (s *PostgresSymbolStore) SaveFileWithContentHash(ctx context.Context, filePath, contentHash string, symbols []Symbol, refs []Reference) error {
 	return s.saveFile(ctx, filePath, contentHash, nil, symbols, refs)
 }
 
+// SaveFileWithSignature requires the same database activation as SaveFile.
 func (s *PostgresSymbolStore) SaveFileWithSignature(ctx context.Context, filePath, contentHash, extractorVersion string, symbols []Symbol, refs []Reference) error {
 	return s.saveFile(ctx, filePath, contentHash, &extractorVersion, symbols, refs)
 }
@@ -100,6 +105,9 @@ func (s *PostgresSymbolStore) saveFile(ctx context.Context, filePath, contentHas
 		}
 	}()
 	if err := s.lockFileMutation(ctx, tx, "save", filePath); err != nil {
+		return err
+	}
+	if err := s.requireProjectActivation(ctx, tx, "save"); err != nil {
 		return err
 	}
 	if err := s.saveFileTx(ctx, tx, filePath, contentHash, extractorVersion, symbols, refs); err != nil {
@@ -138,6 +146,7 @@ func sanUTF8(s string) string {
 	return strings.ToValidUTF8(s, "�")
 }
 
+// DeleteFile requires Load to have activated this project in the database.
 func (s *PostgresSymbolStore) DeleteFile(ctx context.Context, filePath string) (retErr error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -151,6 +160,9 @@ func (s *PostgresSymbolStore) DeleteFile(ctx context.Context, filePath string) (
 		}
 	}()
 	if err := s.lockFileMutation(ctx, tx, "delete", filePath); err != nil {
+		return err
+	}
+	if err := s.requireProjectActivation(ctx, tx, "delete"); err != nil {
 		return err
 	}
 	if err := s.deleteFileTx(ctx, tx, filePath); err != nil {

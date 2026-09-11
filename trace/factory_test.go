@@ -76,6 +76,9 @@ func TestPostgresSymbolStoreFactoryUsesCanonicalRootNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer aliasStore.Close()
+	if err := realStore.Load(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 
 	const file = "factory-canonical.go"
 	const symbol = "FactoryCanonicalSymbol"
@@ -231,37 +234,5 @@ func TestCalleeQueriesUseDurableOrdinals(t *testing.T) {
 		if !strings.Contains(query, "ORDER BY file,line,ordinal") {
 			t.Fatalf("callee query does not use durable ordinal ordering: %s", query)
 		}
-	}
-}
-
-func TestMigrationRefsByFileReconstructsOriginalOrder(t *testing.T) {
-	store := NewGOBSymbolStore("unused")
-	refs := []Reference{
-		{SymbolName: "readFirst", Kind: RefKindRead, File: "main.go", Line: 10, CallerName: "Main"},
-		{SymbolName: "callSecond", Kind: RefKindCall, File: "main.go", Line: 10, CallerName: "Main"},
-		{SymbolName: "writeThird", Kind: RefKindWrite, File: "main.go", Line: 11, CallerName: "Main"},
-	}
-	if err := store.SaveFile(context.Background(), "main.go", nil, refs); err != nil {
-		t.Fatal(err)
-	}
-	got := migrationRefsByFile(store)["main.go"]
-	if !reflect.DeepEqual(got, refs) {
-		t.Fatalf("migration ref order = %#v, want %#v", got, refs)
-	}
-}
-
-func TestMigrationRefsByFileIncludesTopLevelAndSymbolsByFile(t *testing.T) {
-	store := NewGOBSymbolStore("unused")
-	refs := []Reference{{SymbolName: "Top", File: "a.go", CallerName: "<top-level>"}}
-	symbols := []Symbol{{Name: "A", File: "a.go"}, {Name: "B", File: "b.go"}}
-	if err := store.SaveFile(context.Background(), "a.go", symbols, refs); err != nil {
-		t.Fatal(err)
-	}
-	if got := migrationRefsByFile(store)["a.go"]; !reflect.DeepEqual(got, refs) {
-		t.Fatalf("top-level refs = %#v", got)
-	}
-	grouped := migrationSymbolsByFile(store)
-	if len(grouped["a.go"]) != 1 || len(grouped["b.go"]) != 1 {
-		t.Fatalf("symbols by file = %#v", grouped)
 	}
 }

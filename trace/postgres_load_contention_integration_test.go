@@ -20,7 +20,7 @@ func TestPostgresLoadNoDeadlineBoundedByDefaultBudget(t *testing.T) {
 	root := t.TempDir()
 	writeMigrationGOB(t, root, 1)
 	store := newIntegrationSymbolStore(t, "load-budget-default", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 
 	// A stale writer holds the lifetime lock and never finishes the marker.
 	held, err := fileutil.AcquireProjectWriterLock(root)
@@ -84,7 +84,7 @@ func TestPostgresLoadReaderSkipsLifetimeWriterAfterMigration(t *testing.T) {
 	root := t.TempDir()
 	writeMigrationGOB(t, root, 2)
 	writer := newIntegrationSymbolStore(t, "load-steady-reader", root)
-	truncateSymbolTables(t, writer)
+	truncateSymbolTablesUnactivated(t, writer)
 	if err := writer.Load(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -114,7 +114,7 @@ func TestPostgresLoadWaiterFreedByConcurrentMigrationCompletion(t *testing.T) {
 	writeMigrationGOB(t, root, 2)
 	reader := newIntegrationSymbolStore(t, "load-wait-freed", root)
 	writer := newIntegrationSymbolStore(t, "load-wait-freed", root)
-	truncateSymbolTables(t, reader)
+	truncateSymbolTablesUnactivated(t, reader)
 
 	// The writer holds the lifetime lock like a live watcher that will still
 	// run its initial migration via LoadWithProjectWriterLockHeld.

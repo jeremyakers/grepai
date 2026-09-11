@@ -66,6 +66,9 @@ func TestPostgresLookupCalleesUsesOneSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { writer.Close() })
+	if err := writer.Load(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if err := writer.SaveFile(ctx, "main.go", []Symbol{{Name: "Main", Kind: KindFunction, File: "main.go", Line: 1}}, calleeGenRefs("gen1")); err != nil {
 		t.Fatal(err)
 	}

@@ -15,7 +15,7 @@ func TestPostgresMigrationEscapesArchivePathInLog(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "cache\nforged-line")
 	writeMigrationGOB(t, root, 1)
 	store := newIntegrationSymbolStore(t, "migration-log-path", root)
-	truncateSymbolTables(t, store)
+	truncateSymbolTablesUnactivated(t, store)
 	var output bytes.Buffer
 	previous := log.Writer()
 	log.SetOutput(&output)

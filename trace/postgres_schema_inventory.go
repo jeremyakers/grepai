@@ -80,7 +80,7 @@ func inspectSymbolSchema(ctx context.Context, tx pgx.Tx, schema string) (symbolS
 	rows.Close()
 
 	rows, err = tx.Query(ctx, `
-		SELECT c.relname,a.attname,t.oid,NOT a.attnotnull,coalesce(pg_get_expr(d.adbin,d.adrelid),'')
+		SELECT c.relname,a.attname,t.oid,NOT a.attnotnull,coalesce(pg_get_expr(d.adbin,0),'')
 		FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
 		JOIN pg_attribute a ON a.attrelid=c.oid AND a.attnum>0 AND NOT a.attisdropped
 		JOIN pg_type t ON t.oid=a.atttypid LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum
