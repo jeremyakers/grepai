@@ -87,6 +87,7 @@ func runSymbolSchemaDDL(ctx context.Context, executor symbolSchemaExecutor, hook
 		`CREATE INDEX IF NOT EXISTS idx_symbols_project_file ON symbols(project_id, file)`,
 		`CREATE INDEX IF NOT EXISTS idx_refs_project_name ON refs(project_id, symbol_name)`,
 		`CREATE INDEX IF NOT EXISTS idx_refs_project_file ON refs(project_id, file)`,
+		`CREATE INDEX IF NOT EXISTS idx_refs_project_caller ON refs(project_id, caller)`,
 		`CREATE INDEX IF NOT EXISTS idx_call_edges_project_caller ON call_edges(project_id, caller)`,
 		`CREATE INDEX IF NOT EXISTS idx_call_edges_project_callee ON call_edges(project_id, callee)`,
 		`CREATE INDEX IF NOT EXISTS idx_call_edges_project_file ON call_edges(project_id, file)`,

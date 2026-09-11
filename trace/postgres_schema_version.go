@@ -11,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const currentSymbolSchemaVersion = 1
+const currentSymbolSchemaVersion = 2
 const symbolSchemaVersionQuery = `SELECT value FROM symbol_store_meta WHERE key='schema_version'`
 
 // ErrSymbolSchemaVersionTooNew marks a symbol store whose stored schema
