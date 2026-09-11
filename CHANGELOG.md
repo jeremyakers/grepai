@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Bulk-copy GOB migrations per 500-file batch instead of issuing per-file SQL operations, with bounded-memory progress reporting
   - Preserve arbitrary filename and symbol-name bytes exactly while sanitizing invalid UTF-8 only in display text
   - Reject newer PostgreSQL symbol schema versions without changing their metadata or data, including upgrades that finish while waiting for the schema lock
+  - Read callee edges and references from one PostgreSQL snapshot so concurrent file updates cannot mix old and new results
 
 ## [0.37.0] - 2026-09-10
 

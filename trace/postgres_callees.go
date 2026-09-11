@@ -2,7 +2,11 @@ package trace
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 type calleeSite struct {
@@ -14,22 +18,44 @@ type calleeSite struct {
 const calleeEdgesSQL = `SELECT caller,callee,file,line,call_type FROM call_edges WHERE project_id=$1 AND caller=$2 ORDER BY file,line,ordinal,callee`
 const calleeRefsSQL = `SELECT ` + refColumns + ` FROM refs WHERE project_id=$1 AND caller=$2 AND (ref_type=$3 OR ref_type='') ORDER BY file,line,ordinal,symbol_name`
 
-func (s *PostgresSymbolStore) LookupCallees(ctx context.Context, symbolName, _ string) ([]Reference, error) {
-	edges, err := s.calleeEdges(ctx, symbolName)
+// calleeQuerier lets both queries share the same pgx transaction.
+type calleeQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
+// LookupCallees reads edges and references from one snapshot, so a concurrent
+// file update cannot mix generations in the returned callees.
+func (s *PostgresSymbolStore) LookupCallees(ctx context.Context, symbolName, _ string) (result []Reference, err error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin callee snapshot transaction: %w", err)
+	}
+	defer func() {
+		rollbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if rollbackErr := tx.Rollback(rollbackCtx); rollbackErr != nil && !errors.Is(rollbackErr, pgx.ErrTxClosed) {
+			err = errors.Join(err, fmt.Errorf("failed to rollback callee snapshot transaction: %w", rollbackErr))
+		}
+	}()
+	edges, err := s.calleeEdges(ctx, tx, symbolName)
 	if err != nil {
 		return nil, err
 	}
-	refs, err := s.callRefsByCaller(ctx, symbolName)
+	callRefs, err := s.callRefsByCaller(ctx, tx, symbolName)
 	if err != nil {
 		return nil, err
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit callee snapshot transaction: %w", err)
+	}
+
 	refsBySite := make(map[calleeSite][]Reference)
-	for _, ref := range refs {
+	for _, ref := range callRefs {
 		key := calleeSite{name: ref.SymbolName, file: ref.File, line: ref.Line}
 		refsBySite[key] = append(refsBySite[key], ref)
 	}
 
-	result := []Reference{}
+	result = []Reference{}
 	seen := make(map[calleeSite]bool)
 	for _, edge := range edges {
 		key := calleeSite{file: edge.File, line: edge.Line}
@@ -50,8 +76,8 @@ func (s *PostgresSymbolStore) LookupCallees(ctx context.Context, symbolName, _ s
 	return result, nil
 }
 
-func (s *PostgresSymbolStore) calleeEdges(ctx context.Context, symbolName string) ([]CallEdge, error) {
-	rows, err := s.pool.Query(ctx, calleeEdgesSQL, identityBytes(s.projectID), identityBytes(symbolName))
+func (s *PostgresSymbolStore) calleeEdges(ctx context.Context, q calleeQuerier, symbolName string) ([]CallEdge, error) {
+	rows, err := q.Query(ctx, calleeEdgesSQL, identityBytes(s.projectID), identityBytes(symbolName))
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup callee edges: %w", err)
 	}
@@ -69,8 +95,8 @@ func (s *PostgresSymbolStore) calleeEdges(ctx context.Context, symbolName string
 	return edges, rows.Err()
 }
 
-func (s *PostgresSymbolStore) callRefsByCaller(ctx context.Context, symbolName string) ([]Reference, error) {
-	rows, err := s.pool.Query(ctx, calleeRefsSQL, identityBytes(s.projectID), identityBytes(symbolName), RefKindCall)
+func (s *PostgresSymbolStore) callRefsByCaller(ctx context.Context, q calleeQuerier, symbolName string) ([]Reference, error) {
+	rows, err := q.Query(ctx, calleeRefsSQL, identityBytes(s.projectID), identityBytes(symbolName), RefKindCall)
 	if err != nil {
 		return nil, fmt.Errorf("failed to lookup callee references: %w", err)
 	}
