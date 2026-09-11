@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Pin symbol storage to one PostgreSQL schema and reject reserved-name collisions before transactional initialization or upgrades, preserving recognized legacy layouts
   - Bound deadline-free readers' migration contention waits to 30 seconds and return actionable watcher guidance without limiting the subsequent import
   - Quote migrated GOB archive paths in logs so filenames cannot forge additional log lines
+  - Report existing GOB symbol indexes for workspace projects without local configuration, while preserving malformed and permission-error handling
 
 ## [0.37.0] - 2026-09-10
 

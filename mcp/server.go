@@ -1956,7 +1956,7 @@ func (s *Server) handleIndexStatus(ctx context.Context, request mcp.CallToolRequ
 				Name: p.Name,
 				Path: p.Path,
 			}
-			projectCfg, loadErr := config.Load(p.Path)
+			projectCfg, loadErr := loadStatusProjectConfig(p.Path)
 			if loadErr != nil {
 				wsStatus.Projects = append(wsStatus.Projects, ps)
 				continue
