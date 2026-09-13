@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Batch Ollama indexing requests through the modern `/api/embed` endpoint, with bounded request sizes and automatic fallback for older servers that only provide `/api/embeddings` (#314).
+
+## [0.37.0] - 2026-09-10
+
 ### Added
 
 - **Postgres Symbol Store**: Add an opt-in `trace.store_backend: postgres` backend that writes symbol, reference, and call-edge updates incrementally instead of periodically rewriting the entire `.grepai/symbols.gob` file. Existing GOB indexes migrate automatically on first use and are retained as `symbols.gob.migrated.bak` (#298)
