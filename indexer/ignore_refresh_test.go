@@ -216,11 +216,16 @@ func TestCanSkipDirWithoutRefresh(t *testing.T) {
 		want         bool
 	}{
 		{"exact configured exclusion", []string{"cache"}, "", "", "cache", true},
+		{"directory-only configured exclusion", []string{"cache/"}, "", "", "cache", true},
 		{"configured exclusion with known reinclusion", []string{"vendor"}, "", "!vendor/keep.go\n", "vendor", false},
+		{"directory-only exclusion with known reinclusion", []string{"vendor/"}, "", "!vendor/keep.go\n", "vendor", false},
 		{"hard metadata exclusion", []string{".git"}, "", "!.git/keep.go\n", ".git", true},
 		{"gitignore exclusion requires refresh", nil, "incoming/\n", "", "incoming", false},
 		{"grepaiignore exclusion requires refresh", nil, "", "incoming/\n", "incoming", false},
 		{"configured pattern requires refresh", []string{"vendor/*"}, "", "", "vendor/cache", false},
+		{"directory-only glob requires refresh", []string{"cache*/"}, "", "", "cache*", false},
+		{"anchored directory pattern requires refresh", []string{"/cache/"}, "", "", "cache", false},
+		{"multi-component directory pattern requires refresh", []string{"nested/cache/"}, "", "", "nested/cache", false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -256,5 +261,52 @@ func writeIgnoreTestFile(t *testing.T, root, rel, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestExactConfiguredDirectoryPrunesLocalIgnoreRules(t *testing.T) {
+	tests := []struct {
+		name       string
+		configured string
+		refresh    bool
+	}{
+		{"discovery bare", "cache", false},
+		{"discovery directory-only", "cache/", false},
+		{"refresh bare", "cache", true},
+		{"refresh directory-only", "cache/", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			root := t.TempDir()
+			var m *IgnoreMatcher
+			var err error
+			if tc.refresh {
+				m, err = NewIgnoreMatcher(root, []string{tc.configured}, "")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// When
+			writeIgnoreTestFile(t, root, filepath.Join("cache", ".grepaiignore"), "!keep.go\n")
+			writeIgnoreTestFile(t, root, filepath.Join("cache", "keep.go"), "package cache")
+			if tc.refresh {
+				err = m.RefreshSubtree("cache")
+			} else {
+				m, err = NewIgnoreMatcher(root, []string{tc.configured}, "")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Then
+			if !m.ShouldIgnore(filepath.Join("cache", "keep.go")) {
+				t.Fatal("configured directory imported its local ignore override")
+			}
+			if !m.CanSkipDirWithoutRefresh("cache") {
+				t.Fatal("configured directory cannot be pruned without refresh")
+			}
+		})
 	}
 }

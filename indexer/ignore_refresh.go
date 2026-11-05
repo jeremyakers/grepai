@@ -89,10 +89,8 @@ func loadScopedIgnoreMatchers(projectRoot, scanRoot string, extraDirs []string, 
 			return err
 		}
 		if info.IsDir() {
-			for _, dir := range extraDirs {
-				if filepath.Base(path) == dir {
-					return filepath.SkipDir
-				}
+			if matchesExactConfiguredDir(path, extraDirs) {
+				return filepath.SkipDir
 			}
 			return nil
 		}
