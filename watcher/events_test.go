@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/yoanbernabeu/grepai/indexer"
 )
 
 func TestCreateDirectoryNamedLikeSourceRegistersDescendants(t *testing.T) {
@@ -66,6 +67,46 @@ func TestCreateStatFailuresPublishFatal(t *testing.T) {
 			}
 			<-w.processingDone
 			_ = w.Close()
+		})
+	}
+}
+
+func TestCreateConfiguredExcludedDirectorySkipsStat(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pattern string
+	}{
+		{"bare", ".codegraph-native"},
+		{"directory_only", ".codegraph-native/"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			root := t.TempDir()
+			ignore, err := indexer.NewIgnoreMatcher(root, []string{tc.pattern}, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			w, err := NewWatcher(root, ignore, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer w.Close()
+			statCalled := false
+			w.statPath = func(string) (fs.FileInfo, error) {
+				statCalled = true
+				return nil, syscall.EACCES
+			}
+
+			// When
+			err = w.handleEvent(fsnotify.Event{Name: filepath.Join(root, ".codegraph-native"), Op: fsnotify.Create})
+
+			// Then
+			if err != nil {
+				t.Fatalf("handleEvent() error = %v, want configured exclusion ignored", err)
+			}
+			if statCalled {
+				t.Fatal("statPath() called for configured excluded create")
+			}
 		})
 	}
 }

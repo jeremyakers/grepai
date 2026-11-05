@@ -86,6 +86,9 @@ func (w *Watcher) handleEvent(event fsnotify.Event) error {
 	}
 
 	if event.Has(fsnotify.Create) {
+		if w.ignore.CanSkipDirWithoutRefresh(relPath) {
+			return nil
+		}
 		info, err := w.statPath(event.Name)
 		if err != nil {
 			if os.IsNotExist(err) {

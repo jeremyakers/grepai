@@ -99,32 +99,41 @@ func receiveDirectoryTestEvent(t *testing.T, w *Watcher) FileEvent {
 }
 
 func TestImportedIgnoredRootLoadsOwnNegationBeforeSkip(t *testing.T) {
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, ".grepaiignore"), []byte("incoming/\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	w := newDirectoryTestWatcher(t, root)
-	incoming := filepath.Join(root, "incoming")
-	if err := os.Mkdir(incoming, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(incoming, ".grepaiignore"), []byte("!keep.go\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(incoming, "keep.go"), []byte("package keep"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.handleEvent(fsnotify.Event{Name: incoming, Op: fsnotify.Create}); err != nil {
-		t.Fatal(err)
-	}
-	w.flush()
-	select {
-	case event := <-w.Events():
-		if event.Path != filepath.Join("incoming", "keep.go") {
-			t.Fatalf("event = %#v", event)
-		}
-	default:
-		t.Fatal("imported subtree negation was not loaded before skip decision")
+	for _, name := range []string{"incoming", ".incoming"} {
+		t.Run(name, func(t *testing.T) {
+			// Given
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, ".grepaiignore"), []byte(name+"/\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			w := newDirectoryTestWatcher(t, root)
+			incoming := filepath.Join(root, name)
+			if err := os.Mkdir(incoming, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(incoming, ".grepaiignore"), []byte("!keep.go\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(incoming, "keep.go"), []byte("package keep"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			// When
+			if err := w.handleEvent(fsnotify.Event{Name: incoming, Op: fsnotify.Create}); err != nil {
+				t.Fatal(err)
+			}
+
+			// Then
+			w.flush()
+			select {
+			case event := <-w.Events():
+				if event.Path != filepath.Join(name, "keep.go") {
+					t.Fatalf("event = %#v", event)
+				}
+			default:
+				t.Fatal("imported subtree negation was not loaded before skip decision")
+			}
+		})
 	}
 }
 

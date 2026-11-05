@@ -65,6 +65,22 @@ type IgnoreMatcher struct {
 	hardExcludeGrepai bool
 }
 
+// matchesExactConfiguredDir reports whether path's base matches a literal
+// single-component configured directory name with one optional trailing slash.
+func matchesExactConfiguredDir(path string, configured []string) bool {
+	base := filepath.Base(path)
+	for _, pattern := range configured {
+		name := strings.TrimSuffix(pattern, "/")
+		if name == "" || strings.HasPrefix(name, "!") || strings.ContainsAny(name, `/\`) || strings.ContainsAny(name, "*?[") {
+			continue
+		}
+		if base == name {
+			return true
+		}
+	}
+	return false
+}
+
 func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignore string) (*IgnoreMatcher, error) {
 	m := &IgnoreMatcher{
 		projectRoot:       projectRoot,
@@ -108,11 +124,8 @@ func NewIgnoreMatcher(projectRoot string, extraIgnore []string, externalGitignor
 
 		// Skip directories that should be ignored by default
 		if info.IsDir() {
-			base := filepath.Base(path)
-			for _, dir := range extraIgnore {
-				if base == dir {
-					return filepath.SkipDir
-				}
+			if matchesExactConfiguredDir(path, extraIgnore) {
+				return filepath.SkipDir
 			}
 			return nil
 		}
@@ -216,10 +229,28 @@ func (m *IgnoreMatcher) shouldIgnore(path string) bool {
 	return m.evalGitIgnore(normalizedPath)
 }
 
+// CanSkipDirWithoutRefresh reports whether an exact configured or hard exclusion
+// can skip path without importing ignore rules from that subtree.
+func (m *IgnoreMatcher) CanSkipDirWithoutRefresh(path string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.isHardExcludedPath(path) {
+		return true
+	}
+	if matchesExactConfiguredDir(path, m.extraDirs) {
+		return m.shouldSkipDir(path)
+	}
+	return false
+}
+
 // ShouldSkipDir determines if a directory can be skipped entirely via filepath.SkipDir.
 func (m *IgnoreMatcher) ShouldSkipDir(path string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.shouldSkipDir(path)
+}
+
+func (m *IgnoreMatcher) shouldSkipDir(path string) bool {
 	if m.isHardExcludedPath(path) {
 		return true
 	}
@@ -285,17 +316,9 @@ func (m *IgnoreMatcher) evalGitIgnore(normalizedPath string) bool {
 
 // evalGitIgnoreWithLevel checks .gitignore/extra patterns and returns the deepest matching level.
 func (m *IgnoreMatcher) evalGitIgnoreWithLevel(normalizedPath string) (bool, string) {
-	found := false
-	deepestBaseDir := ""
-
 	// Check extra directories (root-level, baseDir="")
-	base := filepath.Base(normalizedPath)
-	for _, dir := range m.extraDirs {
-		if base == dir {
-			found = true
-			break
-		}
-	}
+	found := matchesExactConfiguredDir(normalizedPath, m.extraDirs)
+	deepestBaseDir := ""
 
 	// Check nested gitignore patterns, find the deepest match
 	for _, nm := range m.nestedMatchers {
