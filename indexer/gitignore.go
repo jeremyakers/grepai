@@ -216,10 +216,31 @@ func (m *IgnoreMatcher) shouldIgnore(path string) bool {
 	return m.evalGitIgnore(normalizedPath)
 }
 
+// CanSkipDirWithoutRefresh reports whether an exact configured or hard exclusion
+// can skip path without importing ignore rules from that subtree.
+func (m *IgnoreMatcher) CanSkipDirWithoutRefresh(path string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.isHardExcludedPath(path) {
+		return true
+	}
+	base := filepath.Base(path)
+	for _, dir := range m.extraDirs {
+		if base == dir {
+			return m.shouldSkipDir(path)
+		}
+	}
+	return false
+}
+
 // ShouldSkipDir determines if a directory can be skipped entirely via filepath.SkipDir.
 func (m *IgnoreMatcher) ShouldSkipDir(path string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	return m.shouldSkipDir(path)
+}
+
+func (m *IgnoreMatcher) shouldSkipDir(path string) bool {
 	if m.isHardExcludedPath(path) {
 		return true
 	}

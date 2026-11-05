@@ -206,6 +206,48 @@ func TestScannerTraversesPositiveParentForSameFileNegation(t *testing.T) {
 	}
 }
 
+func TestCanSkipDirWithoutRefresh(t *testing.T) {
+	tests := []struct {
+		name         string
+		extraDirs    []string
+		gitignore    string
+		grepaiignore string
+		path         string
+		want         bool
+	}{
+		{"exact configured exclusion", []string{"cache"}, "", "", "cache", true},
+		{"configured exclusion with known reinclusion", []string{"vendor"}, "", "!vendor/keep.go\n", "vendor", false},
+		{"hard metadata exclusion", []string{".git"}, "", "!.git/keep.go\n", ".git", true},
+		{"gitignore exclusion requires refresh", nil, "incoming/\n", "", "incoming", false},
+		{"grepaiignore exclusion requires refresh", nil, "", "incoming/\n", "incoming", false},
+		{"configured pattern requires refresh", []string{"vendor/*"}, "", "", "vendor/cache", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			root := t.TempDir()
+			if tc.gitignore != "" {
+				writeIgnoreTestFile(t, root, ".gitignore", tc.gitignore)
+			}
+			if tc.grepaiignore != "" {
+				writeIgnoreTestFile(t, root, ".grepaiignore", tc.grepaiignore)
+			}
+			m, err := NewIgnoreMatcher(root, tc.extraDirs, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// When
+			got := m.CanSkipDirWithoutRefresh(tc.path)
+
+			// Then
+			if got != tc.want {
+				t.Fatalf("CanSkipDirWithoutRefresh(%q) = %t, want %t", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
 func writeIgnoreTestFile(t *testing.T, root, rel, content string) {
 	t.Helper()
 	path := filepath.Join(root, rel)
